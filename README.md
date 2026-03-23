@@ -36,7 +36,7 @@ Statusify connects to Spotify via a Spicetify extension, fetches synced lyrics, 
 - **Spotify** desktop app  
 - **Spicetify** → https://spicetify.app  
 - **Discord application ID** → https://discord.com/developers/applications  
-- **Spicetify extension “Spicy Lyrics”** (install from Spicetify Marketplace → Extensions tab → Cart page)
+- **Spicetify extension “Spicy Lyrics”** (install from Spicetify Marketplace → Extensions tab → Search for "Spicy Lyrics")
 
 ---
 
