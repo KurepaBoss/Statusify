@@ -1,0 +1,22 @@
+# Personal config — never commit these
+.env
+statusify.cfg
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Compiled launcher — each user builds their own
+Statusify.exe
+
+# Temp/cache files
+*.log
+*.tmp
+*.jpg
+*.bak
+
+# IDE
+.vscode/
+.idea/
+opencode.jsonc
