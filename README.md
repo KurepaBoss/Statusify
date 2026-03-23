@@ -55,9 +55,9 @@ cd statusify
 pip install -r requirements.txt
 ```
 
-### 3. Create `.env`
+### 3. Edit `.env`
 
-Create a file called `.env` in the folder:
+Edit a file called `.env` in the folder:
 
 ```
 DISCORD_APP_ID=your_id_here
