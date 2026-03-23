@@ -35,6 +35,7 @@ Statusify connects to Spotify via a Spicetify extension, fetches synced lyrics, 
 - **Python 3.8+** → [python.org](https://www.python.org/downloads/)
 - **Spotify** desktop app
 - **Spicetify** → [spicetify.app](https://spicetify.app)
+- **Spicy Lyrics** extension (install via Spicetify Marketplace → Extensions → search "Spicy Lyrics" by Spikerko)
 - **Discord application ID** → [discord.com/developers](https://discord.com/developers/applications)
 
 ---
@@ -44,8 +45,8 @@ Statusify connects to Spotify via a Spicetify extension, fetches synced lyrics, 
 ### 1. Clone
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/statusify.git
-cd statusify
+git clone https://github.com/KurepaBoss/Statusify.git
+cd Statusify
 ```
 
 ### 2. Install dependencies
@@ -64,7 +65,11 @@ DISCORD_APP_ID=your_id_here
 
 Get your ID by making a new application at the [Discord Developer Portal](https://discord.com/developers/applications). The application name is what shows as "Listening to ..." on your profile.
 
-### 4. Install the Spicetify extension
+### 4. Install Spicy Lyrics
+
+Open Spotify → click the Spicetify Marketplace icon → **Extensions** tab → search **"Spicy Lyrics"** → install the one by **Spikerko**.
+
+### 5. Install the Spicetify extension
 
 Copy `lyrics-bridge.js` to your Spicetify extensions folder:
 
@@ -78,11 +83,11 @@ Then apply:
 spicetify apply
 ```
 
-### 5. Run
+### 6. Run
 
 Double-click **`run.vbs`** — launches silently with no terminal window.
 
-Use **`run.bat`** if you want to see the console output for debugging.
+Use **`run.bat`** if you want to see console output for debugging.
 
 ---
 
@@ -123,7 +128,7 @@ Spotify → Spicetify extension → WebSocket → Statusify → Discord RPC
 
 ## Troubleshooting
 
-**No lyrics showing** — make sure `spicetify apply` was run after copying `lyrics-bridge.js`
+**No lyrics showing** — make sure Spicy Lyrics is installed in Spicetify Marketplace AND `spicetify apply` was run after copying `lyrics-bridge.js`
 
 **RPC not connecting** — check your `DISCORD_APP_ID` in `.env` and make sure Discord is running
 
