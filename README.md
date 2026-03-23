@@ -17,6 +17,17 @@
 
 Statusify connects to Spotify via a Spicetify extension, fetches synced lyrics, and updates your Discord status line by line in real time.
 
+---
+
+## ⚠️ Early Development Notice
+
+This project is still in **early development**, so you may encounter bugs or incomplete features.  
+If you run into any issues, please report them here:
+
+👉 https://github.com/KurepaBoss/Statusify/issues
+
+---
+
 ## Features
 
 - 🎵 Line-by-line synced lyrics on your Discord profile  
