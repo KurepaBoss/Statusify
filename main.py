@@ -43,7 +43,7 @@ _ICON_PATH = None  # set on first use
 
 load_dotenv()
 
-_VERSION      = "0.0.1"          # current app version (update on release)
+_VERSION      = "1.1.1"          # current app version (update on release)
 _GITHUB_REPO  = "KurepaBoss/Statusify"  # GitHub repo for update checks
 
 DISCORD_APP_ID    = os.getenv("DISCORD_APP_ID", "")
@@ -2140,8 +2140,33 @@ def _check_for_updates():
     except Exception as e:
         log(f"Update check failed: {e}")
 
+def _ensure_dependencies():
+    """Checks for required libraries and installs them via pip if missing."""
+    import sys, subprocess, importlib
+    deps = ["pypresence", "websockets", "pillow", "python-dotenv", "keyboard"]
+    mapping = {"pillow": "PIL", "python-dotenv": "dotenv"}
+    missing = []
+    
+    for d in deps:
+        lib = mapping.get(d, d)
+        try:
+            importlib.import_module(lib)
+        except ImportError:
+            missing.append(d)
+            
+    if missing:
+        print(f"Statusify v{_VERSION}")
+        print(f"Missing libraries: {', '.join(missing)}")
+        print("Installing dependencies, please wait...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+            print("Dependencies installed successfully!\n")
+        except Exception as e:
+            print(f"Error installing dependencies: {e}")
+            print("Please run: pip install " + " ".join(missing))
 
 if __name__ == "__main__":
+    _ensure_dependencies()
     # DPI awareness — prevents blurry scaling on HiDPI screens
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware

@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/KurepaBoss/Statusify/main/assets/icon.ico" width="100" />
+  <img src="https://raw.githubusercontent.com/KurepaBoss/Statusify/main/statusify.ico" width="100" />
   <h1>Statusify v1.1.0</h1>
   <p><strong>A sleek, lightweight dynamic overlay and backend bringing Spotify lyrics and rich presence fully under your control.</strong></p>
 </div>
@@ -29,15 +29,17 @@ Statusify v1.1.0 brings **8 massive additions** designed to make your experience
 
 ## 🚀 Quick Setup
 
-1. **Install Python 3.10+**
-2. **Install Spicetify** running the Spicetify Lyrics extension (provides lyric websocket).
-3. **Install Requirements:**
-   ```bash
-   pip install pypresence websockets pillow python-dotenv
-   # For hotkeys:
-   pip install keyboard 
-   ```
-4. **Run Statusify!**
+1. **Install Python 3.10+** (The app will automatically try to install missing libraries on first run).
+2. **Install [Spicetify](https://spicetify.app/)** and ensure it's functioning.
+3. **Install the Spicy Lyrics Extension**: 
+   - Open the **Spicetify Marketplace**.
+   - Under the **Extensions** tab, search for and install the **Spicy Lyrics** extension.
+4. **Install the Lyrics Bridge**:
+   - Copy the `lyrics-bridge.js` file from this repository.
+   - Paste it into your Spicetify extensions folder: 
+     `C:\Users\<YourUsername>\AppData\Roaming\spicetify\Extensions`
+   - Run `spicetify apply` in your terminal.
+5. **Run Statusify!**
    ```bash
    python main.py
    ```
