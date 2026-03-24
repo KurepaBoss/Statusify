@@ -43,7 +43,7 @@ _ICON_PATH = None  # set on first use
 
 load_dotenv()
 
-_VERSION      = "0.0.1"          # current app version (update on release)
+_VERSION      = "1.1.0"          # current app version (update on release)
 _GITHUB_REPO  = "KurepaBoss/Statusify"  # GitHub repo for update checks
 
 DISCORD_APP_ID    = os.getenv("DISCORD_APP_ID", "")

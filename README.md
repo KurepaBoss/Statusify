@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/KurepaBoss/Statusify/main/assets/icon.ico" width="100" />
+  <img src="https://raw.githubusercontent.com/KurepaBoss/Statusify/main/statusify.ico" width="100" />
   <h1>Statusify v1.1.0</h1>
   <p><strong>A sleek, lightweight dynamic overlay and backend bringing Spotify lyrics and rich presence fully under your control.</strong></p>
 </div>
