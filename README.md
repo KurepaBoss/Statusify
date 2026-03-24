@@ -1,61 +1,66 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/KurepaBoss/Statusify/main/assets/icon.ico" width="100" />
-  <h1>Statusify v1.1.0</h1>
-  <p><strong>A sleek, lightweight dynamic overlay and backend bringing Spotify lyrics and rich presence fully under your control.</strong></p>
+  <img src="https://raw.githubusercontent.com/KurepaBoss/Statusify/main/statusify_icon_preview.png" width="128" />
+  <h1>Statusify v1.1.5</h1>
+  <p><strong>The ultimate Discord Rich Presence & Spotify Lyrics bridge.</strong></p>
+
+  ![Statusify v1.1.5](https://img.shields.io/badge/Statusify-v1.1.5-brightgreen?style=for-the-badge)
+  ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge)
+  ![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
 </div>
 
-<br>
+---
 
-Statusify bridges the gap between Spotify and Discord, giving you an interactive, highly-customizable Discord RPC and a beautiful minimal GUI. Track your listening stats, view synced lyrics live from Spicetify, search through your song history, and fine-tune your exact Discord status in real-time.
-
-![Statusify UI](https://img.shields.io/badge/Statusify-v1.1.0-brightgreen) ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-yellow)
+## 🌟 Overview
+**Statusify** is a lightweight, high-performance bridge that connects your Spotify listening experience directly to Discord and your desktop. It offers a beautiful, High-DPI aware GUI to track your session history, view synced lyrics, and manage multiple Discord profiles with a single click.
 
 ---
 
-## 🌟 What's New in v1.1.0 (The Mega Update)
-
-Statusify v1.1.0 brings **8 massive additions** designed to make your experience smoother and highly tailored:
-
-- **1️⃣ First-Run Setup Wizard:** No more editing hidden `.env` files. Statusify launches a clean setup dialog on your first load so you can quickly paste your Discord App ID.
-- **2️⃣ Interactive Auto-Update Checker:** Never miss a feature. Statusify checks GitHub directly on launch and presents an interactive prompt containing all newest release notes.
-- **3️⃣ Multi-Profile Discord Manager:** Have multiple Discord bots or alternate accounts? Save multiple App IDs directly inside settings and switch between them dynamically in 1 click.
-- **4️⃣ Unified Session History & Lyric Search:** Find any song you've played! Your session history is now totally searchable—filter tracks by title, artist, or even **individual lines sung in the lyrics**.
-- **5️⃣ In-Overlay Lyric Highlights:** Looking at the lyrics for a song? The new internal search highlights and jumps to the exact line you're searching for.
-- **6️⃣ Custom Instrumental Mode:** Don't just settle for `🎵 ─ ─ ─ ─ ─ ─ ─ ─ ─ 🎵`. You can now inject custom instrumental or blank-text indicators straight from the Settings menu.
-- **7️⃣ Paused-State RPC:** Toggle `"Show Paused on Discord"` to keep your RPC active with a `⏸ Paused` indicator when Spotify stops, instead of Discord completely wiping your status.
-- **8️⃣ Crisper Typography (HiDPI Aware):** Massive UI engine bump fixing pixelated Tkinter fonts on Windows 10/11 laptops with scaling enabled. Crystal-clear text anywhere.
+## ✨ Key Features
+- 🚀 **Zero-Config Startup:** Automated setup wizard and self-installing dependencies.
+- 🎤 **Synced Lyrics:** Direct integration with Spicetify for live, real-time lyrics on your Discord status.
+- 📂 **Session History:** A searchable database of everything you've listened to—filter by song, artist, or even lyric content.
+- 🎭 **Multi-Profile Support:** Manage multiple Discord Application IDs and switch between them instantly.
+- 🔧 **Advanced Customization:** 
+  - Toggle "Paused" status indicators.
+  - Custom instrumental text.
+  - Global hotkeys for skipping songs and toggling visibility.
+- 🖼️ **Retina-Ready UI:** Native High-DPI support for crystal-clear text on any Windows scaling mode.
 
 ---
 
-## 🚀 Quick Setup
+## 🚀 Easy Setup (Tutorial)
 
-1. **Install Python 3.10+**
-2. **Install Spicetify** running the Spicetify Lyrics extension (provides lyric websocket).
-3. **Install Requirements:**
-   ```bash
-   pip install pypresence websockets pillow python-dotenv
-   # For hotkeys:
-   pip install keyboard 
-   ```
-4. **Run Statusify!**
+Setting up Statusify is simpler than ever. Follow these **3 steps** to get started:
+
+### 1. Install Requirements
+- Ensure you have [Python 3.10 or higher](https://www.python.org/downloads/) installed. 
+- **Note:** Statusify will automatically install all necessary Python libraries for you when you launch it for the first time.
+
+### 2. Prepare Spicetify (For Lyrics)
+To see lyrics on your Discord status, you need [Spicetify](https://spicetify.app/):
+1. **Open your Spicetify Marketplace** in the Spotify app.
+2. Go to the **Extensions** tab and install the **Lyrics** extension.
+3. **That's it!** Statusify will automatically move the required bridge files into your Spicetify folder when you launch it.
+
+### 3. Launch & Connect
+1. Download this repository and run:
    ```bash
    python main.py
    ```
-   *The Setup Wizard will walk you through creating and pasting your Discord Developer App ID.*
+2. **Setup Wizard:** On the first run, Statusify will ask for your **Discord Application ID**. Follow the link provided in the popup to create one in 30 seconds.
+3. **Enjoy!** Your Spotify status and lyrics will now sync beautifully to Discord.
 
 ---
 
-## 🎨 Features & Configuration
-
-### Discord RPC Behaviour
-The `statusify.cfg` configuration file remembers everything for you automatically when you use the UI:
-- **Global Hotkeys:** Bind keyboard shortcuts (`Ctrl+Alt+S`) to globally hide/show your RPC, skip songs, or skip instrumental breaks.
-- **Dark & Light Mode:** Toggleable dynamic themes with custom primary Accent colours.
-- **Remember Session History:** Toggles whether Statusify keeps your track session alive in memory for later searches.
+## ⚙️ Configuration
+The app saves all your preferences in `statusify.cfg`. You can customize:
+- **Hotkeys:** Default `Ctrl+Alt+S` to toggle Discord RPC.
+- **Theme:** Smooth Dark and Light modes with custom accent colors.
+- **History:** Toggle session recording on/off in the Settings menu.
 
 ---
 
-## 🤝 Contribution
-Found a bug or want to request a feature? Feel free to open an issue or PR to help make Statusify even better.
+## 🤝 Contributing
+Found a bug or have a suggestion? Open an [Issue](https://github.com/KurepaBoss/Statusify/issues) or submit a Pull Request.
 
-**Made by [KurepaBoss](https://github.com/KurepaBoss)**
+**Made with ❤️ by [KurepaBoss](https://github.com/KurepaBoss)**
