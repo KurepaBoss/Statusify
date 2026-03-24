@@ -43,6 +43,9 @@ _ICON_PATH = None  # set on first use
 
 load_dotenv()
 
+_VERSION      = "0.0.1"          # current app version (update on release)
+_GITHUB_REPO  = "KurepaBoss/Statusify"  # GitHub repo for update checks
+
 DISCORD_APP_ID    = os.getenv("DISCORD_APP_ID", "")
 WS_HOST           = "127.0.0.1"
 WS_PORT           = 8765
@@ -50,6 +53,7 @@ RATE_LIMIT_CALLS  = 5
 RATE_LIMIT_WINDOW = 20.0
 MAX_STATE         = 128
 LYRIC_DELAY_MS    = 0       # user-adjustable lyric timing offset (ms)
+_ENV_PATH         = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 # ── Persistent config ─────────────────────────────────────────────
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "statusify.cfg")
@@ -81,6 +85,10 @@ except: LYRIC_DELAY_MS = 0
 
 ACCENT     = _cfg_get("preferences", "accent_color",  "#1db954") or "#1db954"
 _DARK_MODE = (_cfg_get("preferences", "dark_mode", "true").lower() == "true")
+
+INSTRUMENTAL_TEXT = _cfg_get("preferences", "instrumental_text", "🎵 ─ ─ ─ ─ ─ ─ ─ ─ ─ 🎵") or "🎵 ─ ─ ─ ─ ─ ─ ─ ─ ─ 🎵"
+SHOW_PAUSED_RPC   = (_cfg_get("preferences", "show_paused_rpc", "false").lower() == "true")
+SAVE_HISTORY      = (_cfg_get("preferences", "save_history", "true").lower() == "true")
 
 # ── Session stats ─────────────────────────────────────────────────
 _session_songs        = 0
@@ -241,9 +249,14 @@ def _set_startup_enabled(enabled: bool):
             f'$lnk.WindowStyle = 7; '
             f'$lnk.Save()'
         )
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0  # SW_HIDE
         subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-            capture_output=True, timeout=10
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps],
+            capture_output=True, timeout=10,
+            startupinfo=si,
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
         log("Startup shortcut created")
     except Exception as e:
@@ -484,15 +497,23 @@ class DiscordRPC:
             self._raw(self.OP_FRAME, payload); r = self._recv()
             if r and r.get("evt") == "ERROR": log(f"RPC error: {r.get('data',{}).get('message',r)}")
         except Exception as e: log(f"Pipe error: {e}"); self._connected = False
-    def _activity(self, title, artist, lines, art):
+    def _activity(self, title, artist, lines, art, position_ms=None, duration_ms=None):
         label = f"{title} — {artist}"[:128]
         act = {"details": label, "assets": {"large_image": art or "spotify", "large_text": label}}
         f = [l for l in lines if l]
         act["state"] = join_lines(f)[:MAX_STATE] if f else "— "
+        # Add elapsed/remaining timer — this is part of the activity payload,
+        # NOT a separate RPC call, so it does not count against the rate limit.
+        if position_ms is not None and duration_ms and duration_ms > 0:
+            import time as _time
+            now_unix   = int(_time.time())
+            start_unix = now_unix - (position_ms // 1000)
+            end_unix   = start_unix + (duration_ms // 1000)
+            act["timestamps"] = {"start": start_unix, "end": end_unix}
         return act
-    async def set_activity(self, title, artist, lines, art):
+    async def set_activity(self, title, artist, lines, art, position_ms=None, duration_ms=None):
         if not self._connected: return
-        act = self._activity(title, artist, lines, art)
+        act = self._activity(title, artist, lines, art, position_ms, duration_ms)
         asyncio.get_event_loop().run_in_executor(executor, self._send,
             {"cmd":"SET_ACTIVITY","args":{"pid":os.getpid(),"activity":act},"nonce":self._nxt()})
     async def clear_activity(self):
@@ -553,6 +574,7 @@ async def ws_handler(ws):
         state.is_playing = False
 
 def _save_history(mode, synced, plain):
+    if not SAVE_HISTORY: return
     for entry in history:
         if entry["track_uri"] == state.track_uri:
             entry["synced"] = synced; entry["plain"] = plain; entry["mode"] = mode; return
@@ -569,6 +591,7 @@ async def rpc_loop(rpc):
     last_uri = track_mono = None
     title_sent = False; last_line = None; skip = []
     gap_mono = None; gap_shown_idx = -1; was_playing = False
+    calibration_until = 0.0   # Feature 6: don't RPC until this monotonic time
 
     def avail():
         now = time.monotonic(); rl["t"] = [x for x in rl["t"] if now-x < RATE_LIMIT_WINDOW]
@@ -589,16 +612,31 @@ async def rpc_loop(rpc):
             continue
         if not state.is_playing:
             if was_playing:
-                await rpc.clear_activity(); rl["t"].clear()
+                if SHOW_PAUSED_RPC:
+                    # Feature 7: show paused indicator instead of clearing
+                    if avail():
+                        await rpc.set_activity(state.title, state.artist, ["\u23f8 Paused"], state.album_art)
+                        rec(); log("RPC paused indicator")
+                else:
+                    await rpc.clear_activity(); rl["t"].clear()
                 last_uri = track_mono = None; title_sent = False
                 last_line = None; skip = []; gap_mono = None; gap_shown_idx = -1
-                was_playing = False; log("RPC cleared"); event_queue.put(("line",""))
+                was_playing = False; calibration_until = 0.0
+                event_queue.put(("line",""))
+                if not SHOW_PAUSED_RPC:
+                    log("RPC cleared")
             continue
         was_playing = True
         if not state.title: continue
         if state.track_uri != last_uri:
             last_uri = state.track_uri; track_mono = time.monotonic()
-            title_sent = False; last_line = None; skip = []; gap_mono = None; gap_shown_idx = -1; continue
+            title_sent = False; last_line = None; skip = []; gap_mono = None; gap_shown_idx = -1
+            calibration_until = time.monotonic() + 1.5  # Feature 6: wait 1.5s to prevent Discord RPC rate-limit on rapid skips
+            continue
+
+        # Feature 6: skip RPC until calibration gate has passed
+        if time.monotonic() < calibration_until:
+            continue
 
         line1, _ = get_current_line()
         pos = state.position_ms + LYRIC_DELAY_MS
@@ -606,7 +644,8 @@ async def rpc_loop(rpc):
         # ── Instrumental detection — use pre-calculated gap list ──────
         active_gap = None
         for gap in state.instrumental_gaps:
-            if gap["startMs"] <= pos < gap["endMs"]:
+            # Wait 800ms after the gap starts so sung lyrics don't instantly get cut off
+            if gap["gap_ms"] > 3000 and (gap["startMs"] + 800) <= pos < gap["endMs"]:
                 active_gap = gap
                 break
 
@@ -627,9 +666,10 @@ async def rpc_loop(rpc):
                         await asyncio.sleep(w + 0.05)
                 if avail():
                     gap_shown_idx = active_gap["key"]; title_sent = True; rec()
-                    await rpc.set_activity(state.title, state.artist, ["🎵 ─ ─ ─ ─ ─ ─ ─ ─ ─ 🎵"], state.album_art)
+                    instr_text = INSTRUMENTAL_TEXT  # Feature 5: custom instrumental text
+                    await rpc.set_activity(state.title, state.artist, [instr_text], state.album_art, state.position_ms, state.duration_ms)
                     log(f"RPC instrumental  (gap {active_gap['gap_ms']/1000:.1f}s)")
-                    event_queue.put(("line","🎵 ─ ─ ─ ─ ─ ─ ─ ─ ─ 🎵"))
+                    event_queue.put(("line", instr_text))
             continue
 
         if not line1:
@@ -657,7 +697,7 @@ async def rpc_loop(rpc):
             group, _ = pick_group(line1)
 
         last_line = line1; skip = group[1:]; rec()
-        await rpc.set_activity(state.title, state.artist, group, state.album_art)
+        await rpc.set_activity(state.title, state.artist, group, state.album_art, state.position_ms, state.duration_ms)
         display = join_lines(group)
         log(f"RPC ({len(group)}L)  ·  {display[:55]}"); event_queue.put(("line", display))
 
@@ -716,6 +756,12 @@ class App:
 
     def __init__(self):
         self._root = tk.Tk()
+        try:
+            import ctypes
+            dpi = ctypes.windll.user32.GetDpiForSystem()
+            self._root.tk.call('tk', 'scaling', dpi / 72.0)
+        except Exception:
+            pass
         self._root.title("Statusify")
         self._root.geometry("500x680")
         self._root.resizable(True, True)
@@ -984,7 +1030,8 @@ class App:
         self._root.mainloop()
 
     def _f(self, size, bold=False):
-        return tkfont.Font(family="Segoe UI", size=size, weight="bold" if bold else "normal")
+        # Bumping the global font baseline +1 drastically reduces aliasing/pixelation
+        return tkfont.Font(family="Segoe UI", size=int(size)+1, weight="bold" if bold else "normal")
 
     def _build(self):
         W = self.win
@@ -1156,6 +1203,17 @@ class App:
         tk.Label(p, text="SESSION HISTORY", fg=MUTED, bg=BG,
                  font=self._f(8,True)).pack(anchor="w", padx=14, pady=(12,6))
 
+        # Feature 4: search bar
+        sf = tk.Frame(p, bg=BG); sf.pack(fill="x", padx=14, pady=(0,6))
+        self._hist_search = tk.StringVar()
+        ent_s = tk.Entry(sf, textvariable=self._hist_search, bg=BG2, fg=TEXT2,
+                         insertbackground=TEXT2, relief="flat",
+                         font=self._f(9), width=30)
+        ent_s.pack(fill="x", ipady=4)
+        tk.Label(sf, text="🔍  filter by title, artist, or lyrics",
+                 fg=MUTED, bg=BG, font=self._f(7)).pack(anchor="w", pady=(2,0))
+        self._hist_search.trace_add("write", lambda *_: self._filter_history())
+
         outer = tk.Frame(p, bg=BG); outer.pack(fill="both", expand=True, padx=14, pady=(0,14))
         self._hist_vsb = tk.Scrollbar(outer, bg=BG3, troughcolor=BG, relief="flat", width=5, bd=0)
         self.hist_cv = tk.Canvas(outer, bg=BG, highlightthickness=0, yscrollcommand=self._hist_vsb.set)
@@ -1196,7 +1254,26 @@ class App:
         self.no_hist = tk.Label(self.hist_frm, text="Nothing played yet this session.",
                                 fg=MUTED, bg=BG, font=self._f(9))
         self.no_hist.pack(pady=30)
+        self._hist_rows = []  # list of (row_widget, entry_dict) for filtering
         self._bind_hist_mw(self.hist_frm)
+
+    def _filter_history(self):
+        """Show/hide history rows based on search query."""
+        q = self._hist_search.get().lower()
+        for row, e in self._hist_rows:
+            if not q:
+                match = True
+            else:
+                match = (q in e.get("title", "").lower() or q in e.get("artist", "").lower())
+                if not match:
+                    if e.get("plain"):
+                        match = any(q in ln.lower() for ln in e["plain"])
+                    elif e.get("synced"):
+                        match = any(q in ln.get("words", "").lower() for ln in e["synced"])
+            if match:
+                row.pack(fill="x", pady=(0,2))
+            else:
+                row.pack_forget()
 
     def _add_history_row(self, idx):
         if idx >= len(history): return
@@ -1222,7 +1299,9 @@ class App:
         tk.Label(inf, text=e["artist"], fg=TEXT2, bg=BG2, font=self._f(8),
                  anchor="w").pack(fill="x", padx=(0,6))
         src = "Spicy" if e["mode"]=="synced" else ("Plain" if e["mode"]=="plain" else "No lyrics")
-        n   = len(e["synced"]) or len(e["plain"])
+        syn_len = len(e["synced"]) if e.get("synced") else 0
+        pln_len = len(e["plain"]) if e.get("plain") else 0
+        n = syn_len or pln_len
         tk.Label(inf, text=f"{src}  ·  {n} lines  ·  {e['time']}", fg=MUTED, bg=BG2,
                  font=self._f(7), anchor="w").pack(fill="x", pady=(0,10), padx=(0,6))
 
@@ -1238,6 +1317,10 @@ class App:
         # regardless of which child the cursor is over
         if hasattr(self, "_bind_hist_mw"):
             self._bind_hist_mw(row)
+
+        # Feature 4: register row for search filtering
+        if hasattr(self, "_hist_rows"):
+            self._hist_rows.append((row, e))
 
     def _load_thumb(self, canvas, url):
         try:
@@ -1280,6 +1363,15 @@ class App:
         cb.bind("<Enter>",    lambda ev: cb.config(fg="#e05555"))
         cb.bind("<Leave>",    lambda ev: cb.config(fg=MUTED))
 
+        # Lyrics search bar
+        sbar = tk.Frame(panel, bg=BG)
+        sbar.pack(fill="x", padx=14, pady=(10, 0))
+        tk.Label(sbar, text="🔍", fg=MUTED, bg=BG, font=self._f(9)).pack(side="left")
+        search_var = tk.StringVar()
+        ent_search = tk.Entry(sbar, textvariable=search_var, bg=BG2, fg=TEXT, insertbackground=TEXT,
+                              relief="flat", font=self._f(9))
+        ent_search.pack(side="left", fill="x", expand=True, padx=(6,0), ipady=3)
+
         # Lyrics content
         frm = tk.Frame(panel, bg=BG)
         frm.pack(fill="both", expand=True, padx=14, pady=10)
@@ -1292,6 +1384,7 @@ class App:
         txt.bind("<MouseWheel>", lambda ev: txt.yview_scroll(int(-1*(ev.delta/120)), "units"))
         txt.tag_config("line", foreground=TEXT2, spacing1=3, spacing3=3)
         txt.tag_config("ts",   foreground=MUTED)
+        txt.tag_config("highlight", background=ACCENT, foreground="#000000")
 
         if e["mode"] == "synced" and e["synced"]:
             for ln in e["synced"]:
@@ -1306,6 +1399,29 @@ class App:
 
         txt.config(state="disabled")
 
+        # Handle highlighting on search
+        def _on_search(*args):
+            q = search_var.get().lower()
+            txt.tag_remove("highlight", "1.0", "end")
+            if not q: return
+            
+            idx = "1.0"
+            first_match = None
+            while True:
+                idx = txt.search(q, idx, nocase=True, stopindex="end")
+                if not idx: break
+                
+                if not first_match: first_match = idx
+                length = len(q)
+                end_idx = f"{idx}+{length}c"
+                txt.tag_add("highlight", idx, end_idx)
+                idx = end_idx
+                
+            if first_match:
+                txt.see(first_match)
+
+        search_var.trace_add("write", _on_search)
+
     def _close_lyrics_panel(self):
         panel = getattr(self, "_lyrics_panel", None)
         if panel:
@@ -1317,7 +1433,39 @@ class App:
     def _build_settings(self):
         p = tk.Frame(self._container, bg=BG); self._pages["SETTINGS"] = p
 
-        outer = tk.Frame(p, bg=BG); outer.pack(fill="both", expand=True, padx=14, pady=(10,14))
+        container = tk.Frame(p, bg=BG); container.pack(fill="both", expand=True, padx=14, pady=(10,14))
+        self._set_vsb = tk.Scrollbar(container, bg=BG3, troughcolor=BG, relief="flat", width=5, bd=0)
+        self.set_cv = tk.Canvas(container, bg=BG, highlightthickness=0, yscrollcommand=self._set_vsb.set)
+        self.set_cv.pack(side="left", fill="both", expand=True)
+        self._set_vsb.config(command=self.set_cv.yview)
+
+        outer = tk.Frame(self.set_cv, bg=BG)
+        self._set_hw = self.set_cv.create_window((0,0), window=outer, anchor="nw")
+
+        def _update_set_scroll(e=None):
+            self.set_cv.configure(scrollregion=self.set_cv.bbox("all"))
+            if outer.winfo_reqheight() > self.set_cv.winfo_height():
+                self._set_vsb.pack(side="right", fill="y")
+                self._set_scroll_enabled = True
+            else:
+                self._set_vsb.pack_forget()
+                self.set_cv.yview_moveto(0)
+                self._set_scroll_enabled = False
+
+        outer.bind("<Configure>", _update_set_scroll)
+        self.set_cv.bind("<Configure>",
+            lambda e: (self.set_cv.itemconfig(self._set_hw, width=e.width), _update_set_scroll()))
+
+        def _on_mousewheel(e):
+            if getattr(self, "_set_scroll_enabled", False):
+                self.set_cv.yview_scroll(int(-1*(e.delta/120)), "units")
+
+        self.set_cv.bind("<MouseWheel>", _on_mousewheel)
+        def _bind_mw(widget):
+            widget.bind("<MouseWheel>", _on_mousewheel)
+            for child in widget.winfo_children():
+                _bind_mw(child)
+        self._bind_set_mw = _bind_mw
 
         # ── Section: Session Stats ─────────────────────────────────
         tk.Label(outer, text="SESSION STATS", fg=MUTED, bg=BG,
@@ -1429,6 +1577,18 @@ class App:
         tk.Checkbutton(row_su, variable=self._startup_var, bg=BG2, activebackground=BG2,
                        selectcolor=BG3, command=_toggle_startup).pack(side="right")
 
+        row_sh = tk.Frame(inner_sy, bg=BG2); row_sh.pack(fill="x", pady=(6,0))
+        tk.Label(row_sh, text="Remember session history", fg=TEXT2, bg=BG2,
+                 font=self._f(9), anchor="w").pack(side="left")
+        self._save_hist_var = tk.BooleanVar(value=SAVE_HISTORY)
+        def _toggle_save_hist():
+            global SAVE_HISTORY
+            SAVE_HISTORY = self._save_hist_var.get()
+            _cfg_set("preferences", "save_history", str(SAVE_HISTORY).lower())
+            log(f'Session history {"enabled" if SAVE_HISTORY else "disabled"}')
+        tk.Checkbutton(row_sh, variable=self._save_hist_var, bg=BG2, activebackground=BG2,
+                       selectcolor=BG3, command=_toggle_save_hist).pack(side="right")
+
         # Window position reset
         row_wp = tk.Frame(inner_sy, bg=BG2); row_wp.pack(fill="x", pady=(6,0))
         tk.Label(row_wp, text="Reset window position", fg=TEXT2, bg=BG2,
@@ -1439,6 +1599,147 @@ class App:
         rst_pos.bind("<Button-1>", lambda e: self._center())
         rst_pos.bind("<Enter>",    lambda e: rst_pos.config(fg=ACCENT))
         rst_pos.bind("<Leave>",    lambda e: rst_pos.config(fg=MUTED))
+
+        # ── Section: Discord RPC Behaviour ────────────────────────
+        tk.Label(outer, text="DISCORD RPC BEHAVIOUR", fg=MUTED, bg=BG,
+                 font=self._f(7,True)).pack(anchor="w", pady=(4,4))
+        rpc_card = tk.Frame(outer, bg=BG2); rpc_card.pack(fill="x", pady=(0,10))
+        inner_rpc = tk.Frame(rpc_card, bg=BG2); inner_rpc.pack(fill="x", padx=14, pady=10)
+
+        # Feature 7 — paused state toggle
+        row_ps = tk.Frame(inner_rpc, bg=BG2); row_ps.pack(fill="x", pady=(0,6))
+        tk.Label(row_ps, text='Show "Paused" on Discord', fg=TEXT2, bg=BG2,
+                 font=self._f(9), anchor="w").pack(side="left")
+        self._paused_var = tk.BooleanVar(value=SHOW_PAUSED_RPC)
+        def _toggle_paused_rpc():
+            global SHOW_PAUSED_RPC
+            SHOW_PAUSED_RPC = self._paused_var.get()
+            _cfg_set("preferences", "show_paused_rpc", str(SHOW_PAUSED_RPC).lower())
+            log(f'Paused RPC {"enabled" if SHOW_PAUSED_RPC else "disabled"}')
+        tk.Checkbutton(row_ps, variable=self._paused_var, bg=BG2, activebackground=BG2,
+                       selectcolor=BG3, command=_toggle_paused_rpc).pack(side="right")
+
+        # Feature 5 — custom instrumental text
+        row_it = tk.Frame(inner_rpc, bg=BG2); row_it.pack(fill="x")
+        tk.Label(row_it, text="Instrumental text", fg=TEXT2, bg=BG2,
+                 font=self._f(9), anchor="w").pack(anchor="w")
+        row_it2 = tk.Frame(inner_rpc, bg=BG2); row_it2.pack(fill="x", pady=(2,0))
+        self._instr_var = tk.StringVar(value=INSTRUMENTAL_TEXT)
+        ent_it = tk.Entry(row_it2, textvariable=self._instr_var, bg=BG3, fg=TEXT,
+                          insertbackground=TEXT, relief="flat", font=self._f(9))
+        ent_it.pack(side="left", fill="x", expand=True, padx=(0,6))
+        def _save_instr():
+            global INSTRUMENTAL_TEXT
+            INSTRUMENTAL_TEXT = self._instr_var.get() or "🎵 ─ ─ ─ ─ ─ ─ ─ ─ ─ 🎵"
+            _cfg_set("preferences", "instrumental_text", INSTRUMENTAL_TEXT)
+            log(f"Instrumental text set to: {INSTRUMENTAL_TEXT}")
+        sv_it = tk.Label(row_it2, text="SAVE", fg=MUTED, bg=BG2,
+                         font=self._f(7,True), cursor="hand2")
+        sv_it.pack(side="left")
+        sv_it.bind("<Button-1>", lambda e: _save_instr())
+        sv_it.bind("<Enter>",    lambda e: sv_it.config(fg=ACCENT))
+        sv_it.bind("<Leave>",    lambda e: sv_it.config(fg=MUTED))
+        # ── Section: Discord Profiles ──────────────────────────────
+        tk.Label(outer, text="DISCORD PROFILES", fg=MUTED, bg=BG,
+                 font=self._f(7,True)).pack(anchor="w", pady=(4,4))
+        prof_card = tk.Frame(outer, bg=BG2); prof_card.pack(fill="x", pady=(0,10))
+        inner_pr = tk.Frame(prof_card, bg=BG2); inner_pr.pack(fill="x", padx=14, pady=10)
+
+        tk.Label(inner_pr, text="Save multiple App IDs and switch between them.",
+                 fg=MUTED, bg=BG2, font=self._f(8), anchor="w").pack(anchor="w", pady=(0,6))
+
+        # Profile listbox
+        lb_frame = tk.Frame(inner_pr, bg=BG2); lb_frame.pack(fill="x")
+        self._prof_lb = tk.Listbox(lb_frame, bg=BG3, fg=TEXT2,
+                                   selectbackground=ACCENT, selectforeground="#000000",
+                                   relief="flat", font=self._f(9), height=4,
+                                   activestyle="none", bd=0)
+        self._prof_lb.pack(fill="x")
+
+        def _load_profiles():
+            self._prof_lb.delete(0, "end")
+            cfg = _load_config()
+            if not cfg.has_section("profiles"):
+                cfg.add_section("profiles")
+            for name, app_id in cfg.items("profiles"):
+                marker = " ✓" if app_id == DISCORD_APP_ID else ""
+                self._prof_lb.insert("end", f"{name}{marker}  —  {app_id}")
+        _load_profiles()
+
+        btn_row = tk.Frame(inner_pr, bg=BG2); btn_row.pack(fill="x", pady=(6,0))
+
+        def _mk_btn(parent, txt, cmd):
+            b = tk.Label(parent, text=txt, fg=MUTED, bg=BG2,
+                         font=self._f(7,True), cursor="hand2", padx=8)
+            b.pack(side="left", padx=(0,6))
+            b.bind("<Button-1>", lambda e: cmd())
+            b.bind("<Enter>",    lambda e: b.config(fg=ACCENT))
+            b.bind("<Leave>",    lambda e: b.config(fg=MUTED))
+            return b
+
+        def _add_profile():
+            dlg = tk.Toplevel(self.win); dlg.title("Add Profile")
+            dlg.configure(bg=BG); dlg.resizable(False, False)
+            dlg.geometry("340x160"); dlg.grab_set()
+            tk.Label(dlg, text="Profile name:", fg=TEXT2, bg=BG, font=self._f(9)).pack(pady=(12,2))
+            nv = tk.StringVar(); tk.Entry(dlg, textvariable=nv, bg=BG2, fg=TEXT,
+                                          relief="flat", font=self._f(9)).pack(fill="x", padx=20)
+            tk.Label(dlg, text="App ID:", fg=TEXT2, bg=BG, font=self._f(9)).pack(pady=(8,2))
+            av = tk.StringVar(); tk.Entry(dlg, textvariable=av, bg=BG2, fg=TEXT,
+                                          relief="flat", font=self._f(9)).pack(fill="x", padx=20)
+            def _ok():
+                n = nv.get().strip(); a = av.get().strip()
+                if n and a:
+                    _cfg_set("profiles", n, a); _load_profiles(); dlg.destroy()
+            tk.Label(dlg, text="SAVE", fg=MUTED, bg=BG2, font=self._f(7,True),
+                     cursor="hand2", padx=10, pady=4).pack(pady=(8,0))
+            dlg.bind("<Return>", lambda e: _ok())
+            dlg.children["!label4"].bind("<Button-1>", lambda e: _ok())
+
+        def _del_profile():
+            sel = self._prof_lb.curselection()
+            if not sel: return
+            text = self._prof_lb.get(sel[0])
+            name = text.split(" ✓")[0].split("  —  ")[0].strip()
+            cfg = _load_config()
+            if cfg.has_option("profiles", name):
+                cfg.remove_option("profiles", name)
+                _save_config(cfg)
+            _load_profiles()
+
+        def _switch_profile():
+            global DISCORD_APP_ID
+            sel = self._prof_lb.curselection()
+            if not sel: return
+            text = self._prof_lb.get(sel[0])
+            # Parse: "name [✓]  —  app_id"
+            parts = text.split("  —  ")
+            if len(parts) < 2: return
+            new_id = parts[-1].strip()
+            DISCORD_APP_ID = new_id
+            _cfg_set("preferences", "discord_app_id_active", new_id)
+            # Update .env
+            try:
+                lines = open(_ENV_PATH, encoding="utf-8").readlines()
+                with open(_ENV_PATH, "w", encoding="utf-8") as f:
+                    written = False
+                    for ln in lines:
+                        if ln.startswith("DISCORD_APP_ID="):
+                            f.write(f"DISCORD_APP_ID={new_id}\n"); written = True
+                        else:
+                            f.write(ln)
+                    if not written:
+                        f.write(f"DISCORD_APP_ID={new_id}\n")
+            except Exception: pass
+            _load_profiles()
+            log(f"Switched Discord profile to: {new_id}")
+
+        _mk_btn(btn_row, "ADD",    _add_profile)
+        _mk_btn(btn_row, "DELETE", _del_profile)
+        _mk_btn(btn_row, "SWITCH", _switch_profile)
+
+        # Apply mousewheel binding to all elements in settings
+        self._bind_set_mw(outer)
 
     def _refresh_stats(self):
         """Update session stats labels every 5 seconds."""
@@ -1628,8 +1929,54 @@ class App:
                     status  = "enabled" if enabled else "disabled"
                     log(f"Hotkey: RPC {status}")
                     self.dot_dc.config(fg=ACCENT if enabled else MUTED)
+                elif k == "update_available":
+                    _, tag, url, changelog = ev
+                    self._show_update_dialog(tag, url, changelog)
         except queue.Empty: pass
         self._root.after(50, self._poll)
+
+    def _show_update_dialog(self, tag, url, changelog):
+        """Show a modal dialog asking the user to update, with changelog."""
+        import webbrowser
+        if getattr(self, "_update_banner_shown", False): return
+        self._update_banner_shown = True
+
+        dlg = tk.Toplevel(self.win)
+        dlg.title("Update Available")
+        dlg.configure(bg=BG)
+        dlg.geometry("450x380")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        tk.Label(dlg, text=f"Statusify v{tag} is available!", fg=TEXT, bg=BG,
+                 font=self._f(12, True)).pack(pady=(16, 4))
+        tk.Label(dlg, text="New changes since your version:", fg=TEXT2, bg=BG,
+                 font=self._f(9)).pack()
+
+        # Changelog frame
+        cf = tk.Frame(dlg, bg=BG2)
+        cf.pack(fill="both", expand=True, padx=20, pady=16)
+
+        scrollbar = tk.Scrollbar(cf, bg=BG3, troughcolor=BG2, relief="flat", width=12, bd=0)
+        scrollbar.pack(side="right", fill="y")
+        txt = tk.Text(cf, bg=BG2, fg=TEXT2, font=self._f(8), relief="flat",
+                      wrap="word", yscrollcommand=scrollbar.set, padx=10, pady=10)
+        txt.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=txt.yview)
+
+        txt.insert("end", changelog)
+        txt.config(state="disabled")
+
+        bf = tk.Frame(dlg, bg=BG)
+        bf.pack(fill="x", pady=(0, 20))
+        btn_no = tk.Label(bf, text="LATER", fg=MUTED, bg=BG, font=self._f(8, True), cursor="hand2")
+        btn_no.pack(side="left", padx=30)
+        btn_no.bind("<Button-1>", lambda e: dlg.destroy())
+
+        btn_yes = tk.Label(bf, text="DOWNLOAD", fg="#000000", bg=ACCENT, font=self._f(8, True), cursor="hand2", padx=16, pady=6)
+        btn_yes.pack(side="right", padx=30)
+        def _yes(): webbrowser.open(url); dlg.destroy()
+        btn_yes.bind("<Button-1>", lambda e: _yes())
 
 
 # ── Backend ───────────────────────────────────────────────────────
@@ -1668,8 +2015,134 @@ async def _backend():
 
 _backend_loop = None  # set in __main__, used by _send_skip
 
+# ── Feature 1: First-run setup wizard ────────────────────────────
+def _run_setup_wizard():
+    """If DISCORD_APP_ID is missing/empty, show a blocking modal dialog."""
+    global DISCORD_APP_ID
+    if DISCORD_APP_ID:
+        return  # Already configured — nothing to do
+
+    import webbrowser
+    root = tk.Tk()
+    try:
+        import ctypes
+        dpi = ctypes.windll.user32.GetDpiForSystem()
+        root.tk.call('tk', 'scaling', dpi / 72.0)
+    except Exception:
+        pass
+    root.withdraw()  # hide the blank root; we only want the toplevel
+
+    dlg = tk.Toplevel(root)
+    dlg.title("Statusify — First-run Setup")
+    dlg.resizable(False, False)
+    dlg.configure(bg="#0a0a0a")
+    dlg.grab_set()
+    dlg.focus_force()
+
+    # Center the dialog
+    dlg.update_idletasks()
+    w, h = 420, 250
+    sw = dlg.winfo_screenwidth(); sh = dlg.winfo_screenheight()
+    dlg.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+
+    tk.Label(dlg, text="Welcome to Statusify", fg="#ffffff", bg="#0a0a0a",
+             font=("Segoe UI", 14, "bold")).pack(pady=(24, 4))
+    tk.Label(dlg, text="Paste your Discord Application ID below.\n"
+             "Create one free at discord.com/developers/applications",
+             fg="#b3b3b3", bg="#0a0a0a", font=("Segoe UI", 9),
+             justify="center", wraplength=380).pack(pady=(0, 6))
+
+    link = tk.Label(dlg, text="Open Discord Developer Portal ↗",
+                    fg="#1db954", bg="#0a0a0a",
+                    font=("Segoe UI", 9, "underline"), cursor="hand2")
+    link.pack()
+    link.bind("<Button-1>", lambda e: webbrowser.open(
+        "https://discord.com/developers/applications"))
+
+    tk.Frame(dlg, bg="#2a2a2a", height=1).pack(fill="x", padx=24, pady=12)
+
+    entry_var = tk.StringVar()
+    ent = tk.Entry(dlg, textvariable=entry_var, bg="#181818", fg="#ffffff",
+                   insertbackground="#ffffff", relief="flat",
+                   font=("Segoe UI", 11), justify="center")
+    ent.pack(fill="x", padx=24, ipady=6)
+    ent.focus_set()
+
+    err_lbl = tk.Label(dlg, text="", fg="#e05555", bg="#0a0a0a",
+                       font=("Segoe UI", 8))
+    err_lbl.pack(pady=(4, 0))
+
+    def _save():
+        global DISCORD_APP_ID
+        val = entry_var.get().strip()
+        if not val.isdigit() or len(val) < 16:
+            err_lbl.config(text="App ID must be a long numeric ID (e.g. 1480612100416999474)")
+            return
+        DISCORD_APP_ID = val
+        # Write to .env
+        try:
+            with open(_ENV_PATH, "a", encoding="utf-8") as f:
+                f.write(f"\nDISCORD_APP_ID={val}\n")
+        except Exception:
+            pass
+        dlg.destroy()
+
+    btn = tk.Label(dlg, text="SAVE & CONTINUE", fg="#0a0a0a", bg="#1db954",
+                   font=("Segoe UI", 9, "bold"), cursor="hand2",
+                   padx=16, pady=6)
+    btn.pack(pady=(8, 0))
+    btn.bind("<Button-1>", lambda e: _save())
+    ent.bind("<Return>", lambda e: _save())
+
+    root.wait_window(dlg)
+    root.destroy()
+
+# ── Feature 2: Auto-update checker ───────────────────────────────
+def _check_for_updates():
+    """Background thread: fetches all releases and compiles changelog."""
+    if _GITHUB_REPO == "owner/repo": return
+    try:
+        import urllib.request as _req
+        url = f"https://api.github.com/repos/{_GITHUB_REPO}/releases"
+        req = _req.Request(url, headers={"User-Agent": "Statusify/UpdateChecker"})
+        with _req.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read())
+
+        cur = _VERSION.lstrip("v")
+        def _sv(v):
+            try: return tuple(int(x) for x in v.split("."))
+            except: return (0, 0, 0)
+
+        latest_tag = None
+        latest_url = ""
+        changelog_lines = []
+
+        for release in data:
+            tag = release.get("tag_name", "").lstrip("v")
+            if not tag: continue
+
+            if _sv(tag) > _sv(cur):
+                if not latest_tag:
+                    latest_tag = tag
+                    latest_url = release.get("html_url", "")
+
+                body = release.get("body", "").strip()
+                changelog_lines.append(f"• v{tag}")
+                if body:
+                    for ln in body.splitlines():
+                        if ln.strip():
+                            changelog_lines.append(f"  {ln}")
+                changelog_lines.append("")
+
+        if latest_tag:
+            event_queue.put(("update_available", latest_tag, latest_url, "\n".join(changelog_lines).strip()))
+            log(f"Update available: v{latest_tag} (with {len(changelog_lines)} lines of notes)")
+    except Exception as e:
+        log(f"Update check failed: {e}")
+
+
 if __name__ == "__main__":
-    # Tell Windows this process handles DPI itself — prevents blurry scaling
+    # DPI awareness — prevents blurry scaling on HiDPI screens
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware
     except Exception:
@@ -1681,7 +2154,11 @@ if __name__ == "__main__":
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Statusify.App.1")
     except Exception:
         pass
+    # Feature 1: show setup wizard if no App ID is configured
+    _run_setup_wizard()
     app = App()
     _backend_loop = asyncio.new_event_loop()
     threading.Thread(target=run_backend, args=(_backend_loop,), daemon=True).start()
+    # Feature 2: check for updates in background after app starts (5s delay to let UI settle)
+    threading.Timer(5.0, _check_for_updates).start()
     app.mainloop()

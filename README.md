@@ -1,167 +1,61 @@
 <div align="center">
-
-<img src="statusify.ico" width="80" alt="Statusify logo">
-
-# Statusify
-
-**Show real-time Spotify lyrics as your Discord Rich Presence**
-
-![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D4?logo=windows)
-![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)
-![Discord](https://img.shields.io/badge/Discord_RPC-5865F2?logo=discord&logoColor=white)
-![Spicetify](https://img.shields.io/badge/Spicetify-1DB954?logo=spotify&logoColor=white)
-
+  <img src="https://raw.githubusercontent.com/KurepaBoss/Statusify/main/assets/icon.ico" width="100" />
+  <h1>Statusify v1.1.0</h1>
+  <p><strong>A sleek, lightweight dynamic overlay and backend bringing Spotify lyrics and rich presence fully under your control.</strong></p>
 </div>
 
----
+<br>
 
-Statusify connects to Spotify via a Spicetify extension, fetches synced lyrics, and updates your Discord status line by line in real time.
+Statusify bridges the gap between Spotify and Discord, giving you an interactive, highly-customizable Discord RPC and a beautiful minimal GUI. Track your listening stats, view synced lyrics live from Spicetify, search through your song history, and fine-tune your exact Discord status in real-time.
 
----
-
-## ⚠️ Early Development Notice
-
-This project is still in **early development**, so you may encounter bugs or incomplete features.  
-If you run into any issues, please report them here:
-
-👉 https://github.com/KurepaBoss/Statusify/issues
+![Statusify UI](https://img.shields.io/badge/Statusify-v1.1.0-brightgreen) ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue) ![License: MIT](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
-## Features
+## 🌟 What's New in v1.1.0 (The Mega Update)
 
-- 🎵 Line-by-line synced lyrics on your Discord profile  
-- 🎸 Automatic instrumental detection — shows `🎵 ─ ─ ─ ─ ─ ─ ─ ─ ─ 🎵` during gaps  
-- ⏱️ Adjustable lyric delay to sync to your ears  
-- ⏭️ Global hotkeys — skip track, toggle RPC, skip instrumental  
-- 📜 Song history with full lyrics viewer  
-- 🌓 Dark/light theme with accent colour picker  
-- 🚀 Optional Windows startup launch  
+Statusify v1.1.0 brings **8 massive additions** designed to make your experience smoother and highly tailored:
 
----
-
-## Requirements
-
-- **Windows 10 or 11**
-- **Python 3.8+** → https://www.python.org/downloads/  
-- **Spotify** desktop app  
-- **Spicetify** → https://spicetify.app  
-- **Discord application ID** → https://discord.com/developers/applications  
-- **Spicetify extension “Spicy Lyrics”** (install from Spicetify Marketplace → Extensions tab → Search for "Spicy Lyrics")
+- **1️⃣ First-Run Setup Wizard:** No more editing hidden `.env` files. Statusify launches a clean setup dialog on your first load so you can quickly paste your Discord App ID.
+- **2️⃣ Interactive Auto-Update Checker:** Never miss a feature. Statusify checks GitHub directly on launch and presents an interactive prompt containing all newest release notes.
+- **3️⃣ Multi-Profile Discord Manager:** Have multiple Discord bots or alternate accounts? Save multiple App IDs directly inside settings and switch between them dynamically in 1 click.
+- **4️⃣ Unified Session History & Lyric Search:** Find any song you've played! Your session history is now totally searchable—filter tracks by title, artist, or even **individual lines sung in the lyrics**.
+- **5️⃣ In-Overlay Lyric Highlights:** Looking at the lyrics for a song? The new internal search highlights and jumps to the exact line you're searching for.
+- **6️⃣ Custom Instrumental Mode:** Don't just settle for `🎵 ─ ─ ─ ─ ─ ─ ─ ─ ─ 🎵`. You can now inject custom instrumental or blank-text indicators straight from the Settings menu.
+- **7️⃣ Paused-State RPC:** Toggle `"Show Paused on Discord"` to keep your RPC active with a `⏸ Paused` indicator when Spotify stops, instead of Discord completely wiping your status.
+- **8️⃣ Crisper Typography (HiDPI Aware):** Massive UI engine bump fixing pixelated Tkinter fonts on Windows 10/11 laptops with scaling enabled. Crystal-clear text anywhere.
 
 ---
 
-## Setup
+## 🚀 Quick Setup
 
-### 1. Clone
-
-```bash
-git clone https://github.com/KurepaBoss/statusify.git
-cd statusify
-```
-
-### 2. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 3. Edit `.env`
-
-Edit a file called `.env` in the folder:
-
-```
-DISCORD_APP_ID=your_id_here
-```
-
-Get your ID by creating a new application at:  
-https://discord.com/developers/applications  
-
-The application name is what shows as "Listening to ..." on your profile.  
-"Spotify" is a commonly used name (tested), but you can name it anything you like.
+1. **Install Python 3.10+**
+2. **Install Spicetify** running the Spicetify Lyrics extension (provides lyric websocket).
+3. **Install Requirements:**
+   ```bash
+   pip install pypresence websockets pillow python-dotenv
+   # For hotkeys:
+   pip install keyboard 
+   ```
+4. **Run Statusify!**
+   ```bash
+   python main.py
+   ```
+   *The Setup Wizard will walk you through creating and pasting your Discord Developer App ID.*
 
 ---
 
-### 4. Install the Spicetify extension
+## 🎨 Features & Configuration
 
-Copy `lyrics-bridge.js` to:
-
-```
-%appdata%\spicetify\Extensions\
-```
-
-Then apply:
-
-```bash
-spicetify apply
-```
-
-Make sure you also install the **“Spicy Lyrics” extension** from the Spicetify Marketplace (Extensions tab → Cart page), as it is required for synced lyrics to work properly.
+### Discord RPC Behaviour
+The `statusify.cfg` configuration file remembers everything for you automatically when you use the UI:
+- **Global Hotkeys:** Bind keyboard shortcuts (`Ctrl+Alt+S`) to globally hide/show your RPC, skip songs, or skip instrumental breaks.
+- **Dark & Light Mode:** Toggleable dynamic themes with custom primary Accent colours.
+- **Remember Session History:** Toggles whether Statusify keeps your track session alive in memory for later searches.
 
 ---
 
-### 5. Build & Run
+## 🤝 Contribution
+Found a bug or want to request a feature? Feel free to open an issue or PR to help make Statusify even better.
 
-Right-click `build_launcher.ps1` and select **Run with PowerShell**  
-(or run it manually in PowerShell):
-
-```powershell
-.\build_launcher.ps1
-```
-
-After the build completes, the `.exe` will be created in the **same folder** as the script.
-
-Run it:
-
-```powershell
-.\Statusify.exe
-```
-
-> If PowerShell blocks the script, run:
-> ```
-> Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
-> ```
-
----
-
-## Hotkeys
-
-| Action | Default combo |
-|--------|--------------|
-| Skip track | `Ctrl+Alt+N` |
-| Toggle RPC on/off | `Ctrl+Alt+S` |
-| Skip instrumental | `Ctrl+Alt+I` |
-
-All combos are configurable in **Settings → Hotkeys**.
-
----
-
-## How it works
-
-```
-Spotify → Spicetify extension → WebSocket → Statusify → Discord RPC
-```
-
-1. The Spicetify extension (`lyrics-bridge.js`) hooks into Spotify's player and fetches synced lyrics from SpicyLyrics (falls back to Spotify's API)  
-2. It streams track info, position ticks, and lyrics to Statusify over a local WebSocket  
-3. Statusify determines the current lyric line and updates Discord Rich Presence  
-4. Discord rate limits (5 updates / 20 seconds) are respected  
-
----
-
-## Troubleshooting
-
-**No lyrics showing**  
-→ Run `spicetify apply` after copying `lyrics-bridge.js`
-
-**RPC not connecting**  
-→ Check your `DISCORD_APP_ID` and make sure Discord is running
-
-**Wrong timing**  
-→ Adjust lyric delay using the controls in the app  
-
----
-
-## License
-
-MIT
+**Made by [KurepaBoss](https://github.com/KurepaBoss)**
