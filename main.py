@@ -43,7 +43,7 @@ _ICON_PATH = None  # set on first use
 
 load_dotenv()
 
-_VERSION      = "0.0.1"          # current app version (update on release)
+_VERSION      = "1.1.4"          # current app version (update on release)
 _GITHUB_REPO  = "KurepaBoss/Statusify"  # GitHub repo for update checks
 
 DISCORD_APP_ID    = os.getenv("DISCORD_APP_ID", "")
@@ -57,6 +57,7 @@ _ENV_PATH         = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".e
 
 # ── Persistent config ─────────────────────────────────────────────
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "statusify.cfg")
+_HIST_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.json")
 
 def _load_config():
     cfg = configparser.ConfigParser()
@@ -574,7 +575,7 @@ async def ws_handler(ws):
         state.is_playing = False
 
 def _save_history(mode, synced, plain):
-    if not SAVE_HISTORY: return
+    # Always save to in-memory history so the UI tab works during the session
     for entry in history:
         if entry["track_uri"] == state.track_uri:
             entry["synced"] = synced; entry["plain"] = plain; entry["mode"] = mode; return
@@ -584,6 +585,31 @@ def _save_history(mode, synced, plain):
         "time": datetime.datetime.now().strftime("%H:%M"),
     })
     event_queue.put(("history_add", len(history)-1))
+
+def _load_history():
+    """Loads history from JSON if SAVE_HISTORY is enabled."""
+    global history
+    if not SAVE_HISTORY or not os.path.exists(_HIST_FILE): return
+    try:
+        with open(_HIST_FILE, "r", encoding="utf-8") as f:
+            history = json.load(f)
+        log(f"Loaded {len(history)} history entries from disk")
+    except Exception as e:
+        log(f"Could not load history: {e}")
+
+def _persist_history():
+    """Saves or deletes history on disk based on SAVE_HISTORY setting."""
+    if SAVE_HISTORY:
+        try:
+            with open(_HIST_FILE, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+            log("History persisted to disk")
+        except Exception as e:
+            log(f"Could not save history: {e}")
+    else:
+        if os.path.exists(_HIST_FILE):
+            try: os.remove(_HIST_FILE); log("History file deleted (disabled)")
+            except: pass
 
 # ── RPC loop ──────────────────────────────────────────────────────
 async def rpc_loop(rpc):
@@ -907,6 +933,7 @@ class App:
         self._root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
     def _quit(self):
+        _persist_history()
         # Clear Discord RPC cleanly before exit
         try:
             state.is_playing = False
@@ -920,6 +947,7 @@ class App:
             except Exception:
                 pass
         self._root.destroy()
+        sys.exit(0)
 
     def _minimize(self):
         # Minimize at Win32 level so overrideredirect(True) is never touched.
@@ -1738,6 +1766,48 @@ class App:
         _mk_btn(btn_row, "DELETE", _del_profile)
         _mk_btn(btn_row, "SWITCH", _switch_profile)
 
+        # ── Section: System ──────────────────────────────────────────
+        tk.Label(outer, text="SYSTEM", fg=MUTED, bg=BG,
+                 font=self._f(7,True)).pack(anchor="w", pady=(4,4))
+        sys_card = tk.Frame(outer, bg=BG2); sys_card.pack(fill="x", pady=(0,10))
+        inner_sys = tk.Frame(sys_card, bg=BG2); inner_sys.pack(fill="x", padx=14, pady=10)
+
+        def _do_shortcut():
+            import os, subprocess
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            exe_name = "Statusify.exe"
+            exe_path = os.path.join(app_dir, exe_name)
+            ico_path = os.path.join(app_dir, "statusify.ico")
+
+            if not os.path.exists(exe_path):
+                self._log("Building Statusify.exe...")
+                try:
+                    subprocess.run(["powershell.exe", "-ExecutionPolicy", "Bypass", "-File", "build_launcher.ps1"], 
+                                   cwd=app_dir, check=True)
+                except Exception as e:
+                    self._log(f"Build failed: {e}")
+                    return
+
+            if os.path.exists(exe_path):
+                desk = os.path.join(os.environ["USERPROFILE"], "Desktop")
+                lnk  = os.path.join(desk, "Statusify.lnk")
+                # Use powershell to create the .lnk correctly
+                ps = f"$s=(New-Object -COM WScript.Shell).CreateShortcut('{lnk}');" \
+                     f"$s.TargetPath='{exe_path}';$s.WorkingDirectory='{app_dir}';" \
+                     f"$s.IconLocation='{ico_path}';$s.Save()"
+                try:
+                    subprocess.run(["powershell.exe", "-Command", ps], check=True)
+                    self._log("✅ Shortcut created on Desktop!")
+                except Exception as e:
+                    self._log(f"Shortcut failed: {e}")
+
+        row_sc = tk.Frame(inner_sys, bg=BG2); row_sc.pack(fill="x")
+        tk.Label(row_sc, text="Desktop Access", fg=TEXT2, bg=BG2, font=self._f(9), anchor="w").pack(side="left")
+        btn_sc = tk.Label(row_sc, text="CREATE SHORTCUT", fg="#000000", bg=ACCENT, 
+                          font=self._f(7,True), cursor="hand2", padx=10, pady=4)
+        btn_sc.pack(side="right")
+        btn_sc.bind("<Button-1>", lambda e: _do_shortcut())
+
         # Apply mousewheel binding to all elements in settings
         self._bind_set_mw(outer)
 
@@ -2140,8 +2210,55 @@ def _check_for_updates():
     except Exception as e:
         log(f"Update check failed: {e}")
 
+def _ensure_dependencies():
+    """Checks for required libraries and installs them via pip if missing."""
+    import sys, subprocess, importlib
+    deps = ["pypresence", "websockets", "pillow", "python-dotenv", "keyboard"]
+    mapping = {"pillow": "PIL", "python-dotenv": "dotenv"}
+    missing = []
+    
+    for d in deps:
+        lib = mapping.get(d, d)
+        try:
+            importlib.import_module(lib)
+        except ImportError:
+            missing.append(d)
+            
+    if missing:
+        print(f"Statusify v{_VERSION}")
+        print(f"Missing libraries: {', '.join(missing)}")
+        print("Installing dependencies, please wait...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+            print("Dependencies installed successfully!\n")
+        except Exception as e:
+            print(f"Error installing dependencies: {e}")
+            print("Please run: pip install " + " ".join(missing))
+
+    # Bridge installation
+    try:
+        import shutil, os
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        js_src = os.path.join(app_dir, "lyrics-bridge.js")
+        
+        if os.environ.get("APPDATA"):
+            ext_dir = os.path.join(os.environ["APPDATA"], "spicetify", "Extensions")
+            if os.path.isdir(ext_dir):
+                js_dest = os.path.join(ext_dir, "lyrics-bridge.js")
+                # Copy if it doesn't exist or if size differs (basic "needs update" check)
+                if not os.path.exists(js_dest) or os.path.getsize(js_src) != os.path.getsize(js_dest):
+                    shutil.copy2(js_src, js_dest)
+                    print(f"✅ Bridge installed to: {js_dest}")
+                else:
+                    print("✅ Bridge is up to date.")
+            else:
+                print("⚠ Spicetify extensions folder not found.")
+                print("  Please install Spicetify first for lyrics to work!")
+    except Exception as e:
+        print(f"Could not install bridge: {e}")
 
 if __name__ == "__main__":
+    _ensure_dependencies()
     # DPI awareness — prevents blurry scaling on HiDPI screens
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware
@@ -2156,6 +2273,7 @@ if __name__ == "__main__":
         pass
     # Feature 1: show setup wizard if no App ID is configured
     _run_setup_wizard()
+    _load_history()
     app = App()
     _backend_loop = asyncio.new_event_loop()
     threading.Thread(target=run_backend, args=(_backend_loop,), daemon=True).start()
