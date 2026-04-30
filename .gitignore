@@ -1,0 +1,22 @@
+# Hide personal configuration and auth tokens
+statusify.cfg
+.env*
+.env
+
+# Hide temporary agent files and media
+out.txt
+grep.txt
+history.json
+*.jpg
+*.png
+!statusify_icon_preview.png
+*.jpeg
+
+# Hide compiled outputs
+*.exe
+__pycache__/
+*.pyc
+
+# Random config from IDEs
+.vscode/
+opencode.jsonc
