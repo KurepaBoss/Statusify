@@ -1,5 +1,5 @@
 (async function lyricsBridge() {
-    while (!Spicetify?.Player?.data || !Spicetify?.CosmosAsync) {
+    while (!Spicetify?.Player || !Spicetify?.CosmosAsync) {
         await new Promise(r => setTimeout(r, 300));
     }
     await new Promise(r => setTimeout(r, 1000));
@@ -11,7 +11,9 @@
 
     function connect() {
         if (ws?.readyState === WebSocket.OPEN) return;
-        ws = new WebSocket("ws://127.0.0.1:8765");
+        const wsUrl = "ws://127.0.0.1:8765";
+        ws = new WebSocket(wsUrl);
+        console.log("[LyricsBridge] Connecting:", wsUrl);
 
         ws.onopen = async () => {
             console.log("[LyricsBridge] Connected.");
