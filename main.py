@@ -127,24 +127,146 @@ _hotkey_skip_combo        = _cfg_get("preferences", "hotkey_skip",        "ctrl+
 _hotkey_toggle_combo      = _cfg_get("preferences", "hotkey_toggle",      "ctrl+alt+s") or "ctrl+alt+s"
 _hotkey_skip_instr_combo  = _cfg_get("preferences", "hotkey_skip_instr",  "ctrl+alt+i") or "ctrl+alt+i"
 _hotkey_registered = False
+_hotkey_backend = "none"
+_hotkey_manager = None
 _rpc_enabled          = True   # toggle state
 
+class _WindowsHotkeyManager:
+    MOD_ALT = 0x0001
+    MOD_CONTROL = 0x0002
+    MOD_SHIFT = 0x0004
+    MOD_WIN = 0x0008
+
+    VK_MAP = {
+        "tab": 0x09, "enter": 0x0D, "esc": 0x1B, "escape": 0x1B, "space": 0x20,
+        "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+        "insert": 0x2D, "delete": 0x2E, "home": 0x24, "end": 0x23,
+        "pageup": 0x21, "pagedown": 0x22,
+    }
+
+    def __init__(self):
+        self._user32 = ctypes.windll.user32
+        self._kernel32 = ctypes.windll.kernel32
+        self._id_to_cb = {}
+        self._next_id = 1
+        self._thread = None
+        self._thread_id = 0
+
+    def _parse_combo(self, combo):
+        parts = [p.strip().lower() for p in combo.split("+") if p.strip()]
+        mods = 0
+        key = None
+        for p in parts:
+            if p in ("ctrl", "control"): mods |= self.MOD_CONTROL
+            elif p == "alt": mods |= self.MOD_ALT
+            elif p == "shift": mods |= self.MOD_SHIFT
+            elif p in ("win", "windows", "cmd", "super"): mods |= self.MOD_WIN
+            else: key = p
+        if not key:
+            return None
+        if len(key) == 1 and key.isalpha():
+            vk = ord(key.upper())
+        elif len(key) == 1 and key.isdigit():
+            vk = ord(key)
+        elif key.startswith("f") and key[1:].isdigit() and 1 <= int(key[1:]) <= 24:
+            vk = 0x6F + int(key[1:])
+        else:
+            vk = self.VK_MAP.get(key)
+        if vk is None:
+            return None
+        return mods, vk
+
+    def register(self, combo, cb):
+        parsed = self._parse_combo(combo)
+        if not parsed:
+            return False, f"invalid hotkey '{combo}'"
+        mods, vk = parsed
+        hotkey_id = self._next_id
+        self._next_id += 1
+        if not self._user32.RegisterHotKey(None, hotkey_id, mods, vk):
+            return False, f"Windows refused hotkey '{combo}' (already in use?)"
+        self._id_to_cb[hotkey_id] = cb
+        return True, None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        def _loop():
+            self._thread_id = self._kernel32.GetCurrentThreadId()
+            msg = ctypes.wintypes.MSG()
+            while self._user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+                if msg.message == 0x0312:  # WM_HOTKEY
+                    cb = self._id_to_cb.get(msg.wParam)
+                    if cb:
+                        try:
+                            cb()
+                        except Exception as e:
+                            log(f"Hotkey callback failed: {e}")
+                self._user32.TranslateMessage(ctypes.byref(msg))
+                self._user32.DispatchMessageW(ctypes.byref(msg))
+        self._thread = threading.Thread(target=_loop, daemon=True)
+        self._thread.start()
+
+    def unregister_all(self):
+        for hotkey_id in list(self._id_to_cb):
+            try:
+                self._user32.UnregisterHotKey(None, hotkey_id)
+            except Exception:
+                pass
+        self._id_to_cb.clear()
+        if self._thread_id:
+            try:
+                self._user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)  # WM_QUIT
+            except Exception:
+                pass
+        self._thread = None
+        self._thread_id = 0
+
 def _register_hotkeys(app_ref):
-    global _hotkey_registered
-    if not KEYBOARD_AVAILABLE or _hotkey_registered:
+    global _hotkey_registered, _hotkey_backend, _hotkey_manager
+    if _hotkey_registered:
+        return
+
+    skip_combo   = _hotkey_skip_combo.strip()
+    toggle_combo = _hotkey_toggle_combo.strip()
+    skip_instr_combo = _hotkey_skip_instr_combo.strip()
+
+    if os.name == "nt":
+        try:
+            _hotkey_manager = _WindowsHotkeyManager()
+            for combo, cb in (
+                (skip_combo, lambda: _hotkey_skip(app_ref)),
+                (toggle_combo, lambda: _hotkey_toggle(app_ref)),
+                (skip_instr_combo, _hotkey_skip_instrumental),
+            ):
+                if combo:
+                    ok, err = _hotkey_manager.register(combo, cb)
+                    if not ok:
+                        raise RuntimeError(err)
+            _hotkey_manager.start()
+            _hotkey_backend = "win32"
+            _hotkey_registered = True
+            log(f"Hotkeys registered (Win32)  ·  skip={skip_combo or 'none'}  toggle={toggle_combo or 'none'}  skip_instr={skip_instr_combo or 'none'}")
+            return
+        except Exception as e:
+            if _hotkey_manager:
+                _hotkey_manager.unregister_all()
+            _hotkey_manager = None
+            log(f"Win32 hotkeys failed, falling back to keyboard package: {e}")
+
+    if not KEYBOARD_AVAILABLE:
+        log("Hotkeys unavailable: install keyboard package")
         return
     try:
-        skip_combo   = _hotkey_skip_combo.strip()
-        toggle_combo = _hotkey_toggle_combo.strip()
-        skip_instr_combo = _hotkey_skip_instr_combo.strip()
         if skip_combo:
             _keyboard.add_hotkey(skip_combo,       lambda: _hotkey_skip(app_ref),       suppress=False)
         if toggle_combo:
             _keyboard.add_hotkey(toggle_combo,     lambda: _hotkey_toggle(app_ref),     suppress=False)
         if skip_instr_combo:
             _keyboard.add_hotkey(skip_instr_combo, lambda: _hotkey_skip_instrumental(), suppress=False)
+        _hotkey_backend = "keyboard"
         _hotkey_registered = True
-        log(f"Hotkeys registered  ·  skip={skip_combo or 'none'}  toggle={toggle_combo or 'none'}  skip_instr={skip_instr_combo or 'none'}")
+        log(f"Hotkeys registered (keyboard)  ·  skip={skip_combo or 'none'}  toggle={toggle_combo or 'none'}  skip_instr={skip_instr_combo or 'none'}")
     except Exception as e:
         log(f"Hotkey registration failed: {e}")
 
@@ -1573,13 +1695,13 @@ class App:
         tk.Label(row_ac, text="  ↑ click", fg=MUTED, bg=BG2, font=self._f(7)).pack(side="right")
 
         # ── Section: Hotkeys ───────────────────────────────────────
-        tk.Label(outer, text="GLOBAL HOTKEYS", fg=MUTED, bg=BG,
+        tk.Label(outer, text="GLOBAL HOTKEYS (fullscreen-safe on Windows)", fg=MUTED, bg=BG,
                  font=self._f(7,True)).pack(anchor="w", pady=(4,4))
         hotkey_card = tk.Frame(outer, bg=BG2); hotkey_card.pack(fill="x", pady=(0,10))
         inner_h = tk.Frame(hotkey_card, bg=BG2); inner_h.pack(fill="x", padx=14, pady=10)
 
-        if not KEYBOARD_AVAILABLE:
-            tk.Label(inner_h, text="Install 'keyboard' package to enable hotkeys:\npip install keyboard",
+        if os.name != "nt" and not KEYBOARD_AVAILABLE:
+            tk.Label(inner_h, text="Install 'keyboard' package to enable fallback hotkeys:\npip install keyboard",
                      fg=MUTED, bg=BG2, font=self._f(8), justify="left").pack(anchor="w")
         else:
             # Skip track
@@ -1607,10 +1729,15 @@ class App:
             ent_tg.pack(side="left", padx=(4,0))
 
             def _save_hotkeys():
-                global _hotkey_skip_combo, _hotkey_toggle_combo, _hotkey_skip_instr_combo, _hotkey_registered
+                global _hotkey_skip_combo, _hotkey_toggle_combo, _hotkey_skip_instr_combo, _hotkey_registered, _hotkey_backend, _hotkey_manager
                 # Unregister old
-                try: _keyboard.unhook_all_hotkeys()
-                except: pass
+                if _hotkey_backend == "win32" and _hotkey_manager:
+                    _hotkey_manager.unregister_all()
+                    _hotkey_manager = None
+                else:
+                    try: _keyboard.unhook_all_hotkeys()
+                    except: pass
+                _hotkey_backend = "none"
                 _hotkey_registered = False
                 _hotkey_skip_combo       = self._skip_var.get().strip()
                 _hotkey_toggle_combo     = self._toggle_var.get().strip()
