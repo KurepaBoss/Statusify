@@ -269,6 +269,8 @@ log_queue   = queue.Queue()
 event_queue        = queue.Queue()
 _rpc_skip_instr_flag = [False]  # [0] set True to skip current instrumental
 _spicetify_ws = None  # active WebSocket to Spicetify extension
+_force_bridge_reconnect = [False]
+_force_rpc_reconnect = [False]
 
 def log(msg): log_queue.put(msg)
 
@@ -282,6 +284,30 @@ class State:
     synced = []; plain = []
 
 state = State()
+
+class HealthState:
+    bridge_status = "disconnected"
+    rpc_status = "disconnected"
+    last_heartbeat = "—"
+    reconnect_attempts = 0
+
+health = HealthState()
+
+def _emit_health(component, status, detail=""):
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    health.last_heartbeat = now
+    if component == "bridge":
+        health.bridge_status = status
+    elif component == "rpc":
+        health.rpc_status = status
+    if status == "reconnecting":
+        health.reconnect_attempts += 1
+    tag = f"[HEALTH/{component.upper()}]"
+    msg = f"{tag} {status}"
+    if detail:
+        msg += f"  ·  {detail}"
+    log(msg)
+    event_queue.put(("health", component, status, now, health.reconnect_attempts))
 
 # Session history: [{artist, title, album_art, synced, plain, mode, time}]
 history = []
@@ -483,6 +509,7 @@ class DiscordRPC:
             self._connected = True
             user = resp["data"]["user"]["username"]
             log(f"RPC handshake OK  ·  {user}"); event_queue.put(("rpc_ok", user))
+            _emit_health("rpc", "connected", user)
         else: raise RuntimeError(f"Handshake failed: {resp}")
     def _raw(self, op, data):
         p = json.dumps(data).encode()
@@ -528,6 +555,7 @@ async def ws_handler(ws):
     global _spicetify_ws
     _spicetify_ws = ws
     log("Spicetify connected"); event_queue.put(("sp", True))
+    _emit_health("bridge", "connected")
     try:
         # Brief pause so the extension's onmessage handler is wired up
         # before we ask it to report state (onopen and onmessage are set
@@ -573,6 +601,7 @@ async def ws_handler(ws):
     except websockets.exceptions.ConnectionClosed:
         _spicetify_ws = None
         log("Spicetify disconnected"); event_queue.put(("sp", False))
+        _emit_health("bridge", "disconnected")
         state.is_playing = False
 
 def _save_history(mode, synced, plain):
@@ -637,7 +666,12 @@ async def rpc_loop(rpc):
 
     while True:
         await asyncio.sleep(0.05)
+        if _force_rpc_reconnect[0]:
+            _force_rpc_reconnect[0] = False
+            _emit_health("rpc", "disconnected", "manual reconnect")
+            return
         if not connected():
+            _emit_health("rpc", "disconnected")
             return  # pipe broke — let _backend reconnect
         if not _rpc_enabled:
             continue
@@ -1234,6 +1268,25 @@ class App:
         self.dot_dc = tk.Label(sb, text="●", fg=MUTED, bg=BG, font=self._f(7)); self.dot_dc.pack(side="left")
         tk.Label(sb, text=" Discord RPC", fg=MUTED, bg=BG, font=self._f(8)).pack(side="left")
         self.lbl_rl = tk.Label(sb, text="", fg=MUTED, bg=BG, font=self._f(8)); self.lbl_rl.pack(side="right")
+
+        # Connection Health
+        hc = tk.Frame(p, bg=BG2); hc.pack(fill="x", padx=14, pady=(4,6))
+        tk.Label(hc, text="CONNECTION HEALTH", fg=MUTED, bg=BG2, font=self._f(7, True)).pack(anchor="w", padx=10, pady=(8,2))
+        self.lbl_h_bridge = tk.Label(hc, text="Bridge: disconnected", fg=TEXT2, bg=BG2, font=self._f(8))
+        self.lbl_h_bridge.pack(anchor="w", padx=10)
+        self.lbl_h_rpc = tk.Label(hc, text="Discord RPC: disconnected", fg=TEXT2, bg=BG2, font=self._f(8))
+        self.lbl_h_rpc.pack(anchor="w", padx=10)
+        self.lbl_h_beat = tk.Label(hc, text="Last heartbeat: —", fg=TEXT2, bg=BG2, font=self._f(8))
+        self.lbl_h_beat.pack(anchor="w", padx=10)
+        self.lbl_h_retries = tk.Label(hc, text="Reconnect attempts: 0", fg=TEXT2, bg=BG2, font=self._f(8))
+        self.lbl_h_retries.pack(anchor="w", padx=10, pady=(0,4))
+        hr = tk.Frame(hc, bg=BG2); hr.pack(fill="x", padx=10, pady=(0,8))
+        tk.Label(hr, text="Reconnect Bridge", fg=TEXT2, bg=BG3, font=self._f(8), cursor="hand2", padx=8, pady=3).pack(side="left", padx=(0,6))
+        hr.winfo_children()[-1].bind("<Button-1>", lambda e: self._reconnect_bridge())
+        tk.Label(hr, text="Reconnect Discord", fg=TEXT2, bg=BG3, font=self._f(8), cursor="hand2", padx=8, pady=3).pack(side="left", padx=(0,6))
+        hr.winfo_children()[-1].bind("<Button-1>", lambda e: self._reconnect_discord())
+        tk.Label(hr, text="Reset Session State", fg=TEXT2, bg=BG3, font=self._f(8), cursor="hand2", padx=8, pady=3).pack(side="left")
+        hr.winfo_children()[-1].bind("<Button-1>", lambda e: self._reset_session_state())
 
         tk.Frame(p, bg=BORDER, height=1).pack(fill="x", padx=14, pady=(2,6))
         tk.Label(p, text="LOG", fg=MUTED, bg=BG, font=self._f(7,True)).pack(anchor="w", padx=14)
@@ -1997,6 +2050,33 @@ class App:
         self.canvas.create_rectangle(0,0,72,72, fill=BG3, outline=BORDER)
         self.canvas.create_text(36,36, text="♫", fill=MUTED, font=self._f(14))
 
+    def _reconnect_bridge(self):
+        ws = _spicetify_ws
+        _emit_health("bridge", "reconnecting", "manual request")
+        if ws is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(ws.close(), _backend_loop)
+        except Exception as e:
+            log(f"[HEALTH/BRIDGE] reconnect failed  ·  {e}")
+
+    def _reconnect_discord(self):
+        _force_rpc_reconnect[0] = True
+        _emit_health("rpc", "reconnecting", "manual request")
+
+    def _reset_session_state(self):
+        global _session_songs, _session_start, _session_listen_secs, _track_start_mono
+        _session_songs = 0
+        _session_start = time.monotonic()
+        _session_listen_secs = 0.0
+        _track_start_mono = None
+        health.reconnect_attempts = 0
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        health.last_heartbeat = now
+        event_queue.put(("health", "bridge", health.bridge_status, now, 0))
+        log("[HEALTH/SESSION] state reset")
+        event_queue.put(("stats",))
+
     def _start_rl_countdown(self, wait_secs):
         # Cancel any previous countdown
         if hasattr(self, "_rl_after") and self._rl_after:
@@ -2091,6 +2171,12 @@ class App:
                 threading.Thread(target=_send_skip, daemon=True).start()
             elif k == "rpc_err":
                 self.dot_dc.config(fg=MUTED)
+            elif k == "health":
+                _, component, status, beat, attempts = ev
+                self.lbl_h_bridge.config(text=f"Bridge: {health.bridge_status}")
+                self.lbl_h_rpc.config(text=f"Discord RPC: {health.rpc_status}")
+                self.lbl_h_beat.config(text=f"Last heartbeat: {beat}")
+                self.lbl_h_retries.config(text=f"Reconnect attempts: {attempts}")
             elif k == "hotkey_skip_instr":
                 pass  # handled directly in _hotkey_skip_instrumental
             elif k == "hotkey_toggle":
@@ -2170,12 +2256,15 @@ async def _backend():
     # reconnect automatically — lyrics keep streaming to Discord as soon as
     # the pipe becomes available again.
     while True:
+        if _force_rpc_reconnect[0]:
+            _force_rpc_reconnect[0] = False
         rpc = DiscordRPC(DISCORD_APP_ID)
         try:
             await rpc.connect()
         except RuntimeError as e:
             log(f"RPC unavailable: {e}  — retrying in 15s")
             event_queue.put(("rpc_err",))
+            _emit_health("rpc", "reconnecting", "retry in 15s")
             await asyncio.sleep(15)
             continue
         # Connected — run the RPC update loop until the pipe breaks
@@ -2183,6 +2272,7 @@ async def _backend():
         # rpc_loop returned (pipe died) — wait briefly then reconnect
         log("RPC disconnected — reconnecting in 5s")
         event_queue.put(("rpc_err",))
+        _emit_health("rpc", "reconnecting", "retry in 5s")
         await asyncio.sleep(5)
 
 _backend_loop = None  # set in __main__, used by _send_skip
