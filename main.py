@@ -2,8 +2,8 @@
 Spotify -> Discord Rich Presence (via Spicetify lyrics-bridge extension)
 """
 
-import asyncio, os, json, time, struct, threading, queue, datetime, base64
-import configparser, winreg
+import asyncio, os, sys, json, time, struct, threading, queue, datetime, base64
+import configparser
 import tkinter as tk
 import tkinter.font as tkfont
 import tkinter.colorchooser as tkcolor
@@ -307,7 +307,17 @@ def _hotkey_toggle(app_ref):
         # Signal the RPC loop to clear activity on next tick
         state.is_playing = False
 
-# ── Startup with Windows ──────────────────────────────────────────
+# ── Startup-at-login (Windows only) ───────────────────────────────
+IS_WINDOWS = (sys.platform == "win32")
+_WINDOWS_STARTUP_AVAILABLE = False
+_windows_startup = None
+
+if IS_WINDOWS:
+    try:
+        from statusify.platform import windows_startup as _windows_startup
+        _WINDOWS_STARTUP_AVAILABLE = True
+    except Exception as e:
+        _WINDOWS_STARTUP_AVAILABLE = False
 
 def _startup_lnk_path():
     return _startup_lnk_path_mod()
@@ -1750,13 +1760,17 @@ class App:
         inner_sy = tk.Frame(sys_card, bg=BG2); inner_sy.pack(fill="x", padx=14, pady=10)
 
         row_su = tk.Frame(inner_sy, bg=BG2); row_su.pack(fill="x")
-        tk.Label(row_su, text="Launch at Windows startup", fg=TEXT2, bg=BG2,
+        tk.Label(row_su, text="Launch at startup", fg=TEXT2, bg=BG2,
                  font=self._f(9), anchor="w").pack(side="left")
         self._startup_var = tk.BooleanVar(value=_get_startup_enabled())
+        startup_supported = (_WINDOWS_STARTUP_AVAILABLE and IS_WINDOWS)
         def _toggle_startup():
             _set_startup_enabled(self._startup_var.get())
         tk.Checkbutton(row_su, variable=self._startup_var, bg=BG2, activebackground=BG2,
-                       selectcolor=BG3, command=_toggle_startup).pack(side="right")
+                       selectcolor=BG3, command=_toggle_startup, state=("normal" if startup_supported else "disabled")).pack(side="right")
+        if not startup_supported:
+            tk.Label(inner_sy, text="Startup-at-login is currently only available on Windows.", fg=MUTED, bg=BG2,
+                     font=self._f(8), anchor="w").pack(fill="x", pady=(4,0))
 
         row_sh = tk.Frame(inner_sy, bg=BG2); row_sh.pack(fill="x", pady=(6,0))
         tk.Label(row_sh, text="Remember session history", fg=TEXT2, bg=BG2,
