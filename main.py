@@ -2,8 +2,8 @@
 Spotify -> Discord Rich Presence (via Spicetify lyrics-bridge extension)
 """
 
-import asyncio, os, json, time, struct, threading, queue, datetime, base64
-import configparser, winreg
+import asyncio, os, sys, json, time, struct, threading, queue, datetime, base64
+import configparser
 import tkinter as tk
 import tkinter.font as tkfont
 import tkinter.colorchooser as tkcolor
@@ -180,89 +180,30 @@ def _hotkey_toggle(app_ref):
         # Signal the RPC loop to clear activity on next tick
         state.is_playing = False
 
-# ── Startup with Windows ──────────────────────────────────────────
+# ── Startup-at-login (Windows only) ───────────────────────────────
+IS_WINDOWS = (sys.platform == "win32")
+_WINDOWS_STARTUP_AVAILABLE = False
+_windows_startup = None
 
-def _startup_lnk_path():
-    """Path to the Statusify shortcut in the user's Startup folder."""
-    startup = os.path.join(os.environ.get("APPDATA", ""),
-                           r"Microsoft\Windows\Start Menu\Programs\Startup",
-                           "Statusify.lnk")
-    return startup
+if IS_WINDOWS:
+    try:
+        from statusify.platform import windows_startup as _windows_startup
+        _WINDOWS_STARTUP_AVAILABLE = True
+    except Exception as e:
+        _WINDOWS_STARTUP_AVAILABLE = False
+
 
 def _get_startup_enabled():
-    return os.path.exists(_startup_lnk_path())
+    if not (_WINDOWS_STARTUP_AVAILABLE and _windows_startup):
+        return False
+    return _windows_startup.get_startup_enabled()
 
-def _cleanup_old_startup():
-    """Remove any leftover registry Run key entries from previous versions."""
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                             r"Software\Microsoft\Windows\CurrentVersion\Run",
-                             0, winreg.KEY_SET_VALUE)
-        try: winreg.DeleteValue(key, "Statusify")
-        except FileNotFoundError: pass
-        winreg.CloseKey(key)
-    except Exception:
-        pass
 
 def _set_startup_enabled(enabled: bool):
-    lnk = _startup_lnk_path()
-    # Always clean up old registry entry regardless of enable/disable
-    _cleanup_old_startup()
-    if not enabled:
-        try: os.remove(lnk)
-        except FileNotFoundError: pass
-        except Exception as e: log(f"Startup remove error: {e}")
+    if not (_WINDOWS_STARTUP_AVAILABLE and _windows_startup):
+        log("Startup-at-login is unavailable on this operating system.")
         return
-
-    def _create():
-        try:
-            import subprocess, sys, base64
-            script_dir    = os.path.dirname(os.path.abspath(__file__))
-            ico            = os.path.join(script_dir, "statusify.ico")
-            statusify_exe  = os.path.join(script_dir, "Statusify.exe")
-            main_py        = os.path.join(script_dir, "main.py")
-
-            if os.path.exists(statusify_exe):
-                target = statusify_exe
-                args   = ""
-            else:
-                pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-                if not os.path.exists(pythonw):
-                    pythonw = sys.executable.replace("python.exe", "pythonw.exe")
-                target = pythonw
-                args   = f'"{main_py}"'
-
-            # Build script as a proper multi-line PS string then base64-encode it
-            # so that no path-with-spaces quoting can break the -Command argument.
-            ps_lines = [
-                f'$ws  = New-Object -ComObject WScript.Shell',
-                f'$lnk = $ws.CreateShortcut("{lnk}")',
-                f'$lnk.TargetPath      = "{target}"',
-                f'$lnk.Arguments       = "{args}"',
-                f'$lnk.WorkingDirectory= "{script_dir}"',
-                f'$lnk.Description     = "Statusify"',
-                f'$lnk.IconLocation    = "{ico},0"',
-                f'$lnk.WindowStyle     = 7',
-                f'$lnk.Save()',
-            ]
-            ps_script = "\r\n".join(ps_lines)
-            encoded   = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
-
-            si = subprocess.STARTUPINFO()
-            si.dwFlags    |= subprocess.STARTF_USESHOWWINDOW
-            si.wShowWindow = 0
-            subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive",
-                 "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
-                capture_output=True, timeout=15,
-                startupinfo=si,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            log("Startup shortcut created")
-        except Exception as e:
-            log(f"Startup shortcut error: {e}")
-
-    threading.Thread(target=_create, daemon=True).start()
+    _windows_startup.set_startup_enabled(enabled, log_func=log)
 
 executor    = ThreadPoolExecutor(max_workers=1)
 log_queue   = queue.Queue()
@@ -1635,13 +1576,17 @@ class App:
         inner_sy = tk.Frame(sys_card, bg=BG2); inner_sy.pack(fill="x", padx=14, pady=10)
 
         row_su = tk.Frame(inner_sy, bg=BG2); row_su.pack(fill="x")
-        tk.Label(row_su, text="Launch at Windows startup", fg=TEXT2, bg=BG2,
+        tk.Label(row_su, text="Launch at startup", fg=TEXT2, bg=BG2,
                  font=self._f(9), anchor="w").pack(side="left")
         self._startup_var = tk.BooleanVar(value=_get_startup_enabled())
+        startup_supported = (_WINDOWS_STARTUP_AVAILABLE and IS_WINDOWS)
         def _toggle_startup():
             _set_startup_enabled(self._startup_var.get())
         tk.Checkbutton(row_su, variable=self._startup_var, bg=BG2, activebackground=BG2,
-                       selectcolor=BG3, command=_toggle_startup).pack(side="right")
+                       selectcolor=BG3, command=_toggle_startup, state=("normal" if startup_supported else "disabled")).pack(side="right")
+        if not startup_supported:
+            tk.Label(inner_sy, text="Startup-at-login is currently only available on Windows.", fg=MUTED, bg=BG2,
+                     font=self._f(8), anchor="w").pack(fill="x", pady=(4,0))
 
         row_sh = tk.Frame(inner_sy, bg=BG2); row_sh.pack(fill="x", pady=(6,0))
         tk.Label(row_sh, text="Remember session history", fg=TEXT2, bg=BG2,
