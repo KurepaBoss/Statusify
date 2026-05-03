@@ -11,6 +11,16 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import ctypes, ctypes.wintypes
 
+from statusify.config import config_path, history_path, cfg_get as _cfg_get_mod, cfg_set as _cfg_set_mod, load_config as _load_config_mod, save_config as _save_config_mod
+from statusify.platform.windows_startup import (
+    startup_lnk_path as _startup_lnk_path_mod,
+    get_startup_enabled as _get_startup_enabled_mod,
+    cleanup_old_startup as _cleanup_old_startup_mod,
+    set_startup_enabled as _set_startup_enabled_mod,
+)
+from statusify.rpc import RpcController
+from statusify.ws_bridge import WsBridge
+
 try:
     import keyboard as _keyboard
     KEYBOARD_AVAILABLE = True
@@ -43,7 +53,9 @@ _ICON_PATH = None  # set on first use
 
 load_dotenv()
 
-_VERSION      = "1.1.5"          # current app version (update on release)
+from version import VERSION
+
+_VERSION      = VERSION
 _GITHUB_REPO  = "KurepaBoss/Statusify"  # GitHub repo for update checks
 
 DISCORD_APP_ID    = os.getenv("DISCORD_APP_ID", "")
@@ -56,28 +68,21 @@ LYRIC_DELAY_MS    = 0       # user-adjustable lyric timing offset (ms)
 _ENV_PATH         = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 # ── Persistent config ─────────────────────────────────────────────
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "statusify.cfg")
-_HIST_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.json")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_CONFIG_PATH = str(config_path(_BASE_DIR))
+_HIST_FILE   = str(history_path(_BASE_DIR))
 
 def _load_config():
-    cfg = configparser.ConfigParser()
-    cfg.read(_CONFIG_PATH)
-    return cfg
+    return _load_config_mod(_CONFIG_PATH)
 
 def _save_config(cfg):
-    with open(_CONFIG_PATH, "w") as f:
-        cfg.write(f)
+    _save_config_mod(cfg, _CONFIG_PATH)
 
 def _cfg_get(section, key, fallback=""):
-    cfg = _load_config()
-    return cfg.get(section, key, fallback=fallback)
+    return _cfg_get_mod(_CONFIG_PATH, section, key, fallback)
 
 def _cfg_set(section, key, value):
-    cfg = _load_config()
-    if not cfg.has_section(section):
-        cfg.add_section(section)
-    cfg.set(section, key, str(value))
-    _save_config(cfg)
+    _cfg_set_mod(_CONFIG_PATH, section, key, value)
 
 # Load persisted settings at startup
 _stored_delay = _cfg_get("preferences", "lyric_delay_ms", "0")
@@ -127,24 +132,146 @@ _hotkey_skip_combo        = _cfg_get("preferences", "hotkey_skip",        "ctrl+
 _hotkey_toggle_combo      = _cfg_get("preferences", "hotkey_toggle",      "ctrl+alt+s") or "ctrl+alt+s"
 _hotkey_skip_instr_combo  = _cfg_get("preferences", "hotkey_skip_instr",  "ctrl+alt+i") or "ctrl+alt+i"
 _hotkey_registered = False
+_hotkey_backend = "none"
+_hotkey_manager = None
 _rpc_enabled          = True   # toggle state
 
+class _WindowsHotkeyManager:
+    MOD_ALT = 0x0001
+    MOD_CONTROL = 0x0002
+    MOD_SHIFT = 0x0004
+    MOD_WIN = 0x0008
+
+    VK_MAP = {
+        "tab": 0x09, "enter": 0x0D, "esc": 0x1B, "escape": 0x1B, "space": 0x20,
+        "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+        "insert": 0x2D, "delete": 0x2E, "home": 0x24, "end": 0x23,
+        "pageup": 0x21, "pagedown": 0x22,
+    }
+
+    def __init__(self):
+        self._user32 = ctypes.windll.user32
+        self._kernel32 = ctypes.windll.kernel32
+        self._id_to_cb = {}
+        self._next_id = 1
+        self._thread = None
+        self._thread_id = 0
+
+    def _parse_combo(self, combo):
+        parts = [p.strip().lower() for p in combo.split("+") if p.strip()]
+        mods = 0
+        key = None
+        for p in parts:
+            if p in ("ctrl", "control"): mods |= self.MOD_CONTROL
+            elif p == "alt": mods |= self.MOD_ALT
+            elif p == "shift": mods |= self.MOD_SHIFT
+            elif p in ("win", "windows", "cmd", "super"): mods |= self.MOD_WIN
+            else: key = p
+        if not key:
+            return None
+        if len(key) == 1 and key.isalpha():
+            vk = ord(key.upper())
+        elif len(key) == 1 and key.isdigit():
+            vk = ord(key)
+        elif key.startswith("f") and key[1:].isdigit() and 1 <= int(key[1:]) <= 24:
+            vk = 0x6F + int(key[1:])
+        else:
+            vk = self.VK_MAP.get(key)
+        if vk is None:
+            return None
+        return mods, vk
+
+    def register(self, combo, cb):
+        parsed = self._parse_combo(combo)
+        if not parsed:
+            return False, f"invalid hotkey '{combo}'"
+        mods, vk = parsed
+        hotkey_id = self._next_id
+        self._next_id += 1
+        if not self._user32.RegisterHotKey(None, hotkey_id, mods, vk):
+            return False, f"Windows refused hotkey '{combo}' (already in use?)"
+        self._id_to_cb[hotkey_id] = cb
+        return True, None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        def _loop():
+            self._thread_id = self._kernel32.GetCurrentThreadId()
+            msg = ctypes.wintypes.MSG()
+            while self._user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+                if msg.message == 0x0312:  # WM_HOTKEY
+                    cb = self._id_to_cb.get(msg.wParam)
+                    if cb:
+                        try:
+                            cb()
+                        except Exception as e:
+                            log(f"Hotkey callback failed: {e}")
+                self._user32.TranslateMessage(ctypes.byref(msg))
+                self._user32.DispatchMessageW(ctypes.byref(msg))
+        self._thread = threading.Thread(target=_loop, daemon=True)
+        self._thread.start()
+
+    def unregister_all(self):
+        for hotkey_id in list(self._id_to_cb):
+            try:
+                self._user32.UnregisterHotKey(None, hotkey_id)
+            except Exception:
+                pass
+        self._id_to_cb.clear()
+        if self._thread_id:
+            try:
+                self._user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)  # WM_QUIT
+            except Exception:
+                pass
+        self._thread = None
+        self._thread_id = 0
+
 def _register_hotkeys(app_ref):
-    global _hotkey_registered
-    if not KEYBOARD_AVAILABLE or _hotkey_registered:
+    global _hotkey_registered, _hotkey_backend, _hotkey_manager
+    if _hotkey_registered:
+        return
+
+    skip_combo   = _hotkey_skip_combo.strip()
+    toggle_combo = _hotkey_toggle_combo.strip()
+    skip_instr_combo = _hotkey_skip_instr_combo.strip()
+
+    if os.name == "nt":
+        try:
+            _hotkey_manager = _WindowsHotkeyManager()
+            for combo, cb in (
+                (skip_combo, lambda: _hotkey_skip(app_ref)),
+                (toggle_combo, lambda: _hotkey_toggle(app_ref)),
+                (skip_instr_combo, _hotkey_skip_instrumental),
+            ):
+                if combo:
+                    ok, err = _hotkey_manager.register(combo, cb)
+                    if not ok:
+                        raise RuntimeError(err)
+            _hotkey_manager.start()
+            _hotkey_backend = "win32"
+            _hotkey_registered = True
+            log(f"Hotkeys registered (Win32)  ·  skip={skip_combo or 'none'}  toggle={toggle_combo or 'none'}  skip_instr={skip_instr_combo or 'none'}")
+            return
+        except Exception as e:
+            if _hotkey_manager:
+                _hotkey_manager.unregister_all()
+            _hotkey_manager = None
+            log(f"Win32 hotkeys failed, falling back to keyboard package: {e}")
+
+    if not KEYBOARD_AVAILABLE:
+        log("Hotkeys unavailable: install keyboard package")
         return
     try:
-        skip_combo   = _hotkey_skip_combo.strip()
-        toggle_combo = _hotkey_toggle_combo.strip()
-        skip_instr_combo = _hotkey_skip_instr_combo.strip()
         if skip_combo:
             _keyboard.add_hotkey(skip_combo,       lambda: _hotkey_skip(app_ref),       suppress=False)
         if toggle_combo:
             _keyboard.add_hotkey(toggle_combo,     lambda: _hotkey_toggle(app_ref),     suppress=False)
         if skip_instr_combo:
             _keyboard.add_hotkey(skip_instr_combo, lambda: _hotkey_skip_instrumental(), suppress=False)
+        _hotkey_backend = "keyboard"
         _hotkey_registered = True
-        log(f"Hotkeys registered  ·  skip={skip_combo or 'none'}  toggle={toggle_combo or 'none'}  skip_instr={skip_instr_combo or 'none'}")
+        log(f"Hotkeys registered (keyboard)  ·  skip={skip_combo or 'none'}  toggle={toggle_combo or 'none'}  skip_instr={skip_instr_combo or 'none'}")
     except Exception as e:
         log(f"Hotkey registration failed: {e}")
 
@@ -183,94 +310,24 @@ def _hotkey_toggle(app_ref):
 # ── Startup with Windows ──────────────────────────────────────────
 
 def _startup_lnk_path():
-    """Path to the Statusify shortcut in the user's Startup folder."""
-    startup = os.path.join(os.environ.get("APPDATA", ""),
-                           r"Microsoft\Windows\Start Menu\Programs\Startup",
-                           "Statusify.lnk")
-    return startup
+    return _startup_lnk_path_mod()
 
 def _get_startup_enabled():
-    return os.path.exists(_startup_lnk_path())
+    return _get_startup_enabled_mod()
 
 def _cleanup_old_startup():
-    """Remove any leftover registry Run key entries from previous versions."""
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                             r"Software\Microsoft\Windows\CurrentVersion\Run",
-                             0, winreg.KEY_SET_VALUE)
-        try: winreg.DeleteValue(key, "Statusify")
-        except FileNotFoundError: pass
-        winreg.CloseKey(key)
-    except Exception:
-        pass
+    _cleanup_old_startup_mod()
 
 def _set_startup_enabled(enabled: bool):
-    lnk = _startup_lnk_path()
-    # Always clean up old registry entry regardless of enable/disable
-    _cleanup_old_startup()
-    if not enabled:
-        try: os.remove(lnk)
-        except FileNotFoundError: pass
-        except Exception as e: log(f"Startup remove error: {e}")
-        return
-
-    def _create():
-        try:
-            import subprocess, sys, base64
-            script_dir    = os.path.dirname(os.path.abspath(__file__))
-            ico            = os.path.join(script_dir, "statusify.ico")
-            statusify_exe  = os.path.join(script_dir, "Statusify.exe")
-            main_py        = os.path.join(script_dir, "main.py")
-
-            if os.path.exists(statusify_exe):
-                target = statusify_exe
-                args   = ""
-            else:
-                pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-                if not os.path.exists(pythonw):
-                    pythonw = sys.executable.replace("python.exe", "pythonw.exe")
-                target = pythonw
-                args   = f'"{main_py}"'
-
-            # Build script as a proper multi-line PS string then base64-encode it
-            # so that no path-with-spaces quoting can break the -Command argument.
-            ps_lines = [
-                f'$ws  = New-Object -ComObject WScript.Shell',
-                f'$lnk = $ws.CreateShortcut("{lnk}")',
-                f'$lnk.TargetPath      = "{target}"',
-                f'$lnk.Arguments       = "{args}"',
-                f'$lnk.WorkingDirectory= "{script_dir}"',
-                f'$lnk.Description     = "Statusify"',
-                f'$lnk.IconLocation    = "{ico},0"',
-                f'$lnk.WindowStyle     = 7',
-                f'$lnk.Save()',
-            ]
-            ps_script = "\r\n".join(ps_lines)
-            encoded   = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
-
-            si = subprocess.STARTUPINFO()
-            si.dwFlags    |= subprocess.STARTF_USESHOWWINDOW
-            si.wShowWindow = 0
-            subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive",
-                 "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
-                capture_output=True, timeout=15,
-                startupinfo=si,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            log("Startup shortcut created")
-        except Exception as e:
-            log(f"Startup shortcut error: {e}")
-
-    threading.Thread(target=_create, daemon=True).start()
+    _set_startup_enabled_mod(enabled, _BASE_DIR, log)
 
 executor    = ThreadPoolExecutor(max_workers=1)
 log_queue   = queue.Queue()
 event_queue        = queue.Queue()
 _rpc_skip_instr_flag = [False]  # [0] set True to skip current instrumental
 _spicetify_ws = None  # active WebSocket to Spicetify extension
-_force_bridge_reconnect = [False]
-_force_rpc_reconnect = [False]
+rpc_controller = RpcController(RATE_LIMIT_CALLS, RATE_LIMIT_WINDOW)
+ws_bridge = WsBridge(WS_HOST, WS_PORT)
 
 def log(msg): log_queue.put(msg)
 
@@ -1626,13 +1683,13 @@ class App:
         tk.Label(row_ac, text="  ↑ click", fg=MUTED, bg=BG2, font=self._f(7)).pack(side="right")
 
         # ── Section: Hotkeys ───────────────────────────────────────
-        tk.Label(outer, text="GLOBAL HOTKEYS", fg=MUTED, bg=BG,
+        tk.Label(outer, text="GLOBAL HOTKEYS (fullscreen-safe on Windows)", fg=MUTED, bg=BG,
                  font=self._f(7,True)).pack(anchor="w", pady=(4,4))
         hotkey_card = tk.Frame(outer, bg=BG2); hotkey_card.pack(fill="x", pady=(0,10))
         inner_h = tk.Frame(hotkey_card, bg=BG2); inner_h.pack(fill="x", padx=14, pady=10)
 
-        if not KEYBOARD_AVAILABLE:
-            tk.Label(inner_h, text="Install 'keyboard' package to enable hotkeys:\npip install keyboard",
+        if os.name != "nt" and not KEYBOARD_AVAILABLE:
+            tk.Label(inner_h, text="Install 'keyboard' package to enable fallback hotkeys:\npip install keyboard",
                      fg=MUTED, bg=BG2, font=self._f(8), justify="left").pack(anchor="w")
         else:
             # Skip track
@@ -1660,10 +1717,15 @@ class App:
             ent_tg.pack(side="left", padx=(4,0))
 
             def _save_hotkeys():
-                global _hotkey_skip_combo, _hotkey_toggle_combo, _hotkey_skip_instr_combo, _hotkey_registered
+                global _hotkey_skip_combo, _hotkey_toggle_combo, _hotkey_skip_instr_combo, _hotkey_registered, _hotkey_backend, _hotkey_manager
                 # Unregister old
-                try: _keyboard.unhook_all_hotkeys()
-                except: pass
+                if _hotkey_backend == "win32" and _hotkey_manager:
+                    _hotkey_manager.unregister_all()
+                    _hotkey_manager = None
+                else:
+                    try: _keyboard.unhook_all_hotkeys()
+                    except: pass
+                _hotkey_backend = "none"
                 _hotkey_registered = False
                 _hotkey_skip_combo       = self._skip_var.get().strip()
                 _hotkey_toggle_combo     = self._toggle_var.get().strip()

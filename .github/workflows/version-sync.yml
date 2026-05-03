@@ -1,0 +1,16 @@
+name: Version Sync Check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  version-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Verify README and runtime versions match
+        run: python scripts_check_version_sync.py
