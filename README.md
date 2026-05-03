@@ -28,11 +28,15 @@
 
 ---
 
-## 🆕 What's New in v1.1.6
-- 🐛 Bug fixes and stability improvements to the WebSocket connection layer.
-- ⚡ Improved lyric sync accuracy and reduced latency between Spicetify and Discord.
-- 🔁 Better reconnection handling when Discord or Spotify restarts mid-session.
-- 🧹 General code cleanup and minor UI polish.
+## 🆕 What's New in v1.1.6 (Human-Friendly)
+If you're updating from an older build, here’s what changed in plain language:
+
+- 🔌 **More reliable connection behavior:** Statusify now keeps the local lyrics bridge alive and handles Discord RPC interruptions better, so temporary disconnects are less disruptive.
+- 🔁 **Smarter auto-reconnect:** If Discord restarts or the RPC pipe is unavailable, Statusify retries automatically and restores status updates when the connection is back.
+- 🎯 **Cleaner lyric handoff:** Synced lyric updates are more consistent, helping Discord presence text stay closer to the current line.
+- ⚙️ **Quality-of-life polish:** General cleanup and UI improvements were made to keep daily use smoother.
+
+In short: **fewer random disconnect headaches, better recovery, and steadier lyric/status syncing.**
 
 ---
 

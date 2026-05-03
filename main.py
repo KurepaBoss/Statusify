@@ -11,6 +11,16 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import ctypes, ctypes.wintypes
 
+from statusify.config import config_path, history_path, cfg_get as _cfg_get_mod, cfg_set as _cfg_set_mod, load_config as _load_config_mod, save_config as _save_config_mod
+from statusify.platform.windows_startup import (
+    startup_lnk_path as _startup_lnk_path_mod,
+    get_startup_enabled as _get_startup_enabled_mod,
+    cleanup_old_startup as _cleanup_old_startup_mod,
+    set_startup_enabled as _set_startup_enabled_mod,
+)
+from statusify.rpc import RpcController
+from statusify.ws_bridge import WsBridge
+
 try:
     import keyboard as _keyboard
     KEYBOARD_AVAILABLE = True
@@ -43,7 +53,9 @@ _ICON_PATH = None  # set on first use
 
 load_dotenv()
 
-_VERSION      = "1.1.5"          # current app version (update on release)
+from version import VERSION
+
+_VERSION      = VERSION
 _GITHUB_REPO  = "KurepaBoss/Statusify"  # GitHub repo for update checks
 
 DISCORD_APP_ID    = os.getenv("DISCORD_APP_ID", "")
@@ -56,28 +68,21 @@ LYRIC_DELAY_MS    = 0       # user-adjustable lyric timing offset (ms)
 _ENV_PATH         = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 # ── Persistent config ─────────────────────────────────────────────
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "statusify.cfg")
-_HIST_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.json")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_CONFIG_PATH = str(config_path(_BASE_DIR))
+_HIST_FILE   = str(history_path(_BASE_DIR))
 
 def _load_config():
-    cfg = configparser.ConfigParser()
-    cfg.read(_CONFIG_PATH)
-    return cfg
+    return _load_config_mod(_CONFIG_PATH)
 
 def _save_config(cfg):
-    with open(_CONFIG_PATH, "w") as f:
-        cfg.write(f)
+    _save_config_mod(cfg, _CONFIG_PATH)
 
 def _cfg_get(section, key, fallback=""):
-    cfg = _load_config()
-    return cfg.get(section, key, fallback=fallback)
+    return _cfg_get_mod(_CONFIG_PATH, section, key, fallback)
 
 def _cfg_set(section, key, value):
-    cfg = _load_config()
-    if not cfg.has_section(section):
-        cfg.add_section(section)
-    cfg.set(section, key, str(value))
-    _save_config(cfg)
+    _cfg_set_mod(_CONFIG_PATH, section, key, value)
 
 # Load persisted settings at startup
 _stored_delay = _cfg_get("preferences", "lyric_delay_ms", "0")
@@ -127,24 +132,146 @@ _hotkey_skip_combo        = _cfg_get("preferences", "hotkey_skip",        "ctrl+
 _hotkey_toggle_combo      = _cfg_get("preferences", "hotkey_toggle",      "ctrl+alt+s") or "ctrl+alt+s"
 _hotkey_skip_instr_combo  = _cfg_get("preferences", "hotkey_skip_instr",  "ctrl+alt+i") or "ctrl+alt+i"
 _hotkey_registered = False
+_hotkey_backend = "none"
+_hotkey_manager = None
 _rpc_enabled          = True   # toggle state
 
+class _WindowsHotkeyManager:
+    MOD_ALT = 0x0001
+    MOD_CONTROL = 0x0002
+    MOD_SHIFT = 0x0004
+    MOD_WIN = 0x0008
+
+    VK_MAP = {
+        "tab": 0x09, "enter": 0x0D, "esc": 0x1B, "escape": 0x1B, "space": 0x20,
+        "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+        "insert": 0x2D, "delete": 0x2E, "home": 0x24, "end": 0x23,
+        "pageup": 0x21, "pagedown": 0x22,
+    }
+
+    def __init__(self):
+        self._user32 = ctypes.windll.user32
+        self._kernel32 = ctypes.windll.kernel32
+        self._id_to_cb = {}
+        self._next_id = 1
+        self._thread = None
+        self._thread_id = 0
+
+    def _parse_combo(self, combo):
+        parts = [p.strip().lower() for p in combo.split("+") if p.strip()]
+        mods = 0
+        key = None
+        for p in parts:
+            if p in ("ctrl", "control"): mods |= self.MOD_CONTROL
+            elif p == "alt": mods |= self.MOD_ALT
+            elif p == "shift": mods |= self.MOD_SHIFT
+            elif p in ("win", "windows", "cmd", "super"): mods |= self.MOD_WIN
+            else: key = p
+        if not key:
+            return None
+        if len(key) == 1 and key.isalpha():
+            vk = ord(key.upper())
+        elif len(key) == 1 and key.isdigit():
+            vk = ord(key)
+        elif key.startswith("f") and key[1:].isdigit() and 1 <= int(key[1:]) <= 24:
+            vk = 0x6F + int(key[1:])
+        else:
+            vk = self.VK_MAP.get(key)
+        if vk is None:
+            return None
+        return mods, vk
+
+    def register(self, combo, cb):
+        parsed = self._parse_combo(combo)
+        if not parsed:
+            return False, f"invalid hotkey '{combo}'"
+        mods, vk = parsed
+        hotkey_id = self._next_id
+        self._next_id += 1
+        if not self._user32.RegisterHotKey(None, hotkey_id, mods, vk):
+            return False, f"Windows refused hotkey '{combo}' (already in use?)"
+        self._id_to_cb[hotkey_id] = cb
+        return True, None
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        def _loop():
+            self._thread_id = self._kernel32.GetCurrentThreadId()
+            msg = ctypes.wintypes.MSG()
+            while self._user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+                if msg.message == 0x0312:  # WM_HOTKEY
+                    cb = self._id_to_cb.get(msg.wParam)
+                    if cb:
+                        try:
+                            cb()
+                        except Exception as e:
+                            log(f"Hotkey callback failed: {e}")
+                self._user32.TranslateMessage(ctypes.byref(msg))
+                self._user32.DispatchMessageW(ctypes.byref(msg))
+        self._thread = threading.Thread(target=_loop, daemon=True)
+        self._thread.start()
+
+    def unregister_all(self):
+        for hotkey_id in list(self._id_to_cb):
+            try:
+                self._user32.UnregisterHotKey(None, hotkey_id)
+            except Exception:
+                pass
+        self._id_to_cb.clear()
+        if self._thread_id:
+            try:
+                self._user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)  # WM_QUIT
+            except Exception:
+                pass
+        self._thread = None
+        self._thread_id = 0
+
 def _register_hotkeys(app_ref):
-    global _hotkey_registered
-    if not KEYBOARD_AVAILABLE or _hotkey_registered:
+    global _hotkey_registered, _hotkey_backend, _hotkey_manager
+    if _hotkey_registered:
+        return
+
+    skip_combo   = _hotkey_skip_combo.strip()
+    toggle_combo = _hotkey_toggle_combo.strip()
+    skip_instr_combo = _hotkey_skip_instr_combo.strip()
+
+    if os.name == "nt":
+        try:
+            _hotkey_manager = _WindowsHotkeyManager()
+            for combo, cb in (
+                (skip_combo, lambda: _hotkey_skip(app_ref)),
+                (toggle_combo, lambda: _hotkey_toggle(app_ref)),
+                (skip_instr_combo, _hotkey_skip_instrumental),
+            ):
+                if combo:
+                    ok, err = _hotkey_manager.register(combo, cb)
+                    if not ok:
+                        raise RuntimeError(err)
+            _hotkey_manager.start()
+            _hotkey_backend = "win32"
+            _hotkey_registered = True
+            log(f"Hotkeys registered (Win32)  ·  skip={skip_combo or 'none'}  toggle={toggle_combo or 'none'}  skip_instr={skip_instr_combo or 'none'}")
+            return
+        except Exception as e:
+            if _hotkey_manager:
+                _hotkey_manager.unregister_all()
+            _hotkey_manager = None
+            log(f"Win32 hotkeys failed, falling back to keyboard package: {e}")
+
+    if not KEYBOARD_AVAILABLE:
+        log("Hotkeys unavailable: install keyboard package")
         return
     try:
-        skip_combo   = _hotkey_skip_combo.strip()
-        toggle_combo = _hotkey_toggle_combo.strip()
-        skip_instr_combo = _hotkey_skip_instr_combo.strip()
         if skip_combo:
             _keyboard.add_hotkey(skip_combo,       lambda: _hotkey_skip(app_ref),       suppress=False)
         if toggle_combo:
             _keyboard.add_hotkey(toggle_combo,     lambda: _hotkey_toggle(app_ref),     suppress=False)
         if skip_instr_combo:
             _keyboard.add_hotkey(skip_instr_combo, lambda: _hotkey_skip_instrumental(), suppress=False)
+        _hotkey_backend = "keyboard"
         _hotkey_registered = True
-        log(f"Hotkeys registered  ·  skip={skip_combo or 'none'}  toggle={toggle_combo or 'none'}  skip_instr={skip_instr_combo or 'none'}")
+        log(f"Hotkeys registered (keyboard)  ·  skip={skip_combo or 'none'}  toggle={toggle_combo or 'none'}  skip_instr={skip_instr_combo or 'none'}")
     except Exception as e:
         log(f"Hotkey registration failed: {e}")
 
@@ -192,24 +319,25 @@ if IS_WINDOWS:
     except Exception as e:
         _WINDOWS_STARTUP_AVAILABLE = False
 
+def _startup_lnk_path():
+    return _startup_lnk_path_mod()
 
 def _get_startup_enabled():
-    if not (_WINDOWS_STARTUP_AVAILABLE and _windows_startup):
-        return False
-    return _windows_startup.get_startup_enabled()
+    return _get_startup_enabled_mod()
 
+def _cleanup_old_startup():
+    _cleanup_old_startup_mod()
 
 def _set_startup_enabled(enabled: bool):
-    if not (_WINDOWS_STARTUP_AVAILABLE and _windows_startup):
-        log("Startup-at-login is unavailable on this operating system.")
-        return
-    _windows_startup.set_startup_enabled(enabled, log_func=log)
+    _set_startup_enabled_mod(enabled, _BASE_DIR, log)
 
 executor    = ThreadPoolExecutor(max_workers=1)
 log_queue   = queue.Queue()
 event_queue        = queue.Queue()
 _rpc_skip_instr_flag = [False]  # [0] set True to skip current instrumental
 _spicetify_ws = None  # active WebSocket to Spicetify extension
+rpc_controller = RpcController(RATE_LIMIT_CALLS, RATE_LIMIT_WINDOW)
+ws_bridge = WsBridge(WS_HOST, WS_PORT)
 
 def log(msg): log_queue.put(msg)
 
@@ -223,6 +351,30 @@ class State:
     synced = []; plain = []
 
 state = State()
+
+class HealthState:
+    bridge_status = "disconnected"
+    rpc_status = "disconnected"
+    last_heartbeat = "—"
+    reconnect_attempts = 0
+
+health = HealthState()
+
+def _emit_health(component, status, detail=""):
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    health.last_heartbeat = now
+    if component == "bridge":
+        health.bridge_status = status
+    elif component == "rpc":
+        health.rpc_status = status
+    if status == "reconnecting":
+        health.reconnect_attempts += 1
+    tag = f"[HEALTH/{component.upper()}]"
+    msg = f"{tag} {status}"
+    if detail:
+        msg += f"  ·  {detail}"
+    log(msg)
+    event_queue.put(("health", component, status, now, health.reconnect_attempts))
 
 # Session history: [{artist, title, album_art, synced, plain, mode, time}]
 history = []
@@ -424,6 +576,7 @@ class DiscordRPC:
             self._connected = True
             user = resp["data"]["user"]["username"]
             log(f"RPC handshake OK  ·  {user}"); event_queue.put(("rpc_ok", user))
+            _emit_health("rpc", "connected", user)
         else: raise RuntimeError(f"Handshake failed: {resp}")
     def _raw(self, op, data):
         p = json.dumps(data).encode()
@@ -469,6 +622,7 @@ async def ws_handler(ws):
     global _spicetify_ws
     _spicetify_ws = ws
     log("Spicetify connected"); event_queue.put(("sp", True))
+    _emit_health("bridge", "connected")
     try:
         # Brief pause so the extension's onmessage handler is wired up
         # before we ask it to report state (onopen and onmessage are set
@@ -514,6 +668,7 @@ async def ws_handler(ws):
     except websockets.exceptions.ConnectionClosed:
         _spicetify_ws = None
         log("Spicetify disconnected"); event_queue.put(("sp", False))
+        _emit_health("bridge", "disconnected")
         state.is_playing = False
 
 def _save_history(mode, synced, plain):
@@ -578,7 +733,12 @@ async def rpc_loop(rpc):
 
     while True:
         await asyncio.sleep(0.05)
+        if _force_rpc_reconnect[0]:
+            _force_rpc_reconnect[0] = False
+            _emit_health("rpc", "disconnected", "manual reconnect")
+            return
         if not connected():
+            _emit_health("rpc", "disconnected")
             return  # pipe broke — let _backend reconnect
         if not _rpc_enabled:
             continue
@@ -1176,6 +1336,25 @@ class App:
         tk.Label(sb, text=" Discord RPC", fg=MUTED, bg=BG, font=self._f(8)).pack(side="left")
         self.lbl_rl = tk.Label(sb, text="", fg=MUTED, bg=BG, font=self._f(8)); self.lbl_rl.pack(side="right")
 
+        # Connection Health
+        hc = tk.Frame(p, bg=BG2); hc.pack(fill="x", padx=14, pady=(4,6))
+        tk.Label(hc, text="CONNECTION HEALTH", fg=MUTED, bg=BG2, font=self._f(7, True)).pack(anchor="w", padx=10, pady=(8,2))
+        self.lbl_h_bridge = tk.Label(hc, text="Bridge: disconnected", fg=TEXT2, bg=BG2, font=self._f(8))
+        self.lbl_h_bridge.pack(anchor="w", padx=10)
+        self.lbl_h_rpc = tk.Label(hc, text="Discord RPC: disconnected", fg=TEXT2, bg=BG2, font=self._f(8))
+        self.lbl_h_rpc.pack(anchor="w", padx=10)
+        self.lbl_h_beat = tk.Label(hc, text="Last heartbeat: —", fg=TEXT2, bg=BG2, font=self._f(8))
+        self.lbl_h_beat.pack(anchor="w", padx=10)
+        self.lbl_h_retries = tk.Label(hc, text="Reconnect attempts: 0", fg=TEXT2, bg=BG2, font=self._f(8))
+        self.lbl_h_retries.pack(anchor="w", padx=10, pady=(0,4))
+        hr = tk.Frame(hc, bg=BG2); hr.pack(fill="x", padx=10, pady=(0,8))
+        tk.Label(hr, text="Reconnect Bridge", fg=TEXT2, bg=BG3, font=self._f(8), cursor="hand2", padx=8, pady=3).pack(side="left", padx=(0,6))
+        hr.winfo_children()[-1].bind("<Button-1>", lambda e: self._reconnect_bridge())
+        tk.Label(hr, text="Reconnect Discord", fg=TEXT2, bg=BG3, font=self._f(8), cursor="hand2", padx=8, pady=3).pack(side="left", padx=(0,6))
+        hr.winfo_children()[-1].bind("<Button-1>", lambda e: self._reconnect_discord())
+        tk.Label(hr, text="Reset Session State", fg=TEXT2, bg=BG3, font=self._f(8), cursor="hand2", padx=8, pady=3).pack(side="left")
+        hr.winfo_children()[-1].bind("<Button-1>", lambda e: self._reset_session_state())
+
         tk.Frame(p, bg=BORDER, height=1).pack(fill="x", padx=14, pady=(2,6))
         tk.Label(p, text="LOG", fg=MUTED, bg=BG, font=self._f(7,True)).pack(anchor="w", padx=14)
         lf = tk.Frame(p, bg=BG2); lf.pack(fill="both", expand=True, padx=14, pady=(3,14))
@@ -1514,13 +1693,13 @@ class App:
         tk.Label(row_ac, text="  ↑ click", fg=MUTED, bg=BG2, font=self._f(7)).pack(side="right")
 
         # ── Section: Hotkeys ───────────────────────────────────────
-        tk.Label(outer, text="GLOBAL HOTKEYS", fg=MUTED, bg=BG,
+        tk.Label(outer, text="GLOBAL HOTKEYS (fullscreen-safe on Windows)", fg=MUTED, bg=BG,
                  font=self._f(7,True)).pack(anchor="w", pady=(4,4))
         hotkey_card = tk.Frame(outer, bg=BG2); hotkey_card.pack(fill="x", pady=(0,10))
         inner_h = tk.Frame(hotkey_card, bg=BG2); inner_h.pack(fill="x", padx=14, pady=10)
 
-        if not KEYBOARD_AVAILABLE:
-            tk.Label(inner_h, text="Install 'keyboard' package to enable hotkeys:\npip install keyboard",
+        if os.name != "nt" and not KEYBOARD_AVAILABLE:
+            tk.Label(inner_h, text="Install 'keyboard' package to enable fallback hotkeys:\npip install keyboard",
                      fg=MUTED, bg=BG2, font=self._f(8), justify="left").pack(anchor="w")
         else:
             # Skip track
@@ -1548,10 +1727,15 @@ class App:
             ent_tg.pack(side="left", padx=(4,0))
 
             def _save_hotkeys():
-                global _hotkey_skip_combo, _hotkey_toggle_combo, _hotkey_skip_instr_combo, _hotkey_registered
+                global _hotkey_skip_combo, _hotkey_toggle_combo, _hotkey_skip_instr_combo, _hotkey_registered, _hotkey_backend, _hotkey_manager
                 # Unregister old
-                try: _keyboard.unhook_all_hotkeys()
-                except: pass
+                if _hotkey_backend == "win32" and _hotkey_manager:
+                    _hotkey_manager.unregister_all()
+                    _hotkey_manager = None
+                else:
+                    try: _keyboard.unhook_all_hotkeys()
+                    except: pass
+                _hotkey_backend = "none"
                 _hotkey_registered = False
                 _hotkey_skip_combo       = self._skip_var.get().strip()
                 _hotkey_toggle_combo     = self._toggle_var.get().strip()
@@ -1942,6 +2126,33 @@ class App:
         self.canvas.create_rectangle(0,0,72,72, fill=BG3, outline=BORDER)
         self.canvas.create_text(36,36, text="♫", fill=MUTED, font=self._f(14))
 
+    def _reconnect_bridge(self):
+        ws = _spicetify_ws
+        _emit_health("bridge", "reconnecting", "manual request")
+        if ws is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(ws.close(), _backend_loop)
+        except Exception as e:
+            log(f"[HEALTH/BRIDGE] reconnect failed  ·  {e}")
+
+    def _reconnect_discord(self):
+        _force_rpc_reconnect[0] = True
+        _emit_health("rpc", "reconnecting", "manual request")
+
+    def _reset_session_state(self):
+        global _session_songs, _session_start, _session_listen_secs, _track_start_mono
+        _session_songs = 0
+        _session_start = time.monotonic()
+        _session_listen_secs = 0.0
+        _track_start_mono = None
+        health.reconnect_attempts = 0
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        health.last_heartbeat = now
+        event_queue.put(("health", "bridge", health.bridge_status, now, 0))
+        log("[HEALTH/SESSION] state reset")
+        event_queue.put(("stats",))
+
     def _start_rl_countdown(self, wait_secs):
         # Cancel any previous countdown
         if hasattr(self, "_rl_after") and self._rl_after:
@@ -2036,6 +2247,12 @@ class App:
                 threading.Thread(target=_send_skip, daemon=True).start()
             elif k == "rpc_err":
                 self.dot_dc.config(fg=MUTED)
+            elif k == "health":
+                _, component, status, beat, attempts = ev
+                self.lbl_h_bridge.config(text=f"Bridge: {health.bridge_status}")
+                self.lbl_h_rpc.config(text=f"Discord RPC: {health.rpc_status}")
+                self.lbl_h_beat.config(text=f"Last heartbeat: {beat}")
+                self.lbl_h_retries.config(text=f"Reconnect attempts: {attempts}")
             elif k == "hotkey_skip_instr":
                 pass  # handled directly in _hotkey_skip_instrumental
             elif k == "hotkey_toggle":
@@ -2115,12 +2332,15 @@ async def _backend():
     # reconnect automatically — lyrics keep streaming to Discord as soon as
     # the pipe becomes available again.
     while True:
+        if _force_rpc_reconnect[0]:
+            _force_rpc_reconnect[0] = False
         rpc = DiscordRPC(DISCORD_APP_ID)
         try:
             await rpc.connect()
         except RuntimeError as e:
             log(f"RPC unavailable: {e}  — retrying in 15s")
             event_queue.put(("rpc_err",))
+            _emit_health("rpc", "reconnecting", "retry in 15s")
             await asyncio.sleep(15)
             continue
         # Connected — run the RPC update loop until the pipe breaks
@@ -2128,6 +2348,7 @@ async def _backend():
         # rpc_loop returned (pipe died) — wait briefly then reconnect
         log("RPC disconnected — reconnecting in 5s")
         event_queue.put(("rpc_err",))
+        _emit_health("rpc", "reconnecting", "retry in 5s")
         await asyncio.sleep(5)
 
 _backend_loop = None  # set in __main__, used by _send_skip

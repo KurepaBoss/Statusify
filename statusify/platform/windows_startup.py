@@ -1,28 +1,22 @@
-"""Windows-only startup-at-login integration for Statusify."""
-
 import base64
 import os
-import subprocess
-import sys
 import threading
 import winreg
 
 
-def _startup_lnk_path() -> str:
-    startup = os.path.join(
+def startup_lnk_path() -> str:
+    return os.path.join(
         os.environ.get("APPDATA", ""),
         r"Microsoft\Windows\Start Menu\Programs\Startup",
         "Statusify.lnk",
     )
-    return startup
 
 
 def get_startup_enabled() -> bool:
-    return os.path.exists(_startup_lnk_path())
+    return os.path.exists(startup_lnk_path())
 
 
-def _cleanup_old_startup() -> None:
-    """Remove any leftover registry Run key entries from previous versions."""
+def cleanup_old_startup() -> None:
     try:
         key = winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
@@ -39,24 +33,26 @@ def _cleanup_old_startup() -> None:
         pass
 
 
-def set_startup_enabled(enabled: bool, *, log_func=print) -> None:
-    lnk = _startup_lnk_path()
-    _cleanup_old_startup()
+def set_startup_enabled(enabled: bool, base_dir: str, log) -> None:
+    lnk = startup_lnk_path()
+    cleanup_old_startup()
     if not enabled:
         try:
             os.remove(lnk)
         except FileNotFoundError:
             pass
         except Exception as e:
-            log_func(f"Startup remove error: {e}")
+            log(f"Startup remove error: {e}")
         return
 
-    def _create() -> None:
+    def _create():
         try:
-            script_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            ico = os.path.join(script_dir, "statusify.ico")
-            statusify_exe = os.path.join(script_dir, "Statusify.exe")
-            main_py = os.path.join(script_dir, "main.py")
+            import subprocess
+            import sys
+
+            ico = os.path.join(base_dir, "statusify.ico")
+            statusify_exe = os.path.join(base_dir, "Statusify.exe")
+            main_py = os.path.join(base_dir, "main.py")
 
             if os.path.exists(statusify_exe):
                 target = statusify_exe
@@ -73,7 +69,7 @@ def set_startup_enabled(enabled: bool, *, log_func=print) -> None:
                 f'$lnk = $ws.CreateShortcut("{lnk}")',
                 f'$lnk.TargetPath      = "{target}"',
                 f'$lnk.Arguments       = "{args}"',
-                f'$lnk.WorkingDirectory= "{script_dir}"',
+                f'$lnk.WorkingDirectory= "{base_dir}"',
                 '$lnk.Description     = "Statusify"',
                 f'$lnk.IconLocation    = "{ico},0"',
                 '$lnk.WindowStyle     = 7',
@@ -100,8 +96,8 @@ def set_startup_enabled(enabled: bool, *, log_func=print) -> None:
                 startupinfo=si,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
-            log_func("Startup shortcut created")
+            log("Startup shortcut created")
         except Exception as e:
-            log_func(f"Startup shortcut error: {e}")
+            log(f"Startup shortcut error: {e}")
 
     threading.Thread(target=_create, daemon=True).start()
