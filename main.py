@@ -618,7 +618,7 @@ class DiscordRPC:
             {"cmd":"SET_ACTIVITY","args":{"pid":os.getpid(),"activity":None},"nonce":self._nxt()})
 
 # ── WebSocket ─────────────────────────────────────────────────────
-async def ws_handler(ws):
+async def ws_handler(ws, _path=None):
     global _spicetify_ws
     _spicetify_ws = ws
     log("Spicetify connected"); event_queue.put(("sp", True))
@@ -669,6 +669,11 @@ async def ws_handler(ws):
         _spicetify_ws = None
         log("Spicetify disconnected"); event_queue.put(("sp", False))
         _emit_health("bridge", "disconnected")
+        state.is_playing = False
+    except Exception as e:
+        _spicetify_ws = None
+        log(f"Spicetify handler error: {e}"); event_queue.put(("sp", False))
+        _emit_health("bridge", "disconnected", str(e))
         state.is_playing = False
 
 def _save_history(mode, synced, plain):
