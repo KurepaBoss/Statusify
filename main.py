@@ -11,6 +11,16 @@ from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import ctypes, ctypes.wintypes
 
+from statusify.config import config_path, history_path, cfg_get as _cfg_get_mod, cfg_set as _cfg_set_mod, load_config as _load_config_mod, save_config as _save_config_mod
+from statusify.platform.windows_startup import (
+    startup_lnk_path as _startup_lnk_path_mod,
+    get_startup_enabled as _get_startup_enabled_mod,
+    cleanup_old_startup as _cleanup_old_startup_mod,
+    set_startup_enabled as _set_startup_enabled_mod,
+)
+from statusify.rpc import RpcController
+from statusify.ws_bridge import WsBridge
+
 try:
     import keyboard as _keyboard
     KEYBOARD_AVAILABLE = True
@@ -56,28 +66,21 @@ LYRIC_DELAY_MS    = 0       # user-adjustable lyric timing offset (ms)
 _ENV_PATH         = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 # ── Persistent config ─────────────────────────────────────────────
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "statusify.cfg")
-_HIST_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.json")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_CONFIG_PATH = str(config_path(_BASE_DIR))
+_HIST_FILE   = str(history_path(_BASE_DIR))
 
 def _load_config():
-    cfg = configparser.ConfigParser()
-    cfg.read(_CONFIG_PATH)
-    return cfg
+    return _load_config_mod(_CONFIG_PATH)
 
 def _save_config(cfg):
-    with open(_CONFIG_PATH, "w") as f:
-        cfg.write(f)
+    _save_config_mod(cfg, _CONFIG_PATH)
 
 def _cfg_get(section, key, fallback=""):
-    cfg = _load_config()
-    return cfg.get(section, key, fallback=fallback)
+    return _cfg_get_mod(_CONFIG_PATH, section, key, fallback)
 
 def _cfg_set(section, key, value):
-    cfg = _load_config()
-    if not cfg.has_section(section):
-        cfg.add_section(section)
-    cfg.set(section, key, str(value))
-    _save_config(cfg)
+    _cfg_set_mod(_CONFIG_PATH, section, key, value)
 
 # Load persisted settings at startup
 _stored_delay = _cfg_get("preferences", "lyric_delay_ms", "0")
@@ -183,92 +186,24 @@ def _hotkey_toggle(app_ref):
 # ── Startup with Windows ──────────────────────────────────────────
 
 def _startup_lnk_path():
-    """Path to the Statusify shortcut in the user's Startup folder."""
-    startup = os.path.join(os.environ.get("APPDATA", ""),
-                           r"Microsoft\Windows\Start Menu\Programs\Startup",
-                           "Statusify.lnk")
-    return startup
+    return _startup_lnk_path_mod()
 
 def _get_startup_enabled():
-    return os.path.exists(_startup_lnk_path())
+    return _get_startup_enabled_mod()
 
 def _cleanup_old_startup():
-    """Remove any leftover registry Run key entries from previous versions."""
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                             r"Software\Microsoft\Windows\CurrentVersion\Run",
-                             0, winreg.KEY_SET_VALUE)
-        try: winreg.DeleteValue(key, "Statusify")
-        except FileNotFoundError: pass
-        winreg.CloseKey(key)
-    except Exception:
-        pass
+    _cleanup_old_startup_mod()
 
 def _set_startup_enabled(enabled: bool):
-    lnk = _startup_lnk_path()
-    # Always clean up old registry entry regardless of enable/disable
-    _cleanup_old_startup()
-    if not enabled:
-        try: os.remove(lnk)
-        except FileNotFoundError: pass
-        except Exception as e: log(f"Startup remove error: {e}")
-        return
-
-    def _create():
-        try:
-            import subprocess, sys, base64
-            script_dir    = os.path.dirname(os.path.abspath(__file__))
-            ico            = os.path.join(script_dir, "statusify.ico")
-            statusify_exe  = os.path.join(script_dir, "Statusify.exe")
-            main_py        = os.path.join(script_dir, "main.py")
-
-            if os.path.exists(statusify_exe):
-                target = statusify_exe
-                args   = ""
-            else:
-                pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-                if not os.path.exists(pythonw):
-                    pythonw = sys.executable.replace("python.exe", "pythonw.exe")
-                target = pythonw
-                args   = f'"{main_py}"'
-
-            # Build script as a proper multi-line PS string then base64-encode it
-            # so that no path-with-spaces quoting can break the -Command argument.
-            ps_lines = [
-                f'$ws  = New-Object -ComObject WScript.Shell',
-                f'$lnk = $ws.CreateShortcut("{lnk}")',
-                f'$lnk.TargetPath      = "{target}"',
-                f'$lnk.Arguments       = "{args}"',
-                f'$lnk.WorkingDirectory= "{script_dir}"',
-                f'$lnk.Description     = "Statusify"',
-                f'$lnk.IconLocation    = "{ico},0"',
-                f'$lnk.WindowStyle     = 7',
-                f'$lnk.Save()',
-            ]
-            ps_script = "\r\n".join(ps_lines)
-            encoded   = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
-
-            si = subprocess.STARTUPINFO()
-            si.dwFlags    |= subprocess.STARTF_USESHOWWINDOW
-            si.wShowWindow = 0
-            subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive",
-                 "-WindowStyle", "Hidden", "-EncodedCommand", encoded],
-                capture_output=True, timeout=15,
-                startupinfo=si,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            log("Startup shortcut created")
-        except Exception as e:
-            log(f"Startup shortcut error: {e}")
-
-    threading.Thread(target=_create, daemon=True).start()
+    _set_startup_enabled_mod(enabled, _BASE_DIR, log)
 
 executor    = ThreadPoolExecutor(max_workers=1)
 log_queue   = queue.Queue()
 event_queue        = queue.Queue()
 _rpc_skip_instr_flag = [False]  # [0] set True to skip current instrumental
 _spicetify_ws = None  # active WebSocket to Spicetify extension
+rpc_controller = RpcController(RATE_LIMIT_CALLS, RATE_LIMIT_WINDOW)
+ws_bridge = WsBridge(WS_HOST, WS_PORT)
 
 def log(msg): log_queue.put(msg)
 
