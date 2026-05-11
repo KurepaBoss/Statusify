@@ -684,15 +684,11 @@ async def ws_handler(ws, _path=None):
         log(f"Spicetify handler error: {e}")
         _emit_health("bridge", "disconnected", str(e))
     finally:
-        # Only mark disconnected if this handler still owns the active socket.
-        # A stale handler from a superseded connection must not overwrite
-        # healthy status from the current connection.
-        was_active = (_spicetify_ws is ws)
-        if was_active:
+        if _spicetify_ws is ws:
             _spicetify_ws = None
-            event_queue.put(("sp", False))
-            _emit_health("bridge", "disconnected")
-            state.is_playing = False
+        event_queue.put(("sp", False))
+        _emit_health("bridge", "disconnected")
+        state.is_playing = False
 
 def _save_history(mode, synced, plain):
     # Always save to in-memory history so the UI tab works during the session
@@ -2346,9 +2342,8 @@ async def _backend():
 
     # Start the WebSocket server first so Spicetify can connect regardless of
     # whether Discord RPC is available yet (e.g. Discord not open yet, or a
-    # game is currently holding the pipe). Keep a strong reference so the
-    # server isn't eligible for garbage collection.
-    _ws_server = await websockets.serve(
+    # game is currently holding the pipe).
+    await websockets.serve(
         ws_handler,
         WS_HOST,
         WS_PORT,
