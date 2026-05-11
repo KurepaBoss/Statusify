@@ -629,6 +629,7 @@ async def ws_handler(ws, _path=None):
     if prev_ws is not None and prev_ws is not ws:
         try:
             await prev_ws.close(code=1012, reason="superseded by new connection")
+            await prev_ws.wait_closed()
         except Exception:
             pass
 
@@ -2341,7 +2342,14 @@ async def _backend():
     # Start the WebSocket server first so Spicetify can connect regardless of
     # whether Discord RPC is available yet (e.g. Discord not open yet, or a
     # game is currently holding the pipe).
-    await websockets.serve(ws_handler, WS_HOST, WS_PORT)
+    await websockets.serve(
+        ws_handler,
+        WS_HOST,
+        WS_PORT,
+        ping_interval=20,
+        ping_timeout=20,
+        close_timeout=5,
+    )
     log(f"WebSocket ready  ·  ws://{WS_HOST}:{WS_PORT}")
     log("Open Spotify to begin")
 
