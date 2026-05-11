@@ -620,6 +620,18 @@ class DiscordRPC:
 # ── WebSocket ─────────────────────────────────────────────────────
 async def ws_handler(ws, _path=None):
     global _spicetify_ws
+
+    # Keep at most one active bridge client.
+    # If Spotify/extension reconnects before the previous socket is fully
+    # torn down, explicitly close the stale socket to avoid piling up
+    # CLOSE_WAIT/FIN_WAIT states on the Python side.
+    prev_ws = _spicetify_ws
+    if prev_ws is not None and prev_ws is not ws:
+        try:
+            await prev_ws.close(code=1012, reason="superseded by new connection")
+        except Exception:
+            pass
+
     _spicetify_ws = ws
     log("Spicetify connected"); event_queue.put(("sp", True))
     _emit_health("bridge", "connected")
@@ -666,14 +678,15 @@ async def ws_handler(ws, _path=None):
                 if not was and state.is_playing:
                     _on_track_resume()
     except websockets.exceptions.ConnectionClosed:
-        _spicetify_ws = None
-        log("Spicetify disconnected"); event_queue.put(("sp", False))
-        _emit_health("bridge", "disconnected")
-        state.is_playing = False
+        log("Spicetify disconnected")
     except Exception as e:
-        _spicetify_ws = None
-        log(f"Spicetify handler error: {e}"); event_queue.put(("sp", False))
+        log(f"Spicetify handler error: {e}")
         _emit_health("bridge", "disconnected", str(e))
+    finally:
+        if _spicetify_ws is ws:
+            _spicetify_ws = None
+        event_queue.put(("sp", False))
+        _emit_health("bridge", "disconnected")
         state.is_playing = False
 
 def _save_history(mode, synced, plain):
