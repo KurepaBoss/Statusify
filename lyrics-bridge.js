@@ -8,6 +8,7 @@
     let ws             = null;
     let reconnectTimer = null;
     let lastTrackUri   = "";   // tracks what we last sent a track_change for
+    const ENABLE_SPICY_FALLBACK = false; // disable external fallback to avoid DNS-related Spotify extension instability
 
     function connect() {
         if (ws?.readyState === WebSocket.OPEN) return;
@@ -174,7 +175,17 @@
         return { mode: "synced", synced, plain: [] };
     }
 
+    function isDnsResolutionError(err) {
+        const msg = String(err?.message || err || "").toLowerCase();
+        return msg.includes("err_name_not_resolved")
+            || msg.includes("name_not_resolved")
+            || msg.includes("dns")
+            || msg.includes("failed to fetch")
+            || msg.includes("networkerror");
+    }
+
     async function fetchSpicyLyrics(trackUri) {
+        if (!ENABLE_SPICY_FALLBACK) return null;
         const trackId = trackUri.split(":").pop();
         const token   = getSpotifyToken();
         if (!token) { console.warn("[LyricsBridge] No Spotify token."); return null; }
@@ -200,7 +211,11 @@
             }
             return result;
         } catch(e) {
-            console.warn("[LyricsBridge] Spicy fetch failed:", e.message);
+            if (isDnsResolutionError(e)) {
+                console.warn("[LyricsBridge] Spicy endpoint unreachable.");
+            } else {
+                console.warn("[LyricsBridge] Spicy fetch failed:", e.message);
+            }
             return null;
         }
     }
@@ -256,18 +271,20 @@
         send({ type: "track_change", artist, title, track_uri: trackUri,
                album_art: albumArt, duration_ms: durMs });
 
-        // Try Spicy first; fall back to Spotify's own color-lyrics API if Spicy
-        // returns nothing (song not in their catalogue, network error, etc.).
-        let lyrics = await fetchSpicyLyrics(trackUri);
-        let source = "Spicy";
-        if (!lyrics) {
-            lyrics = await fetchSpotifyLyrics(trackUri);
-            source = "Spotify";
-        }
-        send({ type: "lyrics", track_uri: trackUri, source,
-               ...(lyrics || { mode: "none", synced: [], plain: [] }) });
+        try {
+            let lyrics = await fetchSpotifyLyrics(trackUri);
+            let source = lyrics ? "Spotify" : "None";
 
-        fetchingUris.delete(trackUri);
+            if (!lyrics && ENABLE_SPICY_FALLBACK) {
+                lyrics = await fetchSpicyLyrics(trackUri);
+                source = lyrics ? "Spicy" : "None";
+            }
+
+            send({ type: "lyrics", track_uri: trackUri, source,
+                   ...(lyrics || { mode: "none", synced: [], plain: [] }) });
+        } finally {
+            fetchingUris.delete(trackUri);
+        }
     }
 
     async function tick() {
