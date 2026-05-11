@@ -2337,6 +2337,7 @@ def run_backend(loop):
     asyncio.set_event_loop(loop); loop.run_until_complete(_backend())
 
 async def _backend():
+    global _ws_server
     if not DISCORD_APP_ID: log("ERROR: Missing DISCORD_APP_ID in .env"); return
 
     # Start the WebSocket server first so Spicetify can connect regardless of
@@ -2378,6 +2379,7 @@ async def _backend():
         await asyncio.sleep(5)
 
 _backend_loop = None  # set in __main__, used by _send_skip
+_ws_server = None
 
 # ── Feature 1: First-run setup wizard ────────────────────────────
 def _run_setup_wizard():
