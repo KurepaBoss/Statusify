@@ -2342,9 +2342,8 @@ async def _backend():
 
     # Start the WebSocket server first so Spicetify can connect regardless of
     # whether Discord RPC is available yet (e.g. Discord not open yet, or a
-    # game is currently holding the pipe). Keep a strong reference so the
-    # server isn't eligible for garbage collection.
-    _ws_server = await websockets.serve(
+    # game is currently holding the pipe).
+    await websockets.serve(
         ws_handler,
         WS_HOST,
         WS_PORT,
