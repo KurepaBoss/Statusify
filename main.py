@@ -620,6 +620,19 @@ class DiscordRPC:
 # ── WebSocket ─────────────────────────────────────────────────────
 async def ws_handler(ws, _path=None):
     global _spicetify_ws
+
+    # Keep at most one active bridge client.
+    # If Spotify/extension reconnects before the previous socket is fully
+    # torn down, explicitly close the stale socket to avoid piling up
+    # CLOSE_WAIT/FIN_WAIT states on the Python side.
+    prev_ws = _spicetify_ws
+    if prev_ws is not None and prev_ws is not ws:
+        try:
+            await prev_ws.close(code=1012, reason="superseded by new connection")
+            await prev_ws.wait_closed()
+        except Exception:
+            pass
+
     _spicetify_ws = ws
     log("Spicetify connected"); event_queue.put(("sp", True))
     _emit_health("bridge", "connected")
@@ -666,14 +679,15 @@ async def ws_handler(ws, _path=None):
                 if not was and state.is_playing:
                     _on_track_resume()
     except websockets.exceptions.ConnectionClosed:
-        _spicetify_ws = None
-        log("Spicetify disconnected"); event_queue.put(("sp", False))
-        _emit_health("bridge", "disconnected")
-        state.is_playing = False
+        log("Spicetify disconnected")
     except Exception as e:
-        _spicetify_ws = None
-        log(f"Spicetify handler error: {e}"); event_queue.put(("sp", False))
+        log(f"Spicetify handler error: {e}")
         _emit_health("bridge", "disconnected", str(e))
+    finally:
+        if _spicetify_ws is ws:
+            _spicetify_ws = None
+        event_queue.put(("sp", False))
+        _emit_health("bridge", "disconnected")
         state.is_playing = False
 
 def _save_history(mode, synced, plain):
@@ -2323,12 +2337,21 @@ def run_backend(loop):
     asyncio.set_event_loop(loop); loop.run_until_complete(_backend())
 
 async def _backend():
+    global _ws_server
     if not DISCORD_APP_ID: log("ERROR: Missing DISCORD_APP_ID in .env"); return
 
     # Start the WebSocket server first so Spicetify can connect regardless of
     # whether Discord RPC is available yet (e.g. Discord not open yet, or a
-    # game is currently holding the pipe).
-    await websockets.serve(ws_handler, WS_HOST, WS_PORT)
+    # game is currently holding the pipe). Keep a strong reference so the
+    # server isn't eligible for garbage collection.
+    _ws_server = await websockets.serve(
+        ws_handler,
+        WS_HOST,
+        WS_PORT,
+        ping_interval=20,
+        ping_timeout=20,
+        close_timeout=5,
+    )
     log(f"WebSocket ready  ·  ws://{WS_HOST}:{WS_PORT}")
     log("Open Spotify to begin")
 
@@ -2357,6 +2380,7 @@ async def _backend():
         await asyncio.sleep(5)
 
 _backend_loop = None  # set in __main__, used by _send_skip
+_ws_server = None
 
 # ── Feature 1: First-run setup wizard ────────────────────────────
 def _run_setup_wizard():
