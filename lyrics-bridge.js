@@ -1,20 +1,35 @@
 (async function lyricsBridge() {
-    while (!Spicetify?.Player || !Spicetify?.CosmosAsync) {
+    while (!Spicetify?.Player?.data || !Spicetify?.CosmosAsync) {
         await new Promise(r => setTimeout(r, 300));
     }
     await new Promise(r => setTimeout(r, 1000));
     console.log("[LyricsBridge] Loaded.");
 
+    // ── Spicy Lyrics API version ─────────────────────────────────
+    // api.spicylyrics.org gates requests on the version headers below. This
+    // was pinned to 5.19.12 (released 8 Mar 2026) while the live extension had
+    // moved on to 6.1.1 — ten releases later, across a major version bump that
+    // changed the lyrics backend (6.1.0 added a server-side request queue and
+    // dropped background prefetching). A stale version made every Spicy call
+    // fail, and because the fallback was silent the app quietly served Spotify
+    // lyrics for every single track while still labelling the pipeline "Spicy
+    // first". Keep this in step with:
+    //   https://github.com/Spikerko/spicy-lyrics/releases
+    const SPICY_VERSION = "6.1.1";
+
     let ws             = null;
     let reconnectTimer = null;
     let lastTrackUri   = "";   // tracks what we last sent a track_change for
-    const ENABLE_SPICY_FALLBACK = false; // disable external fallback to avoid DNS-related Spotify extension instability
+    // Remembers why the last Spicy attempt failed, so the fallback can say so
+    // instead of silently downgrading.
+    let lastSpicyError = "";
+
+    // ── In-memory storage for synced lyrics ──────────────────────
+    let currentLyrics = null;  // { mode: "synced", synced: [{startMs, words}, ...], plain: [...] }
 
     function connect() {
         if (ws?.readyState === WebSocket.OPEN) return;
-        const wsUrl = "ws://127.0.0.1:8765";
-        ws = new WebSocket(wsUrl);
-        console.log("[LyricsBridge] Connecting:", wsUrl);
+        ws = new WebSocket("ws://127.0.0.1:8765");
 
         ws.onopen = async () => {
             console.log("[LyricsBridge] Connected.");
@@ -61,6 +76,21 @@
                     }
                 } else if (msg.type === "skip_track") {
                     Spicetify.Player.next();
+                } else if (msg.type === "skip_instrumental") {
+                    // ── Skip instrumental: seek to the next lyric line ──
+                    if (!currentLyrics || currentLyrics.mode !== "synced" || !currentLyrics.synced?.length) {
+                        console.log("[LyricsBridge] Skip instrumental: no synced lyrics available");
+                        return;
+                    }
+                    const posMs = Spicetify.Player.getProgress();
+                    // Find the first lyric line that starts AFTER the current position
+                    const nextLine = currentLyrics.synced.find(line => line.startMs > posMs + 500);
+                    if (nextLine) {
+                        console.log(`[LyricsBridge] Skip instrumental: seeking from ${posMs}ms to ${nextLine.startMs}ms`);
+                        Spicetify.Player.seek(nextLine.startMs);
+                    } else {
+                        console.log("[LyricsBridge] Skip instrumental: no next lyric found (might be near end of song)");
+                    }
                 }
             } catch(e) {}
         };
@@ -175,47 +205,83 @@
         return { mode: "synced", synced, plain: [] };
     }
 
-    function isDnsResolutionError(err) {
-        const msg = String(err?.message || err || "").toLowerCase();
-        return msg.includes("err_name_not_resolved")
-            || msg.includes("name_not_resolved")
-            || msg.includes("dns")
-            || msg.includes("failed to fetch")
-            || msg.includes("networkerror");
-    }
-
     async function fetchSpicyLyrics(trackUri) {
-        if (!ENABLE_SPICY_FALLBACK) return null;
         const trackId = trackUri.split(":").pop();
         const token   = getSpotifyToken();
-        if (!token) { console.warn("[LyricsBridge] No Spotify token."); return null; }
+        lastSpicyError = "";
+        if (!token) {
+            lastSpicyError = "no Spotify auth token yet";
+            console.warn("[LyricsBridge] No Spotify token.");
+            send({ type: "lyrics_debug", message: "Spicy skipped — no Spotify auth token yet" });
+            return null;
+        }
         try {
             const resp = await fetch("https://api.spicylyrics.org/query", {
                 method:  "POST",
                 headers: {
                     "Content-Type":        "application/json",
-                    "SpicyLyrics-Version": "5.19.12",
+                    "SpicyLyrics-Version": SPICY_VERSION,
                     "SpicyLyrics-WebAuth": `Bearer ${token}`,
                 },
                 body: JSON.stringify({
                     queries: [{ operation: "lyrics", variables: { id: trackId, auth: "SpicyLyrics-WebAuth" }}],
-                    client:  { version: "5.19.12" }
+                    client:  { version: SPICY_VERSION }
                 })
             });
-            const data   = await resp.json();
+            if (resp.status !== 200) {
+                lastSpicyError = `HTTP ${resp.status}`;
+                // 400/403/426 here almost always means SPICY_VERSION is stale.
+                const hint = (resp.status === 400 || resp.status === 403 || resp.status === 426)
+                    ? ` — SPICY_VERSION ${SPICY_VERSION} may be outdated`
+                    : "";
+                console.warn("[LyricsBridge] Spicy API returned status:", resp.status);
+                send({ type: "lyrics_debug", message: `Spicy API HTTP ${resp.status}${hint}` });
+                return null;
+            }
+            const data = await resp.json();
+
+            // api.spicylyrics.org answers HTTP 200 even when the query itself
+            // failed: the real status is nested per-query, as
+            //   queries[0].result.httpStatus   (e.g. 401)
+            //   queries[0].result.data.error   (e.g. "Missing authorization")
+            // The outer `resp.status !== 200` check above therefore catches
+            // almost nothing, and this branch used to blame the catalogue for
+            // every failure — reporting "no lyrics for this track" when the
+            // truth was a rejected auth token. The old diagnostic also read
+            // `result.status`, a field this API does not return, so it printed
+            // a literal "status: ?" and told us nothing.
+            const q     = data?.queries?.[0]?.result;
+            const inner = q?.httpStatus;
+            const err   = q?.data?.error;
+            if (err || (inner && inner !== 200)) {
+                lastSpicyError = `${inner || "error"}: ${err || "unknown"}`;
+                // 401/403 here is an auth problem, NOT a missing-lyrics
+                // problem. The token comes from getSpotifyToken(); if the
+                // official Spicy Lyrics panel shows lyrics for the same track
+                // while this fails, the token is the difference.
+                const hint = (inner === 401 || inner === 403)
+                    ? " — auth rejected, not a missing-lyrics problem"
+                    : "";
+                console.warn("[LyricsBridge] Spicy query failed:", trackId, inner, err);
+                send({ type: "lyrics_debug",
+                       message: `Spicy ${inner || "error"} for ${trackId}: ${err || "unknown"}${hint}` });
+                return null;
+            }
+
             const result = parseSpicyLyrics(data);
             if (!result) {
-                const raw = data?.queries?.[0];
+                // Genuinely nothing to parse — this really is a catalogue miss.
                 console.warn("[LyricsBridge] Spicy returned no content:", trackId,
-                    "status:", raw?.result?.status, "type:", raw?.result?.data?.Type);
+                    "type:", q?.data?.Type);
+                lastSpicyError = "no lyrics in Spicy catalogue";
+                send({ type: "lyrics_debug",
+                       message: `Spicy: no lyrics for ${trackId} (type: ${q?.data?.Type || "none"})` });
             }
             return result;
         } catch(e) {
-            if (isDnsResolutionError(e)) {
-                console.warn("[LyricsBridge] Spicy endpoint unreachable.");
-            } else {
-                console.warn("[LyricsBridge] Spicy fetch failed:", e.message);
-            }
+            lastSpicyError = e.message || "network error";
+            console.warn("[LyricsBridge] Spicy fetch failed:", e.message);
+            send({ type: "lyrics_debug", message: `Spicy fetch error: ${e.message}` });
             return null;
         }
     }
@@ -228,7 +294,10 @@
             );
             const lines    = res?.lyrics?.lines;
             const syncType = res?.lyrics?.syncType;
-            if (!lines?.length) return null;
+            if (!lines?.length) {
+                send({ type: "lyrics_debug", message: `Spotify: no lyrics for ${trackId} (syncType: ${syncType || "none"})` });
+                return null;
+            }
             if (syncType === "LINE_SYNCED") {
                 return {
                     mode:   "synced",
@@ -244,45 +313,98 @@
                     plain:  lines.map(l => (l.words||"").trim()).filter(w => w && w !== "♪")
                 };
             }
-        } catch(e) { return null; }
+        } catch(e) {
+            send({ type: "lyrics_debug", message: `Spotify lyrics error: ${e.message}` });
+            return null;
+        }
     }
 
     // Track which URIs are currently being fetched to avoid duplicate requests
     const fetchingUris = new Set();
 
+    // How many times to look for lyrics before giving up, and how long to wait
+    // between tries. Spotify's auth token often isn't ready in the first few
+    // seconds after startup, and the Spicy API needs a valid token too.
+    const LYRIC_ATTEMPTS  = 2;
+    const LYRIC_RETRY_MS  = 3000;
+
+    // One pass over both lyric sources. Returns { lyrics, source } or null.
+    async function fetchLyricsOnce(trackUri) {
+        // Try Spicy first; fall back to Spotify's own color-lyrics API if Spicy
+        // returns nothing (song not in their catalogue, network error, etc.).
+        let lyrics = await fetchSpicyLyrics(trackUri);
+        if (lyrics) return { lyrics, source: "Spicy" };
+
+        // Never downgrade silently. Falling back to Spotify used to be
+        // invisible, so a permanently broken Spicy path looked like normal
+        // operation for months.
+        send({ type: "lyrics_debug",
+               message: `Spicy unavailable (${lastSpicyError || "unknown"}) — falling back to Spotify` });
+        lyrics = await fetchSpotifyLyrics(trackUri);
+        return lyrics ? { lyrics, source: "Spotify (Spicy fallback)" } : null;
+    }
+
     async function sendTrackAndLyrics(item) {
         const trackUri = item.uri || "";
         if (!trackUri) return;
 
-        const artist   = item.metadata?.["artist_name"] || item.artists?.map(a=>a.name).join(", ") || "";
-        const title    = item.metadata?.["title"] || item.name || "";
-        const albumArt = getAlbumArt(item);
-        const durMs    = parseInt(item.metadata?.["duration"] || item.duration_ms || 0);
-
         // Guard against duplicate concurrent fetches for the same track.
-        // Also skip the track_change if we already sent one for this URI.
         if (fetchingUris.has(trackUri)) {
             console.log("[LyricsBridge] Already fetching:", trackUri);
             return;
         }
         fetchingUris.add(trackUri);
 
-        console.log("[LyricsBridge] Sending track_change:", title, "—", artist);
-        send({ type: "track_change", artist, title, track_uri: trackUri,
-               album_art: albumArt, duration_ms: durMs });
-
         try {
-            let lyrics = await fetchSpotifyLyrics(trackUri);
-            let source = lyrics ? "Spotify" : "None";
+            const artist   = item.metadata?.["artist_name"] || item.artists?.map(a=>a.name).join(", ") || "";
+            const title    = item.metadata?.["title"] || item.name || "";
+            const albumArt = getAlbumArt(item);
+            const durMs    = parseInt(item.metadata?.["duration"] || item.duration_ms || 0);
 
-            if (!lyrics && ENABLE_SPICY_FALLBACK) {
-                lyrics = await fetchSpicyLyrics(trackUri);
-                source = lyrics ? "Spicy" : "None";
+            // track_change is sent EXACTLY ONCE per call. The retry used to be
+            // a recursive re-entry into this whole function, so a track whose
+            // lyrics needed a second attempt emitted a second track_change —
+            // and Statusify treats that as a brand new song: it counted twice
+            // in the session stats and reset lyrics_mode/synced/plain back to
+            // empty. The retry now loops over the lyric fetch alone.
+            console.log("[LyricsBridge] Sending track_change:", title, "—", artist);
+            send({ type: "track_change", artist, title, track_uri: trackUri,
+                   album_art: albumArt, duration_ms: durMs });
+
+            let found = null;
+            for (let attempt = 0; attempt < LYRIC_ATTEMPTS; attempt++) {
+                if (attempt > 0) {
+                    console.log(`[LyricsBridge] No lyrics yet, retrying in ${LYRIC_RETRY_MS}ms...`);
+                    send({ type: "lyrics_debug",
+                           message: `No lyrics for "${title}" — retrying in ${LYRIC_RETRY_MS / 1000}s` });
+                    await new Promise(r => setTimeout(r, LYRIC_RETRY_MS));
+                    // The user may have skipped on while we waited.
+                    if (Spicetify.Player.data?.item?.uri !== trackUri) {
+                        console.log("[LyricsBridge] Track changed during retry — abandoning");
+                        return;
+                    }
+                }
+                found = await fetchLyricsOnce(trackUri);
+                if (found) break;
             }
 
-            send({ type: "lyrics", track_uri: trackUri, source,
-                   ...(lyrics || { mode: "none", synced: [], plain: [] }) });
+            if (!found) {
+                send({ type: "lyrics_debug",
+                       message: `No lyrics found for "${title}" after ${LYRIC_ATTEMPTS} attempts` });
+            }
+
+            // Store lyrics in memory for the skip_instrumental feature.
+            currentLyrics = found ? found.lyrics : null;
+            if (found) {
+                console.log(`[LyricsBridge] Stored ${found.lyrics.synced?.length || 0} synced lyrics in memory`);
+            }
+
+            send({ type: "lyrics", track_uri: trackUri,
+                   source: found ? found.source : "none",
+                   ...(found ? found.lyrics : { mode: "none", synced: [], plain: [] }) });
         } finally {
+            // finally, so a throw anywhere above can't leave the URI wedged in
+            // the set — which would block every future fetch for that track.
             fetchingUris.delete(trackUri);
         }
     }
@@ -309,6 +431,6 @@
     }
 
     setInterval(tick, 500);
-    Spicetify.Player.addEventListener("songchange", () => { lastTrackUri = ""; });
+    Spicetify.Player.addEventListener("songchange", () => { lastTrackUri = ""; currentLyrics = null; });
     connect();
 })();

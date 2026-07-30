@@ -1,0 +1,74 @@
+name: Build Release Executable
+
+# Tag a commit to cut a release:
+#   git tag v1.2.0 && git push origin v1.2.0
+#
+# Also runnable by hand from the Actions tab, which builds the exe and leaves
+# it as a workflow artifact without touching any release — useful for checking
+# that a change still packages before committing to a tag.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to upload assets onto the release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pytest -r requirements.txt
+
+      # Build a broken exe and users find out by downloading it, so gate the
+      # build on the suite rather than only on the version check.
+      - name: Run tests
+        run: pytest -q
+
+      - name: Verify README and runtime versions match
+        run: python scripts_check_version_sync.py
+
+      - name: Build Statusify.exe
+        run: pyinstaller --clean --noconfirm Statusify.spec
+
+      # The exe is unsigned, so a published checksum is the only way a user can
+      # confirm the download matches what this workflow produced.
+      - name: Generate SHA256 checksum
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash dist/Statusify.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  Statusify.exe" | Out-File -Encoding ascii -NoNewline dist/Statusify.exe.sha256
+          Write-Host "SHA256: $h"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Statusify-exe
+          path: |
+            dist/Statusify.exe
+            dist/Statusify.exe.sha256
+
+      # Only on a tag push. gh is preinstalled on GitHub runners, so this needs
+      # no third-party action in the release path.
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF -replace '^refs/tags/', ''
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title "Statusify $tag" --generate-notes
+          }
+          gh release upload $tag dist/Statusify.exe dist/Statusify.exe.sha256 --clobber

@@ -1,22 +1,53 @@
-# Hide personal configuration and auth tokens
+# Personal configuration and auth tokens. .env holds the Discord Application
+# ID, so the pattern is deliberately broad — .env.example is the one exception
+# and has to be un-ignored explicitly.
 statusify.cfg
 .env*
 .env
+!.env.example
 
-# Hide temporary agent files and media
-out.txt
-grep.txt
+# Personal listening data and cached media
 history.json
+exports/
 *.jpg
 *.png
 !statusify_icon_preview.png
 *.jpeg
 
-# Hide compiled outputs
+# Compiled outputs. build/ and dist/ are PyInstaller's scratch and output
+# directories; .buildenv is the venv build_exe.ps1 creates for itself. The
+# release exe is published as a GitHub release asset, never committed.
 *.exe
+build/
+dist/
+.buildenv/
 __pycache__/
 *.pyc
 
-# Random config from IDEs
+# IDE / editor config
 .vscode/
+.idea/
 opencode.jsonc
+
+# Generated diagnostics and caches — all of these are produced at runtime and
+# are size-capped by _rotating_write(). health.csv previously reached 17 GB.
+statusify.log
+statusify.log.old
+health.csv
+health.csv.1
+crash.log
+crash.log.1
+output.log
+output.txt
+error.txt
+stdout.log
+stderr.log
+out.txt
+grep.txt
+.artcache/
+.pytest_cache/
+*.bak-*
+
+# Single-instance "show the running window" sentinel, dropped by a second
+# launch and deleted by the instance that picks it up.
+.show-request

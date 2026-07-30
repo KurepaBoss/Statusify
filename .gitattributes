@@ -1,0 +1,17 @@
+# Normalise text files to LF in the repository; Git restores the platform's
+# native endings on checkout.
+* text=auto
+
+# Windows launchers must keep CRLF on disk. A .bat file with LF-only endings
+# can mis-parse labels and goto targets, and cmd/cscript are the only things
+# that ever read these — there is no cross-platform case to serve.
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+*.vbs  text eol=crlf
+
+# Binary assets — never diff or convert these.
+*.ico  binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.exe  binary
