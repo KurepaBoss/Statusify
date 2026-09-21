@@ -1511,6 +1511,10 @@ async def ws_handler(ws):
                 state.duration_ms = int(data.get("duration_ms",0))
                 state.track_uri = data.get("track_uri","")
                 state.lyrics_mode = "none"; state.synced = []; state.plain = []
+                # Gaps belong to the old lyric sheet. Left in place, rpc_loop
+                # (which checks gaps before lyrics) published a phantom
+                # "instrumental" for the next track's first seconds.
+                state.instrumental_gaps = []
                 state.is_playing = True
                 # Reset the per-song dropped-line counter on every track change.
                 _dropped_lines = 0
@@ -1527,7 +1531,12 @@ async def ws_handler(ws):
                 synced = data.get("synced",[]); plain = data.get("plain",[])
                 uri    = data.get("track_uri","")
                 src    = data.get("source", "Spicy" if mode=="synced" and synced else "fallback")
-                if uri == state.track_uri or state.lyrics_mode == "none":
+                # Accept only this track's lyrics. The old fallback clause
+                # (`or state.lyrics_mode == "none"`) was always true right
+                # after a track_change, so lyrics still in flight for the
+                # PREVIOUS track were adopted by the new one. A missing uri
+                # is still accepted for bridges that predate the field.
+                if uri == state.track_uri or (not uri and state.lyrics_mode == "none"):
                     state.lyrics_mode = mode; state.synced = synced; state.plain = plain
                     state.instrumental_gaps = _calc_instrumental_gaps(synced, state.duration_ms) if mode == "synced" else []
                     n   = len(synced) or len(plain)

@@ -38,7 +38,6 @@
         ws.onopen = async () => {
             console.log("[LyricsBridge] Connected.");
             clearTimeout(reconnectTimer);
-            fetchingUris.clear();
             lastTrackUri = "";
             // Retry loop in case Player.data isn't populated immediately.
             for (let attempt = 0; attempt < 8; attempt++) {
@@ -66,7 +65,11 @@
             try {
                 const msg = JSON.parse(ev.data);
                 if (msg.type === "request_state") {
-                    fetchingUris.clear();
+                    // Do NOT clear fetchingUris here. onopen has usually just
+                    // started a fetch for this very track; clearing the guard
+                    // let a second one run alongside it, sending track_change
+                    // and lyrics twice. sendTrackAndLyrics' finally{} already
+                    // guarantees the set can't wedge.
                     lastTrackUri = "";
                     const item = Spicetify.Player.data?.item;
                     if (item?.uri) {
