@@ -213,7 +213,7 @@ pip install pytest
 pytest
 ```
 
-The suite is headless — it stubs out tkinter, Discord and Spotify, so it runs anywhere without a display. `tests/legacy/` holds standalone diagnostic scripts from earlier debugging sessions; they are excluded from collection on purpose (see `pytest.ini`) and are run directly, e.g. `python tests/legacy/test_freeze_fix.py`.
+The suite is headless — it stubs out tkinter, Discord and Spotify, so it needs no display, Discord or Spotify, but it does need Windows (named pipes, the registry and live hotkey registration). CI runs it on every push.
 
 ### Building the release executable
 
