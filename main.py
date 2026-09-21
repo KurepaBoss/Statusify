@@ -541,6 +541,47 @@ def _cfg_set(section, key, value):
         cfg.set(section, key, str(value))
         _save_config(cfg)
 
+# ── Debounced config writes ───────────────────────────────────────────
+# _cfg_set rewrites the whole INI atomically on every call. That is correct
+# but wasteful when the UI fires a burst — nudging a per-track offset or the
+# lyric font size hits it once per click, each a full serialise + os.replace on
+# the Tk thread. _cfg_set_soon updates the in-memory ConfigParser immediately
+# (so a subsequent _cfg_get sees the new value at once) and coalesces the disk
+# write to a single flush ~400 ms after the last change in the burst. Any
+# pending flush is forced on quit via _cfg_flush(), so nothing is lost.
+_CFG_FLUSH_TIMER = None
+_CFG_DIRTY       = False
+
+def _cfg_flush():
+    """Write pending debounced changes to disk now. Safe to call anytime."""
+    global _CFG_FLUSH_TIMER, _CFG_DIRTY
+    with _CFG_LOCK:
+        if _CFG_FLUSH_TIMER is not None:
+            try: _CFG_FLUSH_TIMER.cancel()
+            except Exception: pass
+            _CFG_FLUSH_TIMER = None
+        if not _CFG_DIRTY:
+            return
+        _CFG_DIRTY = False
+        _save_config(_load_config())
+
+def _cfg_set_soon(section, key, value, delay=0.4):
+    """Set a value in memory immediately; flush to disk once the burst settles."""
+    global _CFG_FLUSH_TIMER, _CFG_DIRTY
+    with _CFG_LOCK:
+        cfg = _load_config()
+        if not cfg.has_section(section):
+            cfg.add_section(section)
+        cfg.set(section, key, str(value))
+        _CFG_DIRTY = True
+        if _CFG_FLUSH_TIMER is not None:
+            try: _CFG_FLUSH_TIMER.cancel()
+            except Exception: pass
+        t = threading.Timer(delay, _cfg_flush)
+        t.daemon = True
+        _CFG_FLUSH_TIMER = t
+        t.start()
+
 # Load persisted settings at startup
 _stored_delay = _cfg_get("preferences", "lyric_delay_ms", "0")
 try: LYRIC_DELAY_MS = int(_stored_delay)
@@ -1040,6 +1081,12 @@ def _teardown_and_exit(code=0):
         with _log_fh_lock:
             if _log_fh is not None:
                 _log_fh.flush()
+    except Exception:
+        pass
+
+    # 3b. Force any debounced config write to disk (os._exit skips its timer).
+    try:
+        _cfg_flush()
     except Exception:
         pass
 
@@ -2598,6 +2645,11 @@ class App:
             self._cancel_all_timers()
         except Exception:
             pass
+        # Force any debounced config write to disk before we tear down.
+        try:
+            _cfg_flush()
+        except Exception:
+            pass
         try:
             self._save_geometry()
         except Exception:
@@ -3024,9 +3076,19 @@ class App:
         # ── Page container ────────────────────────────────────────
         self._container = tk.Frame(W, bg=BG); self._container.pack(fill="both", expand=True)
         self._build_now_playing()
-        self._build_history()
-        self._build_settings()
         self._show("NOW PLAYING")
+        # Build the heavier History and Settings pages just after the window
+        # first paints. Startup shows Now Playing immediately instead of
+        # blocking on the whole widget tree; _show() below also builds a page
+        # on demand if its tab is clicked before this idle callback runs.
+        self._root.after_idle(self._build_deferred_pages)
+
+    def _build_deferred_pages(self):
+        """Build the non-default pages once the window is up (see __init__)."""
+        if "HISTORY" not in self._pages:
+            self._build_history()
+        if "SETTINGS" not in self._pages:
+            self._build_settings()
 
     # ── NOW PLAYING ───────────────────────────────────────────────
     def _build_now_playing(self):
@@ -3458,6 +3520,11 @@ class App:
         """Render one history entry. Takes the entry dict, not a list index —
         see _save_history for why indices can't be trusted here."""
         if not e: return
+        # The History page may not be built yet (it is created lazily after the
+        # window first paints). The entry is already in the `history` list via
+        # _save_history, so _build_history's restore pass will render it — we
+        # can safely skip rendering here until the widgets exist.
+        if not hasattr(self, "hist_frm"): return
 
         # Hide the empty-state label once there's something to show.
         if not self._hist_rows:
@@ -3743,6 +3810,48 @@ class App:
         self._lyrics_entry = None
 
     # ── SETTINGS ──────────────────────────────────────────────────
+    def _collapsible(self, parent, title, key):
+        """Section header that folds its card away on click.
+
+        Returns the card frame to pack the section's content into. Collapsed
+        state is keyed by `key` and persisted (debounced) so the page reopens
+        the way you left it — the main lever for taming the long settings
+        scroll. Header padding is uniform here, which also gives every section
+        a consistent rhythm (the old code hand-tuned pady per header)."""
+        collapsed = key in getattr(self, "_collapsed_sections", set())
+        header = tk.Frame(parent, bg=BG); header.pack(fill="x", pady=(6, 4))
+        caret = tk.Label(header, text="▸" if collapsed else "▾", fg=MUTED, bg=BG,
+                         font=self._f(7, True), cursor="hand2")
+        caret.pack(side="left", padx=(0, 5))
+        lbl = tk.Label(header, text=title, fg=MUTED, bg=BG, font=self._f(7, True),
+                       cursor="hand2", anchor="w")
+        lbl.pack(side="left", fill="x", expand=True)
+
+        card = tk.Frame(parent, bg=BG2)
+        if not collapsed:
+            card.pack(fill="x", pady=(0, 10), after=header)
+
+        def _toggle(_e=None):
+            if card.winfo_ismapped():
+                card.pack_forget(); caret.config(text="▸")
+                self._collapsed_sections.add(key)
+            else:
+                card.pack(fill="x", pady=(0, 10), after=header)
+                caret.config(text="▾")
+                self._collapsed_sections.discard(key)
+            _cfg_set_soon("ui", "collapsed_sections",
+                          ",".join(sorted(self._collapsed_sections)))
+            if getattr(self, "_recalc_set_scroll", None):
+                self._recalc_set_scroll()
+
+        def _enter(_e): caret.config(fg=TEXT); lbl.config(fg=TEXT)
+        def _leave(_e): caret.config(fg=MUTED); lbl.config(fg=MUTED)
+        for w in (caret, lbl):
+            w.bind("<Button-1>", _toggle)
+            w.bind("<Enter>", _enter)
+            w.bind("<Leave>", _leave)
+        return card
+
     def _build_settings(self):
         p = tk.Frame(self._container, bg=BG); self._pages["SETTINGS"] = p
 
@@ -3764,26 +3873,29 @@ class App:
                 self._set_vsb.pack_forget()
                 self.set_cv.yview_moveto(0)
                 self._set_scroll_enabled = False
+        # Exposed so the collapsible-section helper can re-measure after a
+        # section is folded/unfolded.
+        self._recalc_set_scroll = _update_set_scroll
 
         outer.bind("<Configure>", _update_set_scroll)
         self.set_cv.bind("<Configure>",
             lambda e: (self.set_cv.itemconfig(self._set_hw, width=e.width), _update_set_scroll()))
 
+        # ONE wheel handler for the whole page instead of binding it onto every
+        # widget in the tree (the old approach did a recursive bind over ~150
+        # widgets at build time). It only scrolls while Settings is the visible
+        # page, so it never fights the History page's own wheel binding.
         def _on_mousewheel(e):
-            if getattr(self, "_set_scroll_enabled", False):
+            if self._cur_page == "SETTINGS" and getattr(self, "_set_scroll_enabled", False):
                 self.set_cv.yview_scroll(int(-1*(e.delta/120)), "units")
+        self.set_cv.bind_all("<MouseWheel>", _on_mousewheel, add="+")
 
-        self.set_cv.bind("<MouseWheel>", _on_mousewheel)
-        def _bind_mw(widget):
-            widget.bind("<MouseWheel>", _on_mousewheel)
-            for child in widget.winfo_children():
-                _bind_mw(child)
-        self._bind_set_mw = _bind_mw
+        # Per-section collapse state, remembered across launches.
+        self._collapsed_sections = set(
+            s for s in _cfg_get("ui", "collapsed_sections", "").split(",") if s)
 
         # ── Section: Session Stats ─────────────────────────────────
-        tk.Label(outer, text="SESSION STATS", fg=MUTED, bg=BG,
-                 font=self._f(7,True)).pack(anchor="w", pady=(0,4))
-        stats_card = tk.Frame(outer, bg=BG2); stats_card.pack(fill="x", pady=(0,10))
+        stats_card = self._collapsible(outer, "SESSION STATS", "stats")
         inner_s = tk.Frame(stats_card, bg=BG2); inner_s.pack(fill="x", padx=14, pady=10)
         self.lbl_stats_songs = tk.Label(inner_s, text="Songs played:  0",
                                         fg=TEXT2, bg=BG2, font=self._f(9), anchor="w")
@@ -3794,9 +3906,7 @@ class App:
         self._refresh_stats()
 
         # ── Section: Behaviour (tray + blacklist + per-track offset) ─
-        tk.Label(outer, text="BEHAVIOUR", fg=MUTED, bg=BG,
-                 font=self._f(7,True)).pack(anchor="w", pady=(4,4))
-        beh_card = tk.Frame(outer, bg=BG2); beh_card.pack(fill="x", pady=(0,10))
+        beh_card = self._collapsible(outer, "BEHAVIOUR", "behaviour")
         inner_b  = tk.Frame(beh_card, bg=BG2); inner_b.pack(fill="x", padx=14, pady=10)
 
         # Close-to-tray toggle (#12)
@@ -3909,7 +4019,8 @@ class App:
         def _nudge_lf(delta):
             global LYRIC_FONT_BOOST
             LYRIC_FONT_BOOST = max(-2, min(10, LYRIC_FONT_BOOST + delta))
-            _cfg_set("preferences", "lyric_font_boost", str(LYRIC_FONT_BOOST))
+            # Debounced: A+/A− can be tapped rapidly; coalesce the disk writes.
+            _cfg_set_soon("preferences", "lyric_font_boost", str(LYRIC_FONT_BOOST))
             try:
                 self.lbl_lyric.config(font=self._f(FS_TITLE + LYRIC_FONT_BOOST, True))
             except (AttributeError, tk.TclError):
@@ -3951,26 +4062,25 @@ class App:
         self._focus_ring(self._bl_txt)
         self._bl_txt.pack(fill="x")
         self._bl_txt.insert("1.0", "\n".join(_BLACKLIST))
-        bl_btn = tk.Label(inner_b, text="SAVE BLACKLIST", fg=ACCENT_FG, bg=ACCENT,
-                          font=self._f(7,True), cursor="hand2", padx=10, pady=4)
-        bl_btn.pack(anchor="e", pady=(4,0))
 
         def _save_blacklist(_e=None):
             global _BLACKLIST
             raw = self._bl_txt.get("1.0", "end").strip()
             # configparser can't hold raw newlines in a value, so store them
             # escaped and unescape on load.
-            _cfg_set("preferences", "blacklist", raw.replace("\n", "\\n"))
+            _cfg_set_soon("preferences", "blacklist", raw.replace("\n", "\\n"))
             _BLACKLIST = _load_blacklist()
             state.blacklisted = _is_blacklisted(
                 getattr(state, "artist", ""), getattr(state, "title", ""))
-            log(f"Blacklist saved  ·  {len(_BLACKLIST)} term(s)")
-        bl_btn.bind("<Button-1>", _save_blacklist)
+        # Auto-save: debounce while typing, and flush on focus-out — no button.
+        self._bl_txt.bind("<KeyRelease>",
+                          lambda e: self._schedule("blsave", 700, _save_blacklist))
+        self._bl_txt.bind("<FocusOut>", _save_blacklist)
+        tk.Label(inner_b, text="saves automatically", fg=MUTED, bg=BG2,
+                 font=self._f(7)).pack(anchor="e", pady=(3,0))
 
         # ── Section: Appearance ────────────────────────────────────
-        tk.Label(outer, text="APPEARANCE", fg=MUTED, bg=BG,
-                 font=self._f(7,True)).pack(anchor="w", pady=(4,4))
-        appear_card = tk.Frame(outer, bg=BG2); appear_card.pack(fill="x", pady=(0,10))
+        appear_card = self._collapsible(outer, "APPEARANCE", "appearance")
         inner_a = tk.Frame(appear_card, bg=BG2); inner_a.pack(fill="x", padx=14, pady=10)
 
         # Dark/Light toggle — custom pill buttons (no ugly Tk radio circles)
@@ -4039,13 +4149,11 @@ class App:
         _paint_anim()
 
         # ── Section: Hotkeys ───────────────────────────────────────
-        tk.Label(outer, text="GLOBAL HOTKEYS", fg=MUTED, bg=BG,
-                 font=self._f(7,True)).pack(anchor="w", pady=(4,4))
-        hotkey_card = tk.Frame(outer, bg=BG2); hotkey_card.pack(fill="x", pady=(0,10))
+        hotkey_card = self._collapsible(outer, "GLOBAL HOTKEYS", "hotkeys")
         inner_h = tk.Frame(hotkey_card, bg=BG2); inner_h.pack(fill="x", padx=14, pady=10)
 
         if not KEYBOARD_AVAILABLE:
-            tk.Label(inner_h, text="Install 'keyboard' package to enable hotkeys:\npip install keyboard",
+            tk.Label(inner_h, text="Global hotkeys are unavailable on this system.",
                      fg=MUTED, bg=BG2, font=self._f(8), justify="left").pack(anchor="w")
         else:
             # Skip track
@@ -4087,16 +4195,17 @@ class App:
                 _register_hotkeys(self)
                 log("Hotkeys saved & re-registered")
 
-            sv_btn = tk.Label(inner_h, text="SAVE HOTKEYS", fg=MUTED, bg=BG2,
-                              font=self._f(7,True), cursor="hand2")
-            sv_btn.pack(anchor="e", pady=(4,0))
-            sv_btn.bind("<Button-1>", lambda e: _save_hotkeys())
-            self._hoverable(sv_btn, fg=lambda: MUTED, hover_fg=lambda: ACCENT)
+            # Auto-save when you finish editing a field (Enter or focus-out),
+            # rather than on a separate SAVE click. Saving per-keystroke would
+            # try to register half-typed combos, so we wait for the edit to end.
+            for _ent in (ent_sk, ent_si, ent_tg):
+                _ent.bind("<Return>",   lambda e: _save_hotkeys())
+                _ent.bind("<FocusOut>", lambda e: _save_hotkeys())
+            tk.Label(inner_h, text="saves on Enter / when you click away",
+                     fg=MUTED, bg=BG2, font=self._f(7)).pack(anchor="e", pady=(4,0))
 
         # ── Section: Startup ───────────────────────────────────────
-        tk.Label(outer, text="SYSTEM", fg=MUTED, bg=BG,
-                 font=self._f(7,True)).pack(anchor="w", pady=(4,4))
-        sys_card = tk.Frame(outer, bg=BG2); sys_card.pack(fill="x", pady=(0,10))
+        sys_card = self._collapsible(outer, "SYSTEM", "system")
         inner_sy = tk.Frame(sys_card, bg=BG2); inner_sy.pack(fill="x", padx=14, pady=10)
 
         row_su = tk.Frame(inner_sy, bg=BG2); row_su.pack(fill="x")
@@ -4131,9 +4240,7 @@ class App:
         self._hoverable(rst_pos, fg=lambda: MUTED, hover_fg=lambda: ACCENT)
 
         # ── Section: Discord RPC Behaviour ────────────────────────
-        tk.Label(outer, text="DISCORD RPC BEHAVIOUR", fg=MUTED, bg=BG,
-                 font=self._f(7,True)).pack(anchor="w", pady=(4,4))
-        rpc_card = tk.Frame(outer, bg=BG2); rpc_card.pack(fill="x", pady=(0,10))
+        rpc_card = self._collapsible(outer, "DISCORD RPC BEHAVIOUR", "rpc")
         inner_rpc = tk.Frame(rpc_card, bg=BG2); inner_rpc.pack(fill="x", padx=14, pady=10)
 
         # Feature 7 — paused state toggle
@@ -4159,20 +4266,17 @@ class App:
                           insertbackground=TEXT, relief="flat", font=self._f(9))
         self._focus_ring(ent_it)
         ent_it.pack(side="left", fill="x", expand=True, padx=(0, SP_SM))
-        def _save_instr():
+        def _save_instr(_e=None):
             global INSTRUMENTAL_TEXT
             INSTRUMENTAL_TEXT = self._instr_var.get() or "🎵 ─ ─ ─ ─ ─ ─ ─ ─ ─ 🎵"
-            _cfg_set("preferences", "instrumental_text", INSTRUMENTAL_TEXT)
-            log(f"Instrumental text set to: {INSTRUMENTAL_TEXT}")
-        sv_it = tk.Label(row_it2, text="SAVE", fg=MUTED, bg=BG2,
-                         font=self._f(7,True), cursor="hand2")
-        sv_it.pack(side="left")
-        sv_it.bind("<Button-1>", lambda e: _save_instr())
-        self._hoverable(sv_it, fg=lambda: MUTED, hover_fg=lambda: ACCENT)
+            _cfg_set_soon("preferences", "instrumental_text", INSTRUMENTAL_TEXT)
+        # Auto-save on Enter / focus-out instead of a SAVE click.
+        ent_it.bind("<Return>",   _save_instr)
+        ent_it.bind("<FocusOut>", _save_instr)
+        tk.Label(row_it2, text="auto", fg=MUTED, bg=BG2,
+                 font=self._f(7)).pack(side="left")
         # ── Section: Discord Profiles ──────────────────────────────
-        tk.Label(outer, text="DISCORD PROFILES", fg=MUTED, bg=BG,
-                 font=self._f(7,True)).pack(anchor="w", pady=(4,4))
-        prof_card = tk.Frame(outer, bg=BG2); prof_card.pack(fill="x", pady=(0,10))
+        prof_card = self._collapsible(outer, "DISCORD PROFILES", "profiles")
         inner_pr = tk.Frame(prof_card, bg=BG2); inner_pr.pack(fill="x", padx=14, pady=10)
 
         tk.Label(inner_pr, text="Save multiple App IDs and switch between them.",
@@ -4363,8 +4467,9 @@ class App:
         btn_sc.pack(side="right")
         btn_sc.bind("<Button-1>", lambda e: _do_shortcut())
 
-        # Apply mousewheel binding to all elements in settings
-        self._bind_set_mw(outer)
+        # Wheel scrolling is handled by a single page-level binding set up at
+        # the top of this method — no per-widget binding needed.
+        self._recalc_set_scroll()
 
     def _refresh_stats(self, reschedule=True):
         """Update session stats labels.
@@ -4530,15 +4635,40 @@ class App:
     def _show(self, name):
         if self._cur_page == name:
             return
+        # Deferred pages (History/Settings) are built lazily — construct on the
+        # first switch if the idle builder hasn't run yet.
+        if name not in self._pages:
+            builder = {"HISTORY": getattr(self, "_build_history", None),
+                       "SETTINGS": getattr(self, "_build_settings", None)}.get(name)
+            if builder:
+                builder()
+            if name not in self._pages:
+                return
+        # Remember the Settings scroll position as we leave it.
+        if self._cur_page == "SETTINGS" and hasattr(self, "set_cv"):
+            try: self._set_scroll_pos = self.set_cv.yview()[0]
+            except Exception: pass
         if self._cur_page: self._pages[self._cur_page].pack_forget()
         self._pages[name].pack(fill="both", expand=True)
         self._cur_page = name
+        # Restore where the user last was on the Settings page.
+        if name == "SETTINGS" and hasattr(self, "set_cv"):
+            pos = getattr(self, "_set_scroll_pos", 0.0)
+            self._root.after_idle(lambda: self._safe_yview(self.set_cv, pos))
         # Cross-fade the labels over the same 220 ms the underline takes to
         # travel, so the colour change reads as one movement with the slide
         # rather than as a separate flash.
         for n, b in self._tab_btns.items():
             self._fade_colors(f"tabfg:{n}", b, 220, fg=ACCENT if n == name else MUTED)
         self._move_tab_line()
+
+    @staticmethod
+    def _safe_yview(canvas, fraction):
+        """Scroll a canvas to a fraction, swallowing teardown races."""
+        try:
+            canvas.yview_moveto(max(0.0, min(1.0, fraction)))
+        except tk.TclError:
+            pass
 
     def _move_tab_line(self, animate=True):
         """Slide the accent underline to the active tab.
