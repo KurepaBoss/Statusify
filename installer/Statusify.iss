@@ -61,8 +61,14 @@ Name: "{userstartup}\Statusify"; Filename: "{app}\Statusify.exe"; Tasks: startup
 Filename: "powershell.exe"; \
   Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup\setup-spicetify.ps1"" -Bridge ""{app}\setup\lyrics-bridge.js"""; \
   StatusMsg: "Setting up Spicetify (a console window will show progress)..."; \
-  Flags: waituntilterminated; Tasks: spicetify
+  Flags: waituntilterminated; Tasks: spicetify; Check: not WizardSilent
+; In-app updates run Setup /SILENT: refresh the bridge without a console that
+; waits for a keypress, then bring Statusify back up (it quit to let us in).
+Filename: "powershell.exe"; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\setup\setup-spicetify.ps1"" -Bridge ""{app}\setup\lyrics-bridge.js"" -NoPause"; \
+  Flags: runhidden waituntilterminated; Tasks: spicetify; Check: WizardSilent
 Filename: "{app}\Statusify.exe"; Description: "Launch Statusify"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\Statusify.exe"; Flags: nowait; Check: WizardSilent
 
 [UninstallRun]
 Filename: "powershell.exe"; \

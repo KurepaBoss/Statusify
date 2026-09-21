@@ -283,6 +283,7 @@ load_dotenv(os.path.join(_APP_DIR, ".env"))
 # Version lives in version.py so the README, the runtime and the CI check in
 # .github/workflows/version-sync.yml can never drift apart.
 from version import VERSION as _VERSION
+import statusify_maintenance as _maint
 _GITHUB_REPO  = "KurepaBoss/Statusify"  # GitHub repo for update checks
 
 DISCORD_APP_ID    = os.getenv("DISCORD_APP_ID", "")
@@ -1331,9 +1332,15 @@ _rpc_mod.configure(log, event_queue.put, _recv_executor, executor, MAX_STATE)
 
 # ── WebSocket ─────────────────────────────────────────────────────
 async def ws_handler(ws):
-    global _spicetify_ws, _dropped_lines
+    global _spicetify_ws, _dropped_lines, _BRIDGE_UPDATED
     _spicetify_ws = ws
     log("Spicetify connected"); event_queue.put(("sp", True))
+    # A repair restarts Spotify, so the bridge reconnecting is the moment to
+    # re-check; otherwise the launch-time warning outlives the fix.
+    if _BRIDGE_UPDATED and not _bridge_needs_apply():
+        _BRIDGE_UPDATED = False
+        log("Spicetify bridge is current")
+        event_queue.put(("bridge_ok",))
     try:
         # Brief pause so the extension's onmessage handler is wired up
         # before we ask it to report state (onopen and onmessage are set
@@ -2234,9 +2241,42 @@ class App:
         The check itself used to compare the source against the folder it had
         just been copied to, which is always equal, so it never fired."""
         if _BRIDGE_UPDATED:
-            msg = "Bridge out of date in Spotify — run: spicetify apply"
+            files = _maint.repair_files(_RES_DIR, _APP_DIR)
+            msg = ("Lyrics bridge out of date in Spotify — click here to repair" if files
+                   else "Bridge out of date in Spotify — run: spicetify apply")
             log(f"⚠ {msg}")
             self._set_error(msg)
+            if files:
+                self.lbl_err.config(cursor="hand2")
+                self.lbl_err.bind("<Button-1>", lambda e: self._repair_bridge())
+
+    def _repair_bridge(self):
+        """Run the Spicetify setup script in its own window, then clear the
+        warning once the bridge inside Spotify matches ours."""
+        files = _maint.repair_files(_RES_DIR, _APP_DIR)
+        if not files:
+            return
+        try:
+            _maint.launch_repair(*files)
+        except Exception as e:
+            self._set_error(f"Could not start repair: {e}")
+            return
+        log("Bridge repair started")
+        self._set_error("Repairing — follow the window that just opened (Spotify will restart)")
+        self.lbl_err.unbind("<Button-1>"); self.lbl_err.config(cursor="")
+        deadline = time.monotonic() + 300
+
+        def check():
+            global _BRIDGE_UPDATED
+            if not _bridge_needs_apply():
+                _BRIDGE_UPDATED = False
+                log("Bridge repaired — Spotify is running the current bridge")
+                self._set_error("")
+            elif time.monotonic() < deadline:
+                self._schedule("bridge_repair", 3000, check)
+            else:
+                self._check_bridge_version()   # restore the clickable warning
+        self._schedule("bridge_repair", 3000, check)
 
     # ── Mini mode ─────────────────────────────────────────────────
     def _toggle_mini(self, _e=None):
@@ -4953,6 +4993,9 @@ class App:
                         fg=WARN if n else MUTED)
                 elif k == "error":
                     self._set_error(ev[1])
+                elif k == "bridge_ok":
+                    self._set_error("")
+                    self.lbl_err.unbind("<Button-1>"); self.lbl_err.config(cursor="")
                 # Event-driven refresh: update the labels only. Must NOT arm a
                 # timer — the 5 s chain is owned solely by the timer itself.
                 elif k == "stats":       self._refresh_stats(reschedule=False)
@@ -4971,13 +5014,13 @@ class App:
                     log(f"Hotkey: RPC {status}")
                     self.dot_dc.config(fg=ACCENT if enabled else MUTED)
                 elif k == "update_available":
-                    _, tag, url, changelog = ev
-                    self._show_update_dialog(tag, url, changelog)
+                    _, tag, url, changelog, setup = ev
+                    self._show_update_dialog(tag, url, changelog, setup)
                 drained += 1
         except queue.Empty: pass
         self._schedule("poll", 50, self._poll)
 
-    def _show_update_dialog(self, tag, url, changelog):
+    def _show_update_dialog(self, tag, url, changelog, setup=None):
         """Show a modal dialog asking the user to update, with changelog."""
         import webbrowser
         if getattr(self, "_update_banner_shown", False): return
@@ -5015,9 +5058,34 @@ class App:
         btn_no.pack(side="left", padx=30)
         btn_no.bind("<Button-1>", lambda e: dlg.destroy())
 
-        btn_yes = tk.Label(bf, text="DOWNLOAD", fg=ACCENT_FG, bg=ACCENT, font=self._f(8, True), cursor="hand2", padx=16, pady=6)
+        # Setup.exe installs update in place: download, verify the published
+        # SHA-256, run the installer silently and let it relaunch us. Portable
+        # exes and source checkouts can't be updated that way, so they keep
+        # the browser link.
+        auto = bool(setup) and _maint.is_installed(_APP_DIR, _FROZEN)
+        btn_yes = tk.Label(bf, text="INSTALL UPDATE" if auto else "DOWNLOAD",
+                           fg=ACCENT_FG, bg=ACCENT, font=self._f(8, True), cursor="hand2", padx=16, pady=6)
         btn_yes.pack(side="right", padx=30)
-        def _yes(): webbrowser.open(url); dlg.destroy()
+
+        def _install():
+            btn_yes.config(text="DOWNLOADING…", cursor="watch"); btn_yes.unbind("<Button-1>")
+            dest = os.path.join(tempfile.gettempdir(), "statusify-update")
+            def work():
+                try:
+                    path = _maint.download_verified(setup[0], setup[1], dest)
+                except Exception as e:
+                    log(f"Update download failed: {e}")
+                    err = f"Update failed: {e} — opening the download page"
+                    self._root.after(0, lambda: (self._set_error(err), webbrowser.open(url), dlg.destroy()))
+                    return
+                log(f"Update v{tag} downloaded and verified — installing")
+                _maint.launch_silent_update(str(path))
+                self._root.after(0, self._quit)
+            threading.Thread(target=work, daemon=True, name="updater").start()
+
+        def _yes():
+            if auto: _install()
+            else: webbrowser.open(url); dlg.destroy()
         btn_yes.bind("<Button-1>", lambda e: _yes())
 
 
@@ -5193,6 +5261,7 @@ def _check_for_updates():
 
         latest_tag = None
         latest_url = ""
+        latest_setup = None   # (setup_url, sha256_url) when the release ships an installer
         changelog_lines = []
 
         for release in data:
@@ -5203,6 +5272,7 @@ def _check_for_updates():
                 if not latest_tag:
                     latest_tag = tag
                     latest_url = release.get("html_url", "")
+                    latest_setup = _maint.setup_asset(release)
 
                 body = release.get("body", "").strip()
                 changelog_lines.append(f"• v{tag}")
@@ -5213,7 +5283,7 @@ def _check_for_updates():
                 changelog_lines.append("")
 
         if latest_tag:
-            event_queue.put(("update_available", latest_tag, latest_url, "\n".join(changelog_lines).strip()))
+            event_queue.put(("update_available", latest_tag, latest_url, "\n".join(changelog_lines).strip(), latest_setup))
             log(f"Update available: v{latest_tag} (with {len(changelog_lines)} lines of notes)")
     except Exception as e:
         log(f"Update check failed: {e}")

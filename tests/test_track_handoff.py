@@ -105,3 +105,19 @@ def test_track_change_clears_instrumental_gaps():
     assert main.state.instrumental_gaps, "precondition: OLD has a gap"
     run([track(NEW)])
     assert main.state.instrumental_gaps == []
+
+
+def test_reconnect_clears_stale_bridge_warning_once_repaired(monkeypatch):
+    """The "bridge out of date" warning was computed once at launch, so after
+    a repair (which restarts Spotify, so the bridge reconnects) it stayed up
+    until Statusify itself was restarted."""
+    monkeypatch.setattr(main, "_BRIDGE_UPDATED", True)
+    monkeypatch.setattr(main, "_bridge_needs_apply", lambda: False)
+    while not main.event_queue.empty():
+        main.event_queue.get_nowait()
+    run([])
+    assert main._BRIDGE_UPDATED is False
+    events = []
+    while not main.event_queue.empty():
+        events.append(main.event_queue.get_nowait())
+    assert ("bridge_ok",) in events

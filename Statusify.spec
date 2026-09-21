@@ -71,6 +71,7 @@ a = Analysis(
     datas=[
         ('lyrics-bridge.js', '.'),
         ('statusify.ico', '.'),
+        ('installer/setup-spicetify.ps1', '.'),   # in-app bridge repair
     ],
     hiddenimports=[
         # pystray picks its backend at import time by probing the platform;
