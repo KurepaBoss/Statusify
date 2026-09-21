@@ -13,8 +13,7 @@ Two things here are load-bearing and easy to undo by accident:
 
 2. `upx=False`. UPX-packed binaries are a well-known heuristic trigger for
    Windows Defender and friends, and this app already looks suspicious to a
-   scanner: it installs a global keyboard hook via `keyboard` and opens a
-   local socket. Saving ~8 MB is not worth turning every download into a
+   scanner: it registers global hotkeys and opens a local socket. Saving ~8 MB is not worth turning every download into a
    quarantine report.
 """
 import os

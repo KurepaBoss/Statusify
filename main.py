@@ -42,11 +42,15 @@ _RES_DIR = (getattr(sys, "_MEIPASS", _APP_DIR) if _FROZEN
 from statusify_lyrics import (join_lines, select_line, resolve_offset_ms,
                               offset_key, _calc_instrumental_gaps)
 
+# Global hotkeys use RegisterHotKey (statusify_hotkeys), not the `keyboard`
+# library: its low-level hook went deaf whenever a game had focus and fired on
+# every auto-repeat of a held key. See tests/test_hotkeys.py.
 try:
-    import keyboard as _keyboard
+    from statusify_hotkeys import HotkeyManager as _HotkeyManager
     KEYBOARD_AVAILABLE = True
-except ImportError:
+except Exception:
     KEYBOARD_AVAILABLE = False
+_HOTKEYS = None   # HotkeyManager, created on first registration
 
 def _pip_install(packages):
     """Install `packages` with the running interpreter's pip. Returns True on success.
@@ -878,21 +882,28 @@ _hotkey_registered = False
 _rpc_enabled          = True   # toggle state
 
 def _register_hotkeys(app_ref):
-    global _hotkey_registered
-    if not KEYBOARD_AVAILABLE or _hotkey_registered:
+    """(Re)register all three hotkeys. Safe to call repeatedly: each call
+    replaces the previous set, so a settings change needs no separate unhook."""
+    global _hotkey_registered, _HOTKEYS
+    if not KEYBOARD_AVAILABLE:
         return
     try:
-        skip_combo   = _hotkey_skip_combo.strip()
-        toggle_combo = _hotkey_toggle_combo.strip()
+        if _HOTKEYS is None:
+            _HOTKEYS = _HotkeyManager()
+        skip_combo       = _hotkey_skip_combo.strip()
+        toggle_combo     = _hotkey_toggle_combo.strip()
         skip_instr_combo = _hotkey_skip_instr_combo.strip()
-        if skip_combo:
-            _keyboard.add_hotkey(skip_combo,       lambda: _hotkey_skip(app_ref),       suppress=False)
-        if toggle_combo:
-            _keyboard.add_hotkey(toggle_combo,     lambda: _hotkey_toggle(app_ref),     suppress=False)
-        if skip_instr_combo:
-            _keyboard.add_hotkey(skip_instr_combo, lambda: _hotkey_skip_instrumental(), suppress=False)
+        failed = _HOTKEYS.set({
+            "skip":       (skip_combo,       lambda: _hotkey_skip(app_ref)),
+            "toggle":     (toggle_combo,     lambda: _hotkey_toggle(app_ref)),
+            "skip_instr": (skip_instr_combo, _hotkey_skip_instrumental),
+        })
         _hotkey_registered = True
         log(f"Hotkeys registered  ·  skip={skip_combo or 'none'}  toggle={toggle_combo or 'none'}  skip_instr={skip_instr_combo or 'none'}")
+        # A combo another program already owns used to fail silently; say so.
+        for name, why in failed.items():
+            log(f"Hotkey '{name}' not active: {why}")
+            event_queue.put(("error", f"Hotkey not active: {why}"))
     except Exception as e:
         log(f"Hotkey registration failed: {e}")
 
@@ -4191,10 +4202,7 @@ class App:
 
             def _save_hotkeys():
                 global _hotkey_skip_combo, _hotkey_toggle_combo, _hotkey_skip_instr_combo, _hotkey_registered
-                # Unregister old
-                try: _keyboard.unhook_all_hotkeys()
-                except Exception as e: log(f"Hotkey unhook failed: {e}")
-                _hotkey_registered = False
+                # _register_hotkeys replaces the whole set, releasing the old combos.
                 _hotkey_skip_combo       = self._skip_var.get().strip()
                 _hotkey_toggle_combo     = self._toggle_var.get().strip()
                 _hotkey_skip_instr_combo = self._skip_instr_var.get().strip()
@@ -5386,7 +5394,7 @@ def _ensure_dependencies():
     python-dotenv are imported at module scope and are bootstrapped by
     _pip_install() up there, long before this function can run."""
     import importlib
-    deps    = ["pypresence", "pillow", "keyboard", "pystray"]
+    deps    = ["pypresence", "pillow", "pystray"]
     mapping = {"pillow": "PIL"}
     missing = []
 
