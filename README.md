@@ -1,9 +1,9 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/KurepaBoss/Statusify/main/statusify_icon_preview.png" width="128" />
-  <h1>Statusify v1.2.0</h1>
+  <h1>Statusify v1.3.0</h1>
   <p><strong>The ultimate Discord Rich Presence & Spotify Lyrics bridge.</strong></p>
 
-  ![Statusify v1.2.0](https://img.shields.io/badge/Statusify-v1.2.0-brightgreen?style=for-the-badge)
+  ![Statusify v1.3.0](https://img.shields.io/badge/Statusify-v1.3.0-brightgreen?style=for-the-badge)
   ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge)
   ![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078d6?style=for-the-badge)
   ![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
@@ -15,6 +15,22 @@
 **Statusify** is a lightweight, high-performance bridge that connects your Spotify listening experience directly to Discord and your desktop. It offers a beautiful, High-DPI aware GUI to track your session history, view synced lyrics, and manage multiple Discord profiles with a single click.
 
 Lyrics come straight from Spicetify over a local WebSocket — no API keys, no polling a web service, no rate limits. The bridge extension pushes the current track and its exact playback position every 500 ms, and Statusify maps that position to the right lyric line before it reaches Discord.
+
+---
+
+## 🆕 What's New in v1.3.0
+
+**One-click installer.** Download `Statusify-Setup-1.3.0.exe` from the [Releases page](https://github.com/KurepaBoss/Statusify/releases) and it handles everything: installs Statusify, installs [Spicetify](https://spicetify.app/) if you don't have it, wires the lyrics bridge into Spotify and applies it. No terminal, no copying files. It also adds a **Repair Spicetify bridge** shortcut to the Start Menu for when a Spotify update wipes Spicetify.
+
+**Hotkeys work in games, without admin.** Hotkeys now use Windows' own `RegisterHotKey` instead of a keyboard hook. The old hook went deaf whenever a game had focus unless Statusify ran as administrator, and fired on every key-repeat, so holding `Ctrl+Alt+N` a moment too long skipped a whole run of tracks. Now one press is one action, and a combo already taken by another program is reported instead of silently doing nothing.
+
+**Lyrics no longer leak between songs.** Skipping while lyrics were still loading could put the *previous* song's lyrics on your status. Lyrics are now matched to their exact track. A lyric-less track also no longer inherits the previous song's instrumental breaks, and the bridge no longer fetches every track twice on connect.
+
+**Smoother lyric timing.** Lines are grouped by how much song they cover, so each Discord update lasts long enough to stay inside Discord's rate limit (5 updates per 20 s). Playback position is interpolated between the bridge's position pings, so lines advance on time instead of in jumps.
+
+**Shows alongside games.** Your presence is now a *Listening* activity, the same slot Spotify uses, so a running game no longer hides your music.
+
+**Spicy Lyrics 6.x support**, a faster and tidier Settings page (collapsible sections, auto-save, no more SAVE buttons), and the scroll-restore crash is fixed.
 
 ---
 
@@ -73,42 +89,47 @@ Prefer running from source? That's the next section, and it's still the better o
 
 ---
 
-## 🚀 Easy Setup (Tutorial)
+## 🚀 Easy Setup
 
-Setting up Statusify is simpler than ever. Follow these **3 steps** to get started:
+You need the **regular desktop Spotify** from [spotify.com](https://www.spotify.com/download/windows/). The Microsoft Store version can't be modified by Spicetify, so lyrics won't work with it. Open Spotify once and log in before installing.
 
-### 1. Install Requirements
-- **Using `Statusify.exe`?** Skip this step — there is nothing to install.
-- From source, ensure you have [Python 3.10 or higher](https://www.python.org/downloads/) installed.
-- **Note:** Statusify will automatically install all necessary Python libraries for you when you launch it for the first time. If you'd rather do it yourself: `pip install -r requirements.txt`.
+### 1. Run the installer
+Download **`Statusify-Setup-<version>.exe`** from the [latest release](https://github.com/KurepaBoss/Statusify/releases/latest) and run it. No administrator rights needed; it installs just for you.
 
-### 2. Prepare Spicetify (For Lyrics)
-To see lyrics on your Discord status, you need [Spicetify](https://spicetify.app/):
-1. **Open your Spicetify Marketplace** in the Spotify app.
-2. Go to the **Extensions** tab and install **Spicy Lyrics**.
-3. Statusify automatically copies its bridge extension into your Spicetify folder when you launch it.
-4. **Run `spicetify apply`.** This is the step that matters, and restarting Spotify is *not* a substitute for it.
+> Windows SmartScreen may say *"Windows protected your PC"* because the installer isn't code-signed. Click **More info → Run anyway**. Each release lists a SHA-256 checksum if you want to verify the download.
+
+Keep **"Install Spicetify and the lyrics bridge"** ticked. A console window shows progress while it sets up Spicetify, and Spotify restarts once at the end.
+
+### 2. Enter your Discord Application ID
+The installer asks for it (you can also skip and Statusify asks on first launch):
+1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**.
+2. Name it what you want your status to show, e.g. **Spotify**.
+3. Copy the **Application ID** from *General Information* and paste it in.
+
+### 3. Play something
+Launch Statusify, play a song, and your status shows the track and synced lyrics.
+
+### If lyrics stop after a Spotify update
+Spotify updates remove Spicetify's changes. Run **Start Menu → Statusify → Repair Spicetify bridge**. Statusify also warns you when the bridge inside Spotify is out of date.
+
+<details>
+<summary><b>Running from source instead</b></summary>
+
+1. Install [Python 3.10+](https://www.python.org/downloads/) and [Spicetify](https://spicetify.app/docs/getting-started).
+2. `pip install -r requirements.txt`
+3. Set up the bridge: `powershell -ExecutionPolicy Bypass -File installer\setup-spicetify.ps1 -Bridge lyrics-bridge.js`
+4. `python main.py` (or `run.vbs` for a windowless start). Copy `.env.example` to `.env` to set the Application ID up front.
+
+</details>
 
 > **Why `spicetify apply` and not just a restart?**
 > Spicetify keeps two copies of every extension: the source in
 > `%APPDATA%\spicetify\Extensions`, and an injected copy inside Spotify's own
 > `xpui` bundle. Spotify only ever runs the injected one, and only
-> `spicetify apply` updates it. Restarting Spotify re-runs whatever was
-> injected last time — so an outdated bridge survives any number of restarts.
-> Statusify compares the two on every launch and warns you when they differ.
+> `spicetify apply` updates it. The installer and the Repair shortcut both do
+> this for you and verify the result.
 
-> If Spicy Lyrics has no lyrics for a track, Statusify falls back to Spotify's own lyrics and says so in the log, rather than silently going quiet. If lyrics are unavailable from both, it still publishes the track title, artist and album art to Discord — a lyric problem never means a blank Rich Presence.
-
-### 3. Launch & Connect
-1. Double-click **`Statusify.exe`**, or from source:
-   ```bash
-   python main.py
-   ```
-   From source on Windows you can also use `run.bat`, or `run.vbs` for a fully windowless start.
-2. **Setup Wizard:** On the first run, Statusify will ask for your **Discord Application ID**. Follow the link provided in the popup to create one in 30 seconds.
-3. **Enjoy!** Your Spotify status and lyrics will now sync beautifully to Discord.
-
-> Prefer to configure it up front? Copy `.env.example` to `.env` and put your Application ID there — the wizard is skipped entirely.
+> If Spicy Lyrics has no lyrics for a track, Statusify falls back to Spotify's own lyrics and says so in the log. If neither has lyrics, it still publishes the title, artist and album art, so a lyric problem never means a blank Rich Presence.
 
 ---
 

@@ -1,37 +1,44 @@
-# Spicetify Extension Install
+# Spicetify Bridge Install
+
+**Most people don't need this page.** `Statusify-Setup-<version>.exe` from the
+[Releases page](https://github.com/KurepaBoss/Statusify/releases) installs
+Spicetify and the bridge for you. This covers doing it by hand.
 
 ## Requirements
-- Spicetify installed: https://spicetify.app/docs/getting-started
+- Desktop Spotify from spotify.com (not the Microsoft Store version), opened
+  and logged in at least once.
+- Do **not** run any of this as administrator. Spicetify refuses to.
 
-## Steps
+## Scripted (recommended)
+From the Statusify folder, in a normal PowerShell window:
+```
+powershell -ExecutionPolicy Bypass -File installer\setup-spicetify.ps1 -Bridge lyrics-bridge.js
+```
+It installs Spicetify if missing, registers the bridge, applies it, and checks
+that the bridge actually reached Spotify. Safe to re-run at any time; after a
+Spotify update, re-running it is the fix.
 
-1. **Copy the extension file** to your Spicetify extensions folder:
-   ```
-   %appdata%\spicetify\Extensions\
-   ```
-   So the full path is:
-   ```
-   C:\Users\<YOU>\AppData\Roaming\spicetify\Extensions\lyrics-bridge.js
-   ```
-
-2. **Open a terminal** (PowerShell or CMD) and run:
+## Fully manual
+1. Install [Spicetify](https://spicetify.app/docs/getting-started).
+2. Copy `lyrics-bridge.js` to `%APPDATA%\spicetify\Extensions\`.
+3. Run:
    ```
    spicetify config extensions lyrics-bridge.js
-   spicetify apply
+   spicetify backup apply
    ```
-
-3. **Spotify will restart** with the extension active.
-
-4. **Run the Python script** (`run.bat`) — it starts a WebSocket server
-   that the extension connects to automatically.
+   (Use `spicetify apply` if you've applied Spicetify before.)
 
 ## How it works
-- The extension pushes the current track + exact playback position (ms)
-  to the Python script every 500ms via WebSocket on port 8765.
-- Python maps the position to a lyric line and updates your Discord status.
-- No API keys, no rate limits on the Spicetify side.
+- The extension pushes the current track and playback position to Statusify
+  over a local WebSocket on port 8765.
+- It fetches lyrics itself (Spicy Lyrics API first, Spotify's own lyrics as a
+  fallback), so no separate lyrics extension or API key is needed.
+- Statusify maps the position to a lyric line and updates your Discord status.
 
 ## Troubleshooting
-- If Spotify doesn't restart after `spicetify apply`, restart it manually.
-- Open Spotify DevTools (Ctrl+Shift+I) and check the Console tab for
-  `[LyricsBridge] Connected to Python.` to confirm it's working.
+- **Lyrics stopped after a Spotify update:** re-run the script, or Start Menu →
+  Statusify → Repair Spicetify bridge. Restarting Spotify alone never helps:
+  Spotify runs the copy injected by `spicetify apply`, not the file in
+  `Extensions`.
+- Open Spotify DevTools (Ctrl+Shift+I) and look for `[LyricsBridge] Connected.`
+  in the Console tab to confirm the bridge is running.
