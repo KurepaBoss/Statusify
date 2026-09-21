@@ -461,6 +461,14 @@ def _request_show():
 
 RATE_LIMIT_CALLS  = 5
 RATE_LIMIT_WINDOW = 20.0
+# Seconds of song time one presence update has to buy to be sustainable.
+# Discord's SET_ACTIVITY limit is a server-side quota — it cannot be raised or
+# opted out of — so the only lever is spending each slot on more song.
+RPC_BUDGET_S      = RATE_LIMIT_WINDOW / RATE_LIMIT_CALLS   # 4.0 s per call
+# Headroom on top of the budget. The loop ticks at 20 Hz and the Spicetify
+# bridge pings position only every few seconds, so a group aimed exactly at
+# 4.0 s lands under it about half the time.
+GROUP_MARGIN_MS   = 750
 MAX_STATE         = 128
 LYRIC_DELAY_MS    = 0       # user-adjustable lyric timing offset (ms)
 _ENV_PATH         = os.path.join(_APP_DIR, ".env")
@@ -1101,12 +1109,32 @@ def _health_snapshot():
 # ── Shared state ──────────────────────────────────────────────────
 class State:
     artist = title = album_art = track_uri = ""
-    position_ms = duration_ms = 0
+    duration_ms = 0
     is_playing  = False
     lyrics_mode        = "none"
     instrumental_gaps  = []  # pre-calculated list of {startMs, endMs, gap_ms, key}
     synced = []; plain = []
     blacklisted        = False  # current track matches the user's blacklist
+    _position_ms = 0
+    _pos_mono    = None        # time.monotonic() when _position_ms was last set
+
+    @property
+    def position_ms(self):
+        """Live playback position. The Spicetify bridge only pings position
+        every few seconds — and sometimes as sparsely as once a minute — so
+        every lyric helper reading this used to sit on one line until the next
+        ping. Interpolate with the wall clock while playing so lyric selection
+        advances continuously; a fresh ping re-anchors via the setter.
+        ponytail: wall-clock interpolation, re-anchored on every position ping."""
+        if self.is_playing and self._pos_mono is not None:
+            live = self._position_ms + (time.monotonic() - self._pos_mono) * 1000.0
+            return int(min(self.duration_ms, live) if self.duration_ms else live)
+        return self._position_ms
+
+    @position_ms.setter
+    def position_ms(self, value):
+        self._position_ms = int(value)
+        self._pos_mono = time.monotonic()
 
 state = State()
 
@@ -1181,17 +1209,54 @@ def get_nth(w, n):
 
 # Stays in main.py: unlike join_lines/_calc_instrumental_gaps this reads the
 # module-level `state` and MAX_STATE, so it is not independently testable.
+def _line_index(w):
+    """Index of `w` in state.synced, disambiguating repeats by playback position.
+
+    get_line_dur and get_nth each re-derive this with their own full scan, so
+    pick_group used to walk the whole lyric sheet three times to build one
+    group. Resolve it once and walk forward from there."""
+    pos = state.position_ms + _track_offset_ms()
+    best = None
+    for i, e in enumerate(state.synced):
+        if e["words"] == w:
+            if best is None or abs(e["startMs"] - pos) < abs(best[0] - pos):
+                best = (e["startMs"], i)
+    return best[1] if best else None
+
 def pick_group(line1):
+    """Pick the lyric lines to publish in one presence update.
+
+    Discord allows RATE_LIMIT_CALLS SET_ACTIVITY frames per RATE_LIMIT_WINDOW
+    seconds, so a sustainable update buys at least RPC_BUDGET_S of song time.
+    The old version chose the group from the FIRST line's duration alone, with
+    a single-line cutoff at 3500 ms — which meant every line lasting 3.5-4.0 s
+    was published on its own and scheduled the next call under the 4.0 s
+    budget. The live log showed the consequence precisely: single-line calls
+    sat at a median spacing of exactly 4.0 s, zero headroom, and the limiter
+    absorbed the overrun as lyric lag.
+
+    So group by what actually matters — cumulative coverage — rather than by
+    the head line's duration, packing lines until the group spans a budget
+    period (plus a margin for tick and position-ping jitter) or runs into
+    MAX_STATE. Fast passages group more, slow passages stay on one line
+    exactly as before."""
     if state.lyrics_mode != "synced" or not state.synced: return [line1], 0
-    dur = get_line_dur(line1); l2 = get_nth(line1,1); l3 = get_nth(line1,2)
-    if dur >= 3500: return [line1], 0
-    elif dur >= 1500:
-        if l2 and len(join_lines([line1,l2])) <= MAX_STATE: return [line1,l2], 1
-        return [line1], 0
-    else:
-        if l2 and l3 and len(join_lines([line1,l2,l3])) <= MAX_STATE: return [line1,l2,l3], 2
-        if l2 and len(join_lines([line1,l2])) <= MAX_STATE: return [line1,l2], 1
-        return [line1], 0
+    i = _line_index(line1)
+    if i is None: return [line1], 0
+
+    def dur(j):
+        nxt = state.synced[j+1]["startMs"] if j+1 < len(state.synced) else state.duration_ms
+        return max(0, nxt - state.synced[j]["startMs"])
+
+    target = RPC_BUDGET_S * 1000 + GROUP_MARGIN_MS
+    group   = [line1]
+    covered = dur(i)
+    j = i + 1
+    while covered < target and j < len(state.synced):
+        cand = group + [state.synced[j]["words"]]
+        if len(join_lines(cand)) > MAX_STATE: break
+        group = cand; covered += dur(j); j += 1
+    return group, len(group) - 1
 
 # Handle on the live DiscordRPC instance so the GUI can act on it (force a
 # reconnect, send a test presence). A dict rather than a bare global so the
@@ -1573,6 +1638,12 @@ async def rpc_loop(rpc):
         last_line = None; skip = []; gap_mono = None; gap_shown_idx = -1
         was_playing = False; calibration_until = 0.0
 
+    # Does Discord currently hold a presence from us? clear_activity() is a
+    # SET_ACTIVITY frame like any other and spends a rate-limit slot, so
+    # clearing when nothing is published buys nothing and costs a slot. Rapid
+    # pause/resume used to emit one such frame per flick.
+    have_presence = False
+
     def avail():
         now = time.monotonic(); rl["t"] = [x for x in rl["t"] if now-x < RATE_LIMIT_WINDOW]
         return len(rl["t"]) < RATE_LIMIT_CALLS
@@ -1580,6 +1651,28 @@ async def rpc_loop(rpc):
     def connected():
         return rpc._connected
     def rec(): rl["t"].append(time.monotonic())
+
+    async def clear():
+        """Take our presence down, and account for it.
+
+        Every call site used to be `await rpc.clear_activity(); rl["t"].clear()`
+        - wiping the local ledger on the assumption that a clear frees the
+        budget. It does the opposite: the clear is itself a SET_ACTIVITY frame
+        that consumes a slot, so after a pause or a blacklisted track
+        Statusify believed it had five fresh slots while Discord was still
+        counting the previous ones. That is the one path here to a real
+        server-side 429 rather than a self-imposed wait.
+
+        The clear is deliberately NOT gated on avail(): dropping it would
+        leave a stale lyric pinned to the user's profile, which is the worse
+        failure and the one the surrounding comments were written about. It is
+        recorded instead, so the publishes that follow respect the true cost."""
+        nonlocal have_presence
+        if not have_presence:
+            return False
+        await rpc.clear_activity(); rec()
+        have_presence = False
+        return True
     def wait():
         if avail(): return 0.0
         return max(0.0, RATE_LIMIT_WINDOW - (time.monotonic() - min(rl["t"])))
@@ -1594,7 +1687,7 @@ async def rpc_loop(rpc):
             # user's Discord profile indefinitely — the one thing the toggle
             # exists to prevent. Clear once on the falling edge.
             if rpc_was_enabled:
-                await rpc.clear_activity(); rl["t"].clear()
+                await clear()
                 reset_track_state()
                 event_queue.put(("line", ""))
                 log("RPC disabled — presence cleared")
@@ -1608,16 +1701,17 @@ async def rpc_loop(rpc):
             log("RPC enabled")
         if not state.is_playing:
             if was_playing:
+                cleared = False
                 if SHOW_PAUSED_RPC:
                     # Feature 7: show paused indicator instead of clearing
                     if avail():
                         await rpc.set_activity(state.title, state.artist, ["\u23f8 Paused"], state.album_art)
-                        rec(); log("RPC paused indicator")
+                        rec(); have_presence = True; log("RPC paused indicator")
                 else:
-                    await rpc.clear_activity(); rl["t"].clear()
+                    cleared = await clear()
                 reset_track_state()
                 event_queue.put(("line",""))
-                if not SHOW_PAUSED_RPC:
+                if cleared:
                     log("RPC cleared")
             continue
         was_playing = True
@@ -1626,7 +1720,7 @@ async def rpc_loop(rpc):
         # this track, then stay silent for as long as it's playing.
         if getattr(state, "blacklisted", False):
             if last_uri != state.track_uri:
-                await rpc.clear_activity(); rl["t"].clear()
+                await clear()
                 last_uri = state.track_uri
                 event_queue.put(("line", "— blacklisted —"))
             continue
@@ -1661,6 +1755,7 @@ async def rpc_loop(rpc):
                         await asyncio.sleep(w + 0.05)
                 if avail():
                     gap_shown_idx = active_gap["key"]; title_sent = True; rec()
+                    have_presence = True
                     instr_text = INSTRUMENTAL_TEXT  # Feature 5: custom instrumental text
                     await rpc.set_activity(state.title, state.artist, [instr_text], state.album_art, state.position_ms, state.duration_ms)
                     log(f"RPC instrumental  (gap {active_gap['gap_ms']/1000:.1f}s)")
@@ -1684,7 +1779,7 @@ async def rpc_loop(rpc):
             # the gate it was written for. One publish per track, not one per
             # 50ms tick, so an unlyricked album can't exhaust the rate limit.
             if not title_sent and avail():
-                title_sent = True; rec()
+                title_sent = True; rec(); have_presence = True
                 await rpc.set_activity(state.title, state.artist, [],
                                        state.album_art,
                                        state.position_ms, state.duration_ms)
@@ -1715,7 +1810,7 @@ async def rpc_loop(rpc):
             line1 = cur
             group, _ = pick_group(line1)
 
-        last_line = line1; skip = group[1:]; rec()
+        last_line = line1; skip = group[1:]; rec(); have_presence = True
         await rpc.set_activity(state.title, state.artist, group, state.album_art, state.position_ms, state.duration_ms)
         display = join_lines(group)
         log(f"RPC ({len(group)}L)  ·  {display[:55]}"); event_queue.put(("line", display))
