@@ -40,15 +40,13 @@ class DiscordRPC:
     # If a single pipe operation takes longer than this, consider the pipe dead.
     # Prevents a blocking read() from wedging the worker thread forever.
     PIPE_TIMEOUT_S   = 5.0
-    # Drop a pending SET_ACTIVITY if the worker can't keep up (rate-limit /
-    # pipe stall). Old lyric lines are stale anyway; we keep only the latest.
-    SEND_STALE_S     = 1.0
     def __init__(self, app_id):
         self.app_id = app_id; self.pipe = None
         self._connected = False; self._nonce = 0
         # Pending RPC sends, newest last. We only need the newest, so older
         # unprocessed sends are dropped to avoid an unbounded queue backlog.
         self._pending = []
+        self._drain_queued = False   # a _drain_sends task is already queued
         self._lock = threading.Lock()
     def _nxt(self): self._nonce += 1; return str(self._nonce)
     async def connect(self):
@@ -178,17 +176,17 @@ class DiscordRPC:
         by a game), the backlog grows without bound and the app freezes. We keep
         only the newest pending send — older lyric lines are stale by the time
         they'd be sent anyway."""
-        now = time.monotonic()
+        # Keep literally the newest send, and queue at most one drain task.
+        # This used to keep every send from the last second and submit a
+        # drain task per call, so while the pipe was stalled — the very case
+        # this guards — the executor's queue kept growing (tests/test_rpc.py).
         with self._lock:
-            # Drop sends that have been sitting in the queue longer than the
-            # staleness window — they're no longer worth sending.
-            self._pending = [(ts, p) for (ts, p) in self._pending
-                             if now - ts < self.SEND_STALE_S]
-            fut_payload = (now, payload)
-            self._pending.append(fut_payload)
-        # Submit directly to the thread pool. A ThreadPoolExecutor accepts
-        # submissions from any thread — no event loop required — and is itself
-        # the backpressure boundary (max_workers caps concurrent sends).
+            self._pending = [(time.monotonic(), payload)]
+            if self._drain_queued:
+                return
+            self._drain_queued = True
+        # A ThreadPoolExecutor accepts submissions from any thread, no event
+        # loop required.
         fut = executor.submit(self._drain_sends)
         # Don't await — fire-and-forget, but consume exceptions so they can't
         # surface as "exception never retrieved" warnings.
@@ -204,8 +202,11 @@ class DiscordRPC:
         only a fixed number of threads are ever tied up — never an unbounded
         queue of fire-and-forget tasks."""
         with self._lock:
+            # Cleared before sending, so a send arriving mid-write queues a
+            # fresh drain instead of being lost.
+            self._drain_queued = False
             if not self._pending:
                 return
-            _, payload = self._pending.pop()      # newest only
-            self._pending.clear()                  # discard the rest (stale)
+            _, payload = self._pending.pop()      # the newest (and only) send
+            self._pending.clear()
         self._send(payload)
