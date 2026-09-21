@@ -11,13 +11,14 @@ objShell.CurrentDirectory = scriptDir
 Dim pythonw, pyPath, v
 pythonw = ""
 
-Dim versions(5)
-versions(0) = "3.13"
-versions(1) = "3.12"
-versions(2) = "3.11"
-versions(3) = "3.10"
-versions(4) = "3.9"
-versions(5) = "3.8"
+Dim versions(6)
+versions(0) = "3.14"
+versions(1) = "3.13"
+versions(2) = "3.12"
+versions(3) = "3.11"
+versions(4) = "3.10"
+versions(5) = "3.9"
+versions(6) = "3.8"
 
 For Each v In versions
     On Error Resume Next
