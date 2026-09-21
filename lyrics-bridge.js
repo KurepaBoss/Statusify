@@ -6,15 +6,19 @@
     console.log("[LyricsBridge] Loaded.");
 
     // ── Spicy Lyrics API version ─────────────────────────────────
-    // api.spicylyrics.org gates requests on the version headers below. This
-    // was pinned to 5.19.12 (released 8 Mar 2026) while the live extension had
-    // moved on to 6.1.1 — ten releases later, across a major version bump that
-    // changed the lyrics backend (6.1.0 added a server-side request queue and
-    // dropped background prefetching). A stale version made every Spicy call
-    // fail, and because the fallback was silent the app quietly served Spotify
-    // lyrics for every single track while still labelling the pipeline "Spicy
-    // first". Keep this in step with:
-    //   https://github.com/Spikerko/spicy-lyrics/releases
+    // Sent in the SpicyLyrics-Version header and the request body. The API is
+    // lenient about the exact value (6.1.1 is still accepted even though the
+    // live extension is on 6.3.x), so this does NOT need to track releases
+    // release-for-release.
+    //
+    // NOTE for future maintainers: the "lyrics silently came from Spotify"
+    // outage was NOT a version-pin problem. Spicy Lyrics 6.x changed the
+    // response *format* — queries[0] became a "_notice" object (pushing the
+    // result to a later index) and result.data became an SLObjPack-packed
+    // [valuesList, stream] payload instead of a plain object. The old parser
+    // read queries[0].result.data.Content, found nothing, and fell back to
+    // Spotify for every track. The fix lives in fetchSpicyLyrics/slUnpack
+    // below, not here. See: https://github.com/Spikerko/spicy-lyrics/releases
     const SPICY_VERSION = "6.1.1";
 
     let ws             = null;
@@ -137,8 +141,85 @@
         return uri || item.album?.images?.[0]?.url || "";
     }
 
-    function parseSpicyLyrics(data) {
-        const result = data?.queries?.[0]?.result?.data;
+    // ── SLObjPack decoder ────────────────────────────────────────
+    // Spicy Lyrics 6.x no longer returns lyrics as a plain JSON object:
+    // result.data is a packed payload [valuesList, stream] produced by the
+    // extension's own SLObjPack packer. This is a faithful port of its
+    // unpack() — https://github.com/Spikerko/spicy-lyrics, src/utils/objpack.ts
+    // — keeping the prototype-pollution guards (safeSet/forbidden keys) and
+    // the size/decode budgets intact. Not decoding this is why every Spicy
+    // call looked empty and the pipeline silently fell back to Spotify.
+    function slUnpack(packed) {
+        const L = { depth: 512, arrayLength: 1 << 20, objectKeys: 1 << 16,
+                    streamLength: 1 << 24, valuesLength: 1 << 22, decodeOps: 1 << 22 };
+        const FORBIDDEN = new Set(["__proto__", "constructor", "prototype"]);
+        if (!Array.isArray(packed) || packed.length !== 2) throw new Error("bad payload shell");
+        const valuesList = packed[0], stream = packed[1];
+        if (!Array.isArray(valuesList) || !Array.isArray(stream)) throw new Error("bad payload arrays");
+        if (valuesList.length > L.valuesLength) throw new Error("valuesList too big");
+        if (stream.length > L.streamLength) throw new Error("stream too big");
+        for (let i = 0; i < valuesList.length; i++) {
+            const v = valuesList[i]; if (v === null) continue; const t = typeof v;
+            if (t === "string" || t === "boolean") continue;
+            if (t === "number") { if (!Number.isFinite(v)) throw new Error("non-finite@" + i); continue; }
+            throw new Error("bad valuesList entry@" + i + " (" + t + ")");
+        }
+        const streamLen = stream.length, valuesLen = valuesList.length; let cursor = 0;
+        const readStream = () => { if (cursor >= streamLen) throw new Error("end of stream"); return stream[cursor++]; };
+        const resolvePointer = (p) => {
+            if (typeof p !== "number" || !Number.isInteger(p) || p < 0 || p >= valuesLen) throw new Error("bad ptr " + p);
+            return valuesList[p];
+        };
+        const readKey = () => {
+            const k = resolvePointer(readStream());
+            if (typeof k !== "string") throw new Error("key not string");
+            if (FORBIDDEN.has(k)) throw new Error("forbidden key");
+            return k;
+        };
+        const safeSet = (o, k, v) => Object.defineProperty(o, k, { value: v, writable: true, enumerable: true, configurable: true });
+        const validateCount = (n, max, label) => {
+            if (typeof n !== "number" || !Number.isInteger(n) || n < 0 || n > max) throw new Error("bad " + label + " count " + n);
+        };
+        const requireStream = (min, label) => { if (min > streamLen - cursor) throw new Error(label + " exceeds stream"); };
+        function decode(depth) {
+            if (depth > L.depth) throw new Error("max depth");
+            const op = readStream();
+            if (typeof op !== "number" || !Number.isInteger(op)) throw new Error("bad opcode " + op);
+            if (op >= 0) return resolvePointer(op);
+            switch (op) {
+                case -1: {
+                    const nk = readStream(); validateCount(nk, L.objectKeys, "object key"); requireStream(nk * 2, "object");
+                    const keys = new Array(nk); for (let i = 0; i < nk; i++) keys[i] = readKey();
+                    const obj = {}; for (let i = 0; i < nk; i++) safeSet(obj, keys[i], decode(depth + 1)); return obj;
+                }
+                case -2: {
+                    const ni = readStream(); validateCount(ni, L.arrayLength, "array item"); requireStream(ni, "array");
+                    const arr = new Array(ni); for (let i = 0; i < ni; i++) arr[i] = decode(depth + 1); return arr;
+                }
+                case -3: {
+                    const ni = readStream(); validateCount(ni, L.arrayLength, "schema item");
+                    const nk = readStream(); validateCount(nk, L.objectKeys, "schema key");
+                    if (ni * nk > L.decodeOps) throw new Error("schema budget");
+                    requireStream(nk + ni * nk, "schema array");
+                    const keys = new Array(nk); for (let i = 0; i < nk; i++) keys[i] = readKey();
+                    const arr = new Array(ni);
+                    for (let i = 0; i < ni; i++) { const obj = {}; for (let k = 0; k < nk; k++) safeSet(obj, keys[k], decode(depth + 1)); arr[i] = obj; }
+                    return arr;
+                }
+                case -4: return [];
+                case -5: return [decode(depth + 1)];
+                case -6: return {};
+                default: throw new Error("unknown opcode " + op);
+            }
+        }
+        const result = decode(0);
+        if (cursor !== streamLen) throw new Error("extra data (" + cursor + "/" + streamLen + ")");
+        return result;
+    }
+
+    // Parse a DECODED Spicy lyrics object ({ Type, Content, ... }) into the
+    // { mode, synced, plain } shape the RPC loop consumes.
+    function parseSpicyLyrics(result) {
         if (!result?.Content?.length) return null;
 
         const type    = result.Type;
@@ -221,6 +302,7 @@
                 headers: {
                     "Content-Type":        "application/json",
                     "SpicyLyrics-Version": SPICY_VERSION,
+                    "X-mode":              "2",
                     "SpicyLyrics-WebAuth": `Bearer ${token}`,
                 },
                 body: JSON.stringify({
@@ -240,42 +322,56 @@
             }
             const data = await resp.json();
 
-            // api.spicylyrics.org answers HTTP 200 even when the query itself
-            // failed: the real status is nested per-query, as
-            //   queries[0].result.httpStatus   (e.g. 401)
-            //   queries[0].result.data.error   (e.g. "Missing authorization")
-            // The outer `resp.status !== 200` check above therefore catches
-            // almost nothing, and this branch used to blame the catalogue for
-            // every failure — reporting "no lyrics for this track" when the
-            // truth was a rejected auth token. The old diagnostic also read
-            // `result.status`, a field this API does not return, so it printed
-            // a literal "status: ?" and told us nothing.
-            const q     = data?.queries?.[0]?.result;
-            const inner = q?.httpStatus;
-            const err   = q?.data?.error;
-            if (err || (inner && inner !== 200)) {
-                lastSpicyError = `${inner || "error"}: ${err || "unknown"}`;
-                // 401/403 here is an auth problem, NOT a missing-lyrics
-                // problem. The token comes from getSpotifyToken(); if the
-                // official Spicy Lyrics panel shows lyrics for the same track
-                // while this fails, the token is the difference.
+            // The response envelope changed in Spicy Lyrics 6.x, in two ways
+            // that each independently broke the old parser:
+            //   1. queries[0] is now a legal "_notice" string object, so the
+            //      lyrics result is no longer at a fixed index — it must be
+            //      found by its operation name.
+            //   2. result.data is no longer a plain { Type, Content } object;
+            //      it is an SLObjPack packed payload [valuesList, stream] that
+            //      has to be unpacked first.
+            // On failure the query still answers HTTP 200, carrying the real
+            // status per-query as result.httpStatus / result.error instead of
+            // a packed payload.
+            const query = Array.isArray(data?.queries)
+                ? data.queries.find(x => x && x.operation === "lyrics")
+                : null;
+            const qres  = query?.result;
+            const inner = qres?.httpStatus;
+            const err   = qres?.error || qres?.data?.error;
+            if (!qres || err || (inner && inner !== 200)) {
+                lastSpicyError = err
+                    ? `${inner || "error"}: ${err}`
+                    : (inner ? `inner ${inner}` : "no lyrics query in response");
+                // 401/403 here is an auth problem, NOT a missing-lyrics one.
                 const hint = (inner === 401 || inner === 403)
                     ? " — auth rejected, not a missing-lyrics problem"
                     : "";
                 console.warn("[LyricsBridge] Spicy query failed:", trackId, inner, err);
                 send({ type: "lyrics_debug",
-                       message: `Spicy ${inner || "error"} for ${trackId}: ${err || "unknown"}${hint}` });
+                       message: `Spicy ${inner || "error"} for ${trackId}: ${err || lastSpicyError}${hint}` });
                 return null;
             }
 
-            const result = parseSpicyLyrics(data);
+            // Decode the packed payload back into the lyrics object.
+            let lyricsObj;
+            try {
+                lyricsObj = slUnpack(qres.data);
+            } catch (e) {
+                lastSpicyError = `decode failed: ${e.message}`;
+                console.warn("[LyricsBridge] SLObjPack decode failed:", trackId, e.message);
+                send({ type: "lyrics_debug", message: `Spicy decode failed for ${trackId}: ${e.message}` });
+                return null;
+            }
+
+            const result = parseSpicyLyrics(lyricsObj);
             if (!result) {
                 // Genuinely nothing to parse — this really is a catalogue miss.
                 console.warn("[LyricsBridge] Spicy returned no content:", trackId,
-                    "type:", q?.data?.Type);
+                    "type:", lyricsObj?.Type);
                 lastSpicyError = "no lyrics in Spicy catalogue";
                 send({ type: "lyrics_debug",
-                       message: `Spicy: no lyrics for ${trackId} (type: ${q?.data?.Type || "none"})` });
+                       message: `Spicy: no lyrics for ${trackId} (type: ${lyricsObj?.Type || "none"})` });
             }
             return result;
         } catch(e) {
