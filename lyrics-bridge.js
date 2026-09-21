@@ -385,12 +385,40 @@
         }
     }
 
+    // CosmosAsync fails with "Resolver not found!" until Spotify's internal
+    // request router has started. Every Spotify-fallback failure in the logs
+    // hit within ~17 s of the bridge connecting, i.e. during Spotify's boot,
+    // and a single 3 s retry gave up long before the router was ready. Treat
+    // that error as "not ready yet" and keep waiting (up to ~30 s), dropping
+    // out early if the user moves on to another track.
+    const RESOLVER_WAIT_MS  = 30000;
+    const RESOLVER_POLL_MS  = 1500;
+    async function cosmosGetWhenReady(url, trackUri) {
+        const deadline = Date.now() + RESOLVER_WAIT_MS;
+        let noted = false;
+        for (;;) {
+            try {
+                return await Spicetify.CosmosAsync.get(url);
+            } catch (e) {
+                if (!/Resolver not found/i.test(e?.message || "") || Date.now() >= deadline) throw e;
+                if (!noted) {
+                    noted = true;
+                    send({ type: "lyrics_debug", message: "Spotify is still starting up — waiting to fetch its lyrics" });
+                }
+                await new Promise(r => setTimeout(r, RESOLVER_POLL_MS));
+                if (Spicetify.Player.data?.item?.uri !== trackUri) return null;
+            }
+        }
+    }
+
     async function fetchSpotifyLyrics(trackUri) {
         const trackId = trackUri.split(":").pop();
         try {
-            const res      = await Spicetify.CosmosAsync.get(
-                `https://spclient.wg.spotify.com/color-lyrics/v2/track/${trackId}?format=json&market=from_token`
+            const res      = await cosmosGetWhenReady(
+                `https://spclient.wg.spotify.com/color-lyrics/v2/track/${trackId}?format=json&market=from_token`,
+                trackUri
             );
+            if (res === null) return null;   // track changed while we waited
             const lines    = res?.lyrics?.lines;
             const syncType = res?.lyrics?.syncType;
             if (!lines?.length) {
