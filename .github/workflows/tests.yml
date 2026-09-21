@@ -28,9 +28,14 @@ jobs:
 
       - name: Lint for undefined names
         shell: pwsh
+        # pyflakes exits 1 on ANY finding (unused imports included), and pwsh
+        # doesn't expand globs for native commands, so list the files
+        # explicitly and fail only on undefined names.
         run: |
-          $out = python -m pyflakes main.py statusify_*.py | Select-String "undefined name"
+          $files = @("main.py") + (Get-ChildItem statusify_*.py).Name
+          $out = python -m pyflakes @files | Select-String "undefined name"
           if ($out) { $out; exit 1 }
+          exit 0
 
       - name: Run tests
         run: pytest -q
