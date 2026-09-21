@@ -1307,7 +1307,15 @@ class DiscordRPC:
             return None
     def _activity(self, title, artist, lines, art, position_ms=None, duration_ms=None):
         label = f"{title} — {artist}"[:128]
-        act = {"details": label, "assets": {"large_image": art or "spotify", "large_text": label}}
+        # type 2 = "Listening" activity. Discord shows Playing/game presence and
+        # Listening presence in SEPARATE slots, so tagging this as Listening lets
+        # it coexist with a running game instead of fighting it for the single
+        # "Playing" slot — exactly how Spotify stays visible while you game.
+        # large_text is the smaller secondary line Discord renders under the
+        # details/state — showing the full "title — artist" there just repeated
+        # the top line, so use it for the creator only.
+        act = {"type": 2, "details": label,
+               "assets": {"large_image": art or "spotify", "large_text": (artist or label)[:128]}}
         f = [l for l in lines if l]
         act["state"] = join_lines(f)[:MAX_STATE] if f else "— "
         # Add elapsed/remaining timer — this is part of the activity payload,
