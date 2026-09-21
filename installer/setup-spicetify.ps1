@@ -6,6 +6,9 @@
 
     Usage:  setup-spicetify.ps1 -Bridge <path\to\lyrics-bridge.js>
             setup-spicetify.ps1 -Uninstall
+            -InstallDir <dir>   put Spicetify somewhere other than
+                                %LOCALAPPDATA%\spicetify (PATH is then left
+                                alone, and an existing install is not reused)
 
     Must run UNELEVATED. Spicetify refuses to run as admin, and it patches the
     per-user Spotify install in %APPDATA%, so an elevated run would either fail
@@ -14,7 +17,8 @@
 param(
     [string]$Bridge,
     [switch]$Uninstall,
-    [switch]$NoPause
+    [switch]$NoPause,
+    [string]$InstallDir
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,12 +26,12 @@ $ProgressPreference    = "SilentlyContinue"   # Invoke-WebRequest is 10x slower 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $BridgeName  = "lyrics-bridge.js"
-$SpiceDir    = Join-Path $env:LOCALAPPDATA "spicetify"
+$SpiceDir    = if ($InstallDir) { $InstallDir } else { Join-Path $env:LOCALAPPDATA "spicetify" }
 $SpiceExe    = Join-Path $SpiceDir "spicetify.exe"
 # Respect an existing install elsewhere (Scoop, winget, a custom folder)
 # rather than dropping a second copy into LOCALAPPDATA.
 $onPath = Get-Command spicetify -ErrorAction SilentlyContinue
-if ($onPath -and -not (Test-Path $SpiceExe)) { $SpiceExe = $onPath.Source }
+if (-not $InstallDir -and $onPath -and -not (Test-Path $SpiceExe)) { $SpiceExe = $onPath.Source }
 $SpiceCfgDir = Join-Path $env:APPDATA "spicetify"
 $ExtDir      = Join-Path $SpiceCfgDir "Extensions"
 $CfgFile     = Join-Path $SpiceCfgDir "config-xpui.ini"
@@ -132,7 +136,7 @@ if (Test-Path $SpiceExe) {
     Remove-Item $zip -ErrorAction SilentlyContinue
 
     $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-    if (($userPath -split ";") -notcontains $SpiceDir) {
+    if (-not $InstallDir -and ($userPath -split ";") -notcontains $SpiceDir) {
         [Environment]::SetEnvironmentVariable("PATH", "$userPath;$SpiceDir".TrimStart(";"), "User")
     }
     Ok "Installed Spicetify $($rel.tag_name)"
