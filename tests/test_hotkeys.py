@@ -82,8 +82,22 @@ def _wait_for(cond, timeout=2.0):
     return cond()
 
 
+def _keys_held():
+    # Keyboard keys only (0x08+); mouse buttons and movement don't interfere.
+    return any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in range(0x08, 0xFF))
+
+
 @pytest.fixture
 def mgr():
+    # These tests inject real, system-wide keystrokes. A key the user is
+    # physically holding (a modifier especially) mixes with ours, so wait for
+    # the keyboard to be released and skip rather than report a false failure.
+    if sys.platform == "win32":
+        end = time.monotonic() + 10
+        while _keys_held() and time.monotonic() < end:
+            time.sleep(0.1)
+        if _keys_held():
+            pytest.skip("a key is being held; live hotkey test would be unreliable")
     m = hk.HotkeyManager()
     yield m
     m.stop()
