@@ -18,6 +18,8 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      SIGNING_ENABLED: ${{ secrets.AZURE_CLIENT_ID != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -41,14 +43,26 @@ jobs:
       - name: Build Statusify.exe
         run: pyinstaller --clean --noconfirm Statusify.spec
 
-      # The exe is unsigned, so a published checksum is the only way a user can
-      # confirm the download matches what this workflow produced.
-      - name: Generate SHA256 checksum
-        shell: pwsh
-        run: |
-          $h = (Get-FileHash dist/Statusify.exe -Algorithm SHA256).Hash.ToLower()
-          "$h  Statusify.exe" | Out-File -Encoding ascii -NoNewline dist/Statusify.exe.sha256
-          Write-Host "SHA256: $h"
+      # ── Code signing (Azure Trusted Signing) ─────────────────────
+      # Dormant until the repository has the secrets listed in SIGNING.md;
+      # without them the build is unsigned exactly as before. The exe is signed
+      # BEFORE the installer is built so Setup.exe carries the signed copy, and
+      # checksums are taken only after all signing is done.
+      - name: Sign Statusify.exe
+        if: env.SIGNING_ENABLED == 'true'
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       # Setup.exe wraps the exe plus the Spicetify/bridge installer script.
       # Inno Setup isn't guaranteed on the runner image, so install it if absent.
@@ -64,10 +78,36 @@ jobs:
           }
           & $iscc "/DAppVersion=$ver" installer/Statusify.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $setup = "dist/Statusify-Setup-$ver.exe"
-          $h = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
-          "$h  Statusify-Setup-$ver.exe" | Out-File -Encoding ascii -NoNewline "$setup.sha256"
-          Write-Host "Setup SHA256: $h"
+          New-Item -ItemType Directory -Force dist/setup | Out-Null
+          Move-Item "dist/Statusify-Setup-$ver.exe" dist/setup/
+
+      - name: Sign installer
+        if: env.SIGNING_ENABLED == 'true'
+        uses: azure/trusted-signing-action@v0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_CERT_PROFILE }}
+          files-folder: ${{ github.workspace }}\dist\setup
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Published checksums let users verify a download, and the in-app
+      # updater refuses to run an installer whose hash doesn't match.
+      - name: Generate SHA256 checksums
+        shell: pwsh
+        run: |
+          Move-Item dist/setup/*.exe dist/
+          foreach ($f in Get-ChildItem dist/Statusify*.exe) {
+            $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($f.Name)" | Out-File -Encoding ascii -NoNewline "$($f.FullName).sha256"
+            Write-Host "$($f.Name): $h"
+          }
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -90,6 +130,16 @@ jobs:
           $tag = $env:GITHUB_REF -replace '^refs/tags/', ''
           gh release view $tag 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --title "Statusify $tag" --generate-notes
+            # Release notes = the README's "What's New in <tag>" section. The
+            # in-app update dialog shows this text as its changelog, so it
+            # should read like release notes, not a commit list.
+            $ver = [regex]::Escape($tag.TrimStart('v'))
+            $md  = (Get-Content README.md -Raw -Encoding utf8) -replace "`r`n", "`n"
+            if ($md -match "(?s)## [^\n]*What's New in v$ver\n(.*?)\n---") {
+              $Matches[1].Trim() | Out-File -Encoding utf8 notes.md
+              gh release create $tag --title "Statusify $tag" --notes-file notes.md
+            } else {
+              gh release create $tag --title "Statusify $tag" --generate-notes
+            }
           }
           gh release upload $tag dist/Statusify.exe dist/Statusify.exe.sha256 (Get-ChildItem dist/Statusify-Setup-*).FullName --clobber
