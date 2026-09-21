@@ -1,12 +1,16 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/KurepaBoss/Statusify/main/statusify_icon_preview.png" width="128" />
-  <h1>Statusify v1.3.0</h1>
+  <h1>Statusify v1.4.0</h1>
   <p><strong>The ultimate Discord Rich Presence & Spotify Lyrics bridge.</strong></p>
 
-  ![Statusify v1.3.0](https://img.shields.io/badge/Statusify-v1.3.0-brightgreen?style=for-the-badge)
+  ![Statusify v1.4.0](https://img.shields.io/badge/Statusify-v1.4.0-brightgreen?style=for-the-badge)
   ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge)
   ![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078d6?style=for-the-badge)
   ![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
+  [![Tests](https://github.com/KurepaBoss/Statusify/actions/workflows/tests.yml/badge.svg)](https://github.com/KurepaBoss/Statusify/actions/workflows/tests.yml)
+
+  <img src="docs/preview.svg" alt="Illustration: a Discord profile showing Listening to Statusify with the current lyric line, next to the Statusify window" width="760" />
+  <br><sub>Illustration: your Discord status shows the lyric line playing right now.</sub>
 </div>
 
 ---
@@ -15,6 +19,20 @@
 **Statusify** is a lightweight, high-performance bridge that connects your Spotify listening experience directly to Discord and your desktop. It offers a beautiful, High-DPI aware GUI to track your session history, view synced lyrics, and manage multiple Discord profiles with a single click.
 
 Lyrics come straight from Spicetify over a local WebSocket — no API keys, no polling a web service, no rate limits. The bridge extension pushes the current track and its exact playback position every 500 ms, and Statusify maps that position to the right lyric line before it reaches Discord.
+
+---
+
+## 🆕 What's New in v1.4.0
+
+**One-click updates.** When a new version is out, *Install update* downloads the new installer, checks it against the SHA-256 published with the release (and refuses to run it if they differ), installs it silently and restarts Statusify. Installs from `Statusify-Setup.exe` only; portable and source copies still get the download link.
+
+**Repair lyrics from the app.** When a Spotify update knocks out the lyrics bridge, the warning under the status dots is now a button: click it and Statusify re-applies Spicetify for you, then clears the warning once Spotify is running the current bridge.
+
+**Lyrics right after Spotify starts.** Songs that fall back to Spotify's own lyrics used to get none if played in the first ~20 seconds after Spotify opened: Spotify's internal request router isn't ready yet and the bridge gave up. It now waits for it.
+
+**No more admin.** Hotkeys don't need Statusify to run elevated any more (since v1.3.0), so nothing about Statusify asks for administrator rights.
+
+**Under the hood.** Tests run on every push, the Discord connection code lives in its own module, and releases are ready for code signing (see [SIGNING.md](SIGNING.md)).
 
 ---
 

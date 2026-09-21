@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="400" viewBox="0 0 900 400" font-family="Segoe UI, Inter, Helvetica, Arial, sans-serif">
+  <title>Statusify: synced lyrics on your Discord status (illustration)</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b0d10"/>
+      <stop offset="1" stop-color="#12151a"/>
+    </linearGradient>
+    <linearGradient id="art" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1db954"/>
+      <stop offset="1" stop-color="#0e5c2a"/>
+    </linearGradient>
+    <linearGradient id="art2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1db954"/>
+      <stop offset="1" stop-color="#136b33"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="900" height="400" rx="18" fill="url(#bg)"/>
+
+  <!-- Left: a presence card, as friends see it -->
+  <g transform="translate(40,56)">
+    <rect width="400" height="288" rx="14" fill="#1a1f26" stroke="#252b34"/>
+    <circle cx="44" cy="46" r="22" fill="#2b3340"/>
+    <circle cx="60" cy="62" r="7" fill="#1db954" stroke="#1a1f26" stroke-width="3"/>
+    <text x="80" y="42" fill="#f2f4f7" font-size="16" font-weight="700">you</text>
+    <text x="80" y="62" fill="#a8b0bb" font-size="12">your profile, as friends see it</text>
+    <line x1="24" y1="90" x2="376" y2="90" stroke="#252b34"/>
+    <text x="24" y="116" fill="#a8b0bb" font-size="11" font-weight="700" letter-spacing="1">LISTENING TO STATUSIFY</text>
+    <rect x="24" y="132" width="96" height="96" rx="10" fill="url(#art)"/>
+    <text x="72" y="190" text-anchor="middle" fill="#0b0d10" font-size="34">♪</text>
+    <text x="136" y="152" fill="#f2f4f7" font-size="15" font-weight="700">Song Title</text>
+    <text x="136" y="174" fill="#d7dbe0" font-size="13">♪ the lyric line playing</text>
+    <text x="136" y="192" fill="#d7dbe0" font-size="13">right now, on the beat</text>
+    <text x="136" y="214" fill="#a8b0bb" font-size="12">Artist</text>
+    <rect x="136" y="232" width="224" height="4" rx="2" fill="#252b34"/>
+    <rect x="136" y="232" width="92" height="4" rx="2" fill="#f2f4f7"/>
+    <text x="136" y="254" fill="#a8b0bb" font-size="11">1:12</text>
+    <text x="360" y="254" text-anchor="end" fill="#a8b0bb" font-size="11">3:05</text>
+  </g>
+
+  <!-- Arrow -->
+  <g transform="translate(456,200)" fill="none" stroke="#1db954" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M40 0 H0"/><path d="M12 -10 L0 0 L12 10"/>
+  </g>
+
+  <!-- Right: the Statusify window -->
+  <g transform="translate(510,40)">
+    <rect width="350" height="320" rx="14" fill="#12151a" stroke="#252b34"/>
+    <text x="22" y="34" fill="#f2f4f7" font-size="14" font-weight="700">Statusify</text>
+    <circle cx="302" cy="29" r="5" fill="#1db954"/><circle cx="322" cy="29" r="5" fill="#1db954"/>
+    <text x="22" y="62" fill="#6b7480" font-size="10" font-weight="700" letter-spacing="1">NOW PLAYING</text>
+    <rect x="22" y="74" width="64" height="64" rx="8" fill="url(#art2)"/>
+    <text x="54" y="115" text-anchor="middle" fill="#0b0d10" font-size="24">♪</text>
+    <text x="100" y="98" fill="#f2f4f7" font-size="14" font-weight="700">Song Title</text>
+    <text x="100" y="118" fill="#a8b0bb" font-size="12">Artist</text>
+    <rect x="22" y="160" width="306" height="112" rx="10" fill="#1a1f26"/>
+    <text x="40" y="188" fill="#6b7480" font-size="12">the line before</text>
+    <text x="40" y="216" fill="#1db954" font-size="15" font-weight="700">the line playing now</text>
+    <text x="40" y="244" fill="#6b7480" font-size="12">the line after</text>
+    <text x="22" y="298" fill="#6b7480" font-size="10">Synced lyrics · Spicy Lyrics, Spotify fallback</text>
+  </g>
+</svg>
