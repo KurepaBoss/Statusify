@@ -50,6 +50,25 @@ jobs:
           "$h  Statusify.exe" | Out-File -Encoding ascii -NoNewline dist/Statusify.exe.sha256
           Write-Host "SHA256: $h"
 
+      # Setup.exe wraps the exe plus the Spicetify/bridge installer script.
+      # Inno Setup isn't guaranteed on the runner image, so install it if absent.
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $ver = (python -c "from version import VERSION; print(VERSION)").Trim()
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc "/DAppVersion=$ver" installer/Statusify.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setup = "dist/Statusify-Setup-$ver.exe"
+          $h = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLower()
+          "$h  Statusify-Setup-$ver.exe" | Out-File -Encoding ascii -NoNewline "$setup.sha256"
+          Write-Host "Setup SHA256: $h"
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
@@ -57,6 +76,8 @@ jobs:
           path: |
             dist/Statusify.exe
             dist/Statusify.exe.sha256
+            dist/Statusify-Setup-*.exe
+            dist/Statusify-Setup-*.exe.sha256
 
       # Only on a tag push. gh is preinstalled on GitHub runners, so this needs
       # no third-party action in the release path.
@@ -71,4 +92,4 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             gh release create $tag --title "Statusify $tag" --generate-notes
           }
-          gh release upload $tag dist/Statusify.exe dist/Statusify.exe.sha256 --clobber
+          gh release upload $tag dist/Statusify.exe dist/Statusify.exe.sha256 (Get-ChildItem dist/Statusify-Setup-*).FullName --clobber
