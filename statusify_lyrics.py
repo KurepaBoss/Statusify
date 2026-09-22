@@ -181,3 +181,68 @@ def _calc_instrumental_gaps(synced, duration_ms):
 
     gaps.sort(key=lambda g: g["startMs"])
     return gaps
+
+
+# ── LRCLIB (third lyrics source) ──────────────────────────────────
+# When both Spicy Lyrics and Spotify's own lyrics come back empty (the log
+# showed api.spicylyrics.org failing outright and Spotify's endpoint answering
+# "Resolver not found"), lrclib.net — free, keyless, community-maintained —
+# usually still has the track.
+import re as _re
+
+_LRC_TAG = _re.compile(r"\[(\d+):(\d{1,2})(?:[.:](\d{1,3}))?\]")
+LRCLIB_DURATION_TOLERANCE_S = 3
+
+
+def parse_lrc(text):
+    """LRC text -> [{"startMs", "words"}] sorted by time. A line with several
+    time tags ("[00:10.00][01:20.00]chorus") yields one entry per tag."""
+    out = []
+    for raw in (text or "").splitlines():
+        tags = list(_LRC_TAG.finditer(raw))
+        if not tags or tags[0].start() != 0:
+            continue
+        words = raw[tags[-1].end():].strip()
+        for m in tags:
+            frac = m.group(3) or "0"
+            ms = int(frac.ljust(3, "0")[:3])
+            out.append({"startMs": (int(m.group(1)) * 60 + int(m.group(2))) * 1000 + ms,
+                        "words": words})
+    out.sort(key=lambda l: l["startMs"])
+    return out
+
+
+def clean_title(title):
+    """Drop decorations LRCLIB titles usually lack: "(feat. X)", "[Remix]"
+    stays, " - Remastered 2011" / " - Live" suffixes go."""
+    t = _re.sub(r"\s*[\(\[](feat\.?|ft\.?|with)\s[^\)\]]*[\)\]]", "", title or "", flags=_re.I)
+    t = _re.sub(r"\s+-\s+.*(remaster|version|edit|mix|live|mono|stereo).*$", "", t, flags=_re.I)
+    return t.strip()
+
+
+def pick_lrclib(results, duration_ms):
+    """Best LRCLIB search result -> (mode, synced, plain), or None.
+
+    Only results within LRCLIB_DURATION_TOLERANCE_S of the track's length are
+    trusted: search is fuzzy, and a same-named song (or a whole-album upload —
+    a real result for "Money Trees" was 2355 s long) would put the wrong
+    words on someone's profile. Synced beats plain; closer length breaks ties."""
+    best = None
+    for r in results or []:
+        if not isinstance(r, dict) or r.get("instrumental"):
+            continue
+        try:
+            dur_s = float(r.get("duration") or 0)
+        except (TypeError, ValueError):
+            continue
+        diff = abs(dur_s - duration_ms / 1000.0) if duration_ms else 0.0
+        if duration_ms and diff > LRCLIB_DURATION_TOLERANCE_S:
+            continue
+        synced = parse_lrc(r.get("syncedLyrics") or "")
+        plain = [l for l in (r.get("plainLyrics") or "").splitlines()]
+        if not synced and not any(l.strip() for l in plain):
+            continue
+        rank = (0 if synced else 1, diff)
+        if best is None or rank < best[0]:
+            best = (rank, ("synced", synced, []) if synced else ("plain", [], plain))
+    return best[1] if best else None

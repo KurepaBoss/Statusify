@@ -43,7 +43,8 @@ _RES_DIR = (getattr(sys, "_MEIPASS", _APP_DIR) if _FROZEN
 # here rather than halfway down the file because _track_offset_ms — defined
 # long before the old import site — now depends on resolve_offset_ms.
 from statusify_lyrics import (join_lines, select_line, resolve_offset_ms,
-                              offset_key, _calc_instrumental_gaps)
+                              offset_key, _calc_instrumental_gaps,
+                              clean_title, pick_lrclib)
 
 # Global hotkeys use RegisterHotKey (statusify_hotkeys), not the `keyboard`
 # library: its low-level hook went deaf whenever a game had focus and fired on
@@ -1348,6 +1349,65 @@ _rpc_mod.status_display_type = (
 _rpc_mod.link_track = _cfg_get("preferences", "link_track", "true").lower() == "true"
 
 # ── WebSocket ─────────────────────────────────────────────────────
+def _apply_lyrics(mode, synced, plain, src):
+    """Make these the current track's lyrics (bridge, cache or LRCLIB)."""
+    state.lyrics_mode = mode; state.synced = synced; state.plain = plain
+    state.instrumental_gaps = (_calc_instrumental_gaps(synced, state.duration_ms)
+                               if mode == "synced" else [])
+    n = len(synced) or len(plain)
+    log(f"Lyrics ({src})  ·  {mode}  ·  {n} lines")
+    event_queue.put(("lyrics", src, mode, n))
+    _save_history(mode, synced, plain, src)
+
+# ── LRCLIB fallback ───────────────────────────────────────────────
+# Third source, tried only after the bridge reports no lyrics from Spicy or
+# Spotify. One lookup per track per session, off the event loop.
+LRCLIB_ENABLED = _cfg_get("preferences", "lrclib_fallback", "true").lower() == "true"
+_LRCLIB_URL    = "https://lrclib.net/api/search"
+_LRCLIB_TRIED  = set()   # track URIs already looked up this session
+_LRCLIB_TASKS  = set()   # strong refs, so pending tasks are not GC'd
+
+def _lrclib_search(artist, title):
+    import urllib.request, urllib.parse
+    q = urllib.parse.urlencode({"track_name": clean_title(title), "artist_name": artist})
+    req = urllib.request.Request(
+        f"{_LRCLIB_URL}?{q}",
+        # LRCLIB asks clients to identify themselves.
+        headers={"User-Agent": f"Statusify/{_VERSION} (https://github.com/{_GITHUB_REPO})"})
+    with urllib.request.urlopen(req, timeout=8) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+def _maybe_fetch_lrclib(uri):
+    if not LRCLIB_ENABLED or not uri or uri in _LRCLIB_TRIED:
+        return
+    _LRCLIB_TRIED.add(uri)
+    task = asyncio.get_running_loop().create_task(
+        _lrclib_task(uri, state.artist, state.title, state.duration_ms))
+    _LRCLIB_TASKS.add(task)
+    task.add_done_callback(_LRCLIB_TASKS.discard)
+
+async def _lrclib_task(uri, artist, title, duration_ms):
+    loop = asyncio.get_running_loop()
+    results = None
+    for attempt in (1, 2):
+        try:
+            results = await loop.run_in_executor(None, _lrclib_search, artist, title)
+            break
+        except Exception as e:
+            # LRCLIB answers 503 under load now and then; one retry covers it.
+            if attempt == 2 or getattr(e, "code", 500) < 500:
+                log(f"LRCLIB lookup failed: {type(e).__name__}: {e}")
+                return
+            await asyncio.sleep(3)
+    picked = pick_lrclib(results, duration_ms)
+    if not picked:
+        log(f"LRCLIB: no match for {artist} — {title}")
+        return
+    # The user may have skipped, or lyrics may have arrived meanwhile.
+    if state.track_uri != uri or state.lyrics_mode != "none":
+        return
+    _apply_lyrics(*picked, "LRCLIB")
+
 async def ws_handler(ws):
     global _spicetify_ws, _dropped_lines, _BRIDGE_UPDATED
     _spicetify_ws = ws
@@ -1400,13 +1460,7 @@ async def ws_handler(ws):
                 cached = _cached_lyrics(state.track_uri)
                 if cached:
                     c_mode, c_synced, c_plain, _ = cached
-                    state.lyrics_mode = c_mode; state.synced = c_synced; state.plain = c_plain
-                    state.instrumental_gaps = (_calc_instrumental_gaps(c_synced, state.duration_ms)
-                                               if c_mode == "synced" else [])
-                    n = len(c_synced) or len(c_plain)
-                    log(f"Lyrics (cache)  ·  {c_mode}  ·  {n} lines")
-                    event_queue.put(("lyrics", "cache", c_mode, n))
-                    _save_history(c_mode, c_synced, c_plain, "cache")
+                    _apply_lyrics(c_mode, c_synced, c_plain, "cache")
             elif t == "lyrics":
                 mode   = data.get("mode", data.get("lyrics_mode","none"))
                 synced = data.get("synced",[]); plain = data.get("plain",[])
@@ -1422,12 +1476,9 @@ async def ws_handler(ws):
                     # Already showing cached lyrics; a failed fetch keeps them.
                     log(f"Lyrics ({src})  ·  none  ·  keeping cached lyrics")
                 elif uri == state.track_uri or (not uri and state.lyrics_mode == "none"):
-                    state.lyrics_mode = mode; state.synced = synced; state.plain = plain
-                    state.instrumental_gaps = _calc_instrumental_gaps(synced, state.duration_ms) if mode == "synced" else []
-                    n   = len(synced) or len(plain)
-                    log(f"Lyrics ({src})  ·  {mode}  ·  {n} lines")
-                    event_queue.put(("lyrics", src, mode, n))
-                    _save_history(mode, synced, plain, src)
+                    _apply_lyrics(mode, synced, plain, src)
+                    if mode == "none":
+                        _maybe_fetch_lrclib(state.track_uri)
             elif t == "position":
                 was = state.is_playing
                 state.position_ms = int(data.get("position_ms",0))
@@ -4303,6 +4354,17 @@ class App:
             _cfg_set("preferences", "link_track", str(_rpc_mod.link_track).lower())
         tk.Checkbutton(row_lk, variable=self._link_var, bg=BG2, activebackground=BG2,
                        selectcolor=BG3, command=_toggle_link).pack(side="right")
+
+        row_lr = tk.Frame(inner_rpc, bg=BG2); row_lr.pack(fill="x", pady=(0,6))
+        tk.Label(row_lr, text='Try LRCLIB when Spicy and Spotify have no lyrics', fg=TEXT2, bg=BG2,
+                 font=self._f(9), anchor="w").pack(side="left")
+        self._lrclib_var = tk.BooleanVar(value=LRCLIB_ENABLED)
+        def _toggle_lrclib():
+            global LRCLIB_ENABLED
+            LRCLIB_ENABLED = self._lrclib_var.get()
+            _cfg_set("preferences", "lrclib_fallback", str(LRCLIB_ENABLED).lower())
+        tk.Checkbutton(row_lr, variable=self._lrclib_var, bg=BG2, activebackground=BG2,
+                       selectcolor=BG3, command=_toggle_lrclib).pack(side="right")
 
         # Feature 5 — custom instrumental text
         row_it = tk.Frame(inner_rpc, bg=BG2); row_it.pack(fill="x")

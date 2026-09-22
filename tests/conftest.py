@@ -16,3 +16,16 @@ os.environ["STATUSIFY_DATA_DIR"] = _DATA_DIR
 
 def pytest_unconfigure(config):
     shutil.rmtree(_DATA_DIR, ignore_errors=True)
+
+
+import sys
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_lrclib_network(monkeypatch):
+    """No test may reach lrclib.net; tests that exercise it stub the search."""
+    main = sys.modules.get("main")
+    if main is not None:
+        monkeypatch.setattr(main, "LRCLIB_ENABLED", False)
