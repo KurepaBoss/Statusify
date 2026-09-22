@@ -24,15 +24,7 @@ Lyrics come straight from Spicetify over a local WebSocket — no API keys, no p
 
 ## 🆕 What's New in v2.0.1
 
-**Settings could flip a setting you didn't touch.** In 2.0.0, when the Settings page re-laid itself out (for example as the listening stats finished loading), clicking an ordinary row could toggle a switch that had been in that spot before. Every click target is now unique to the current layout. If a setting changed without you asking in 2.0.0 (*Start minimised to the tray* is the likely one), set it back once and it will stay.
-
-Everything new in Statusify 2.0 is listed under v2.0.0 below.
-
----
-
-## 🆕 What's New in v2.0.0
-
-Statusify 2.0 is a new app on the outside. Everything since v1.4.0 is in this release.
+Statusify 2.0 is a new app on the outside. If you're coming from 1.x, everything since v1.4.0 is below.
 
 **A lyric sheet that moves with the music.** The Lyrics page is rebuilt from scratch. The background is the album cover's own colours drifting slowly like thick water, heavily blurred, and it flows into the next cover's colours when the track changes. When a new line starts, the sheet glides up: the new line sharpens and brightens, and lines further away soften and dim. Colours are kept dark (or light) enough that the words stay readable on any cover. Japanese, Chinese, Korean and Thai lyrics are drawn with the right fonts.
 
@@ -52,49 +44,9 @@ Statusify 2.0 is a new app on the outside. Everything since v1.4.0 is in this re
 
 **Updating from 1.x:** the Spotify bridge gained the playback commands, so it has to be re-applied once. The installer does this for you. If you run from source, click the *Lyrics bridge out of date* message under the status dots after updating.
 
----
+**2.0.1 fix: Settings could flip a setting you didn't touch.** In 2.0.0, after the Settings page re-laid itself out (for example when the listening stats finished loading), clicking an ordinary row could toggle a switch that had been in that spot before. Click targets are now unique to the current layout. If a setting changed by itself in 2.0.0 (*Start minimised to the tray* is the likely one), set it back once and it will stay.
 
-## 🆕 What's New in v1.4.0
-
-**One-click updates.** When a new version is out, *Install update* downloads the new installer, checks it against the SHA-256 published with the release (and refuses to run it if they differ), installs it silently and restarts Statusify. Installs from `Statusify-Setup.exe` only; portable and source copies still get the download link.
-
-**Repair lyrics from the app.** When a Spotify update knocks out the lyrics bridge, the warning under the status dots is now a button: click it and Statusify re-applies Spicetify for you, then clears the warning once Spotify is running the current bridge.
-
-**Lyrics right after Spotify starts.** Songs that fall back to Spotify's own lyrics used to get none if played in the first ~20 seconds after Spotify opened: Spotify's internal request router isn't ready yet and the bridge gave up. It now waits for it.
-
-**No more admin.** Hotkeys don't need Statusify to run elevated any more (since v1.3.0), so nothing about Statusify asks for administrator rights.
-
-**Under the hood.** Tests run on every push, the Discord connection code lives in its own module, and releases are ready for code signing (see [SIGNING.md](SIGNING.md)).
-
----
-
-## 🆕 What's New in v1.3.0
-
-**One-click installer.** Download `Statusify-Setup-1.3.0.exe` from the [Releases page](https://github.com/KurepaBoss/Statusify/releases) and it handles everything: installs Statusify, installs [Spicetify](https://spicetify.app/) if you don't have it, wires the lyrics bridge into Spotify and applies it. No terminal, no copying files. It also adds a **Repair Spicetify bridge** shortcut to the Start Menu for when a Spotify update wipes Spicetify.
-
-**Hotkeys work in games, without admin.** Hotkeys now use Windows' own `RegisterHotKey` instead of a keyboard hook. The old hook went deaf whenever a game had focus unless Statusify ran as administrator, and fired on every key-repeat, so holding `Ctrl+Alt+N` a moment too long skipped a whole run of tracks. Now one press is one action, and a combo already taken by another program is reported instead of silently doing nothing.
-
-**Lyrics no longer leak between songs.** Skipping while lyrics were still loading could put the *previous* song's lyrics on your status. Lyrics are now matched to their exact track. A lyric-less track also no longer inherits the previous song's instrumental breaks, and the bridge no longer fetches every track twice on connect.
-
-**Smoother lyric timing.** Lines are grouped by how much song they cover, so each Discord update lasts long enough to stay inside Discord's rate limit (5 updates per 20 s). Playback position is interpolated between the bridge's position pings, so lines advance on time instead of in jumps.
-
-**Shows alongside games.** Your presence is now a *Listening* activity, the same slot Spotify uses, so a running game no longer hides your music.
-
-**Spicy Lyrics 6.x support**, a faster and tidier Settings page (collapsible sections, auto-save, no more SAVE buttons), and the scroll-restore crash is fixed.
-
----
-
-## 🆕 What's New in v1.2.0
-
-**A fully redesigned interface.** The GUI now runs on a real animation engine — eased fades and transitions, smooth scrolling, hover and focus states on every control, and rounded album art. Accent colours are blended and contrast-checked at runtime, so text stays readable against whatever accent you pick, in both light and dark themes.
-
-**No more zombie processes.** Closing Statusify could leave `pythonw.exe` running with no window, still holding the single-instance lock and port 8765 — so the next launch refused to start and Task Manager was the only way out. Shutdown now closes the Discord pipe first to unblock stuck reader threads, then exits without waiting on them.
-
-**Launching a second copy now shows the first one.** Previously it just exited silently and looked like nothing had happened. It now brings the running window to the front, and tells you plainly if the running copy is wedged instead of leaving you guessing.
-
-**Stale-bridge detection.** Statusify compares the bridge extension in your Spicetify folder against the copy actually injected into Spotify and warns you when they differ — the situation that used to look like "lyrics randomly stopped working." See [step 2 of the setup](#2-prepare-spicetify-for-lyrics) for why restarting Spotify never fixed it.
-
-**Better diagnostics.** Every log line, including everything from the Spicetify bridge, now lands in a timestamped `statusify.log` next to `main.py` — so "presence stopped working an hour ago" is answerable after the fact. The file is size-capped, and crashes are captured too, even under `pythonw.exe`, which has no console for stderr to go to.
+Notes for earlier versions are on the [Releases page](https://github.com/KurepaBoss/Statusify/releases).
 
 ---
 
