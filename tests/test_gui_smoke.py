@@ -52,6 +52,13 @@ def app(tmp_path, monkeypatch):
     a._alive = False
     a._root.destroy()
     st.close()
+    # Reclaim the dead App (and its PhotoImages) here, on the Tk thread.
+    # Left to the cyclic GC, it could be freed later on whatever thread
+    # triggers a collection (a later test's asyncio or executor thread), and
+    # Tcl aborts the process when an image is deleted from the wrong thread.
+    del a
+    import gc
+    gc.collect()
 
 
 def _pump(app, n=20):

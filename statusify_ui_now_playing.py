@@ -1182,11 +1182,19 @@ class NowPlayingPage:
     def _tick_progress(self):
         """The page's frame clock.
 
-        25 fps while the page is on screen (the water is slow, so that's
-        plenty), 60 fps while a line or the header is gliding, and nothing
-        at all while the page is hidden. With animations off, frames are
-        drawn only when something changed or the clock ticks over a second."""
+        60 fps while a line or the header is gliding, 25 fps otherwise (the
+        water is slow and unchanged frames are skipped), nothing while the
+        page is hidden. Lower quality tiers use 30/15 fps.
+
+        Two things used to halve these rates. Windows wakes timers every
+        15.6 ms by default, so after(16) really waited ~31 ms: 32 fps at best.
+        And the wait began after the frame was drawn, so drawing time was
+        added on top. The clock now asks for 1 ms timer precision while the
+        page is animating on screen (released when hidden) and schedules each
+        frame against a deadline, so drawing time comes out of the wait."""
+        t0 = time.perf_counter()
         interval = 500
+        animating = False
         try:
             if self._np_visible():
                 self._update_sheet()
@@ -1194,17 +1202,35 @@ class NowPlayingPage:
                 busy = self._np_render(force=False)
                 if busy:
                     interval = (self.FRAME_MS_BUSY, 33, 33)[tier]
+                    animating = True
                 elif self._np_hover == "seek" or self._np_drag is not None:
-                    interval = 33
+                    interval = self.FRAME_MS_BUSY
+                    animating = True
                 else:
                     interval = (self.FRAME_MS_IDLE, 66, 250)[tier]
+                    animating = tier < 2 and M.ANIMATIONS_ENABLED
                 # Wake exactly when the next lyric line starts, so a low frame
                 # rate never makes a line late.
                 interval = min(interval, self._np_ms_to_next_line())
         except Exception as e:
             M.log(f"Lyric sheet frame failed: {e}")
             interval = 1000
-        self._schedule("progress", interval, self._tick_progress)
+        self._np_fine_timer(animating)
+        spent = (time.perf_counter() - t0) * 1000.0
+        self._schedule("progress", max(1, int(interval - spent)), self._tick_progress)
+
+    def _np_fine_timer(self, on):
+        """1 ms Windows timer resolution while animating; default otherwise.
+        Held only while the lyric page is on screen and moving, so an idle or
+        hidden Statusify costs no extra power."""
+        if on == getattr(self, "_np_timer_fine", False):
+            return
+        try:
+            import ctypes
+            (ctypes.windll.winmm.timeBeginPeriod if on else ctypes.windll.winmm.timeEndPeriod)(1)
+            self._np_timer_fine = on
+        except Exception:
+            self._np_timer_fine = on
 
     def _np_ms_to_next_line(self):
         if not self._np_synced() or not self._np_playing():
