@@ -224,3 +224,23 @@ def test_seek_without_spotify_reports_instead_of_failing(app, monkeypatch):
     assert app._np_seek(1000) is False
     assert "isn't connected" in app.lbl_err.cget("text")
 
+
+
+def test_relayout_does_not_leave_stale_click_targets(app, monkeypatch):
+    """A re-render moves rows; a plain row landing where a switch row was
+    must not inherit that switch's click."""
+    monkeypatch.setattr(main, "_cfg_set", lambda *a, **k: None)
+    app._build_deferred_pages()
+    app._show("SETTINGS"); _pump(app, 3)
+    cv = app.set_cv
+    before = (main.START_MINIMIZED, main.CLOSE_TO_TRAY, main.ALBUM_TINT, main.ANIMATIONS_ENABLED,
+              main.SAVE_HISTORY, main.LRCLIB_ENABLED, main.SHOW_PAUSED_RPC)
+    old_tags = {t for i in cv.find_all() for t in cv.gettags(i) if t.startswith("row")}
+    app._set_render(); _pump(app, 2)
+    new_tags = {t for i in cv.find_all() for t in cv.gettags(i) if t.startswith("row")}
+    assert not (old_tags & new_tags)
+    for t in old_tags:
+        assert not cv.tag_bind(t, "<Button-1>")
+    after = (main.START_MINIMIZED, main.CLOSE_TO_TRAY, main.ALBUM_TINT, main.ANIMATIONS_ENABLED,
+             main.SAVE_HISTORY, main.LRCLIB_ENABLED, main.SHOW_PAUSED_RPC)
+    assert before == after

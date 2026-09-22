@@ -376,13 +376,14 @@ class SettingsPage:
 
     def _set_bind(self, tag, cmd):
         cv = self.set_cv
+        self.__dict__.setdefault("_set_live_tags", []).append(tag)
         cv.tag_bind(tag, "<Button-1>", lambda e: cmd())
         cv.tag_bind(tag, "<Enter>", lambda e: cv.config(cursor="hand2"))
         cv.tag_bind(tag, "<Leave>", lambda e: cv.config(cursor=""))
 
     def _set_button(self, cv, x, y, w, h, text, cmd, kind="secondary"):
         """A rounded button drawn on the canvas, with a 120 ms hover fade."""
-        tag = f"btn{int(x)}_{int(y)}_{abs(hash(text))}"
+        tag = f"btn{self._set_gen}_{int(x)}_{int(y)}"
         def colours(hover):
             if kind == "primary":
                 return (M._blend(M.ACCENT, M.TEXT, 0.15) if hover else M.ACCENT), M.ACCENT_FG
@@ -409,6 +410,7 @@ class SettingsPage:
                 except tk.TclError:
                     pass
             self._animate(f"hover:{tag}", 120, apply)
+        self.__dict__.setdefault("_set_live_tags", []).append(tag)
         cv.tag_bind(tag, "<Enter>", lambda e: (cv.config(cursor="hand2"), fade(1.0)))
         cv.tag_bind(tag, "<Leave>", lambda e: (cv.config(cursor=""), fade(0.0)))
         cv.tag_bind(tag, "<Button-1>", lambda e: cmd())
@@ -479,6 +481,19 @@ class SettingsPage:
         top = cv.canvasy(0)
         cv.delete("all")
         cv.page_widgets = []
+        # Tag bindings outlive the items that carried them. Position-based
+        # tags from the last layout must not be reused by this one, or a
+        # plain row that lands where a switch row used to be inherits that
+        # switch's click (and silently flips a setting). A new generation
+        # per render keeps every tag unique; the old ones are unbound.
+        for t in getattr(self, "_set_live_tags", ()):
+            for seq in ("<Button-1>", "<Enter>", "<Leave>"):
+                try:
+                    cv.tag_unbind(t, seq)
+                except tk.TclError:
+                    pass
+        self._set_live_tags = []
+        self._set_gen = getattr(self, "_set_gen", 0) + 1
         S = self._ss
         x0, x1 = S(2), W - S(2)
         y = S(18)
@@ -556,7 +571,7 @@ class SettingsPage:
         ctl = row.get("ctl")
         cw, ch = ctl.size() if ctl else (0, 0)
         tw = max(S(80), (x1 - x0) - (cw + S(16) if ctl else 0))
-        tag = f"row{y}"
+        tag = f"row{self._set_gen}_{y}"
         t = cv.create_text(x0, y + vpad, anchor="nw", text=row["title"], fill=M.TEXT,
                            font=self._f(M.FS_BODY), width=tw, tags=(tag,))
         th = cv.bbox(t)[3] - (y + vpad)

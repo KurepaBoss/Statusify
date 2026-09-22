@@ -1,9 +1,9 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/KurepaBoss/Statusify/main/statusify_icon_preview.png" width="128" />
-  <h1>Statusify v2.0.0</h1>
+  <h1>Statusify v2.0.1</h1>
   <p><strong>The ultimate Discord Rich Presence & Spotify Lyrics bridge.</strong></p>
 
-  ![Statusify v2.0.0](https://img.shields.io/badge/Statusify-v2.0.0-brightgreen?style=for-the-badge)
+  ![Statusify v2.0.1](https://img.shields.io/badge/Statusify-v2.0.1-brightgreen?style=for-the-badge)
   ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge)
   ![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078d6?style=for-the-badge)
   ![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
@@ -19,6 +19,14 @@
 **Statusify** is a lightweight, high-performance bridge that connects your Spotify listening experience directly to Discord and your desktop. It offers a beautiful, High-DPI aware GUI to track your session history, view synced lyrics, and manage multiple Discord profiles with a single click.
 
 Lyrics come straight from Spicetify over a local WebSocket — no API keys, no polling a web service, no rate limits. The bridge extension pushes the current track and its exact playback position every 500 ms, and Statusify maps that position to the right lyric line before it reaches Discord.
+
+---
+
+## 🆕 What's New in v2.0.1
+
+**Settings could flip a setting you didn't touch.** In 2.0.0, when the Settings page re-laid itself out (for example as the listening stats finished loading), clicking an ordinary row could toggle a switch that had been in that spot before. Every click target is now unique to the current layout. If a setting changed without you asking in 2.0.0 (*Start minimised to the tray* is the likely one), set it back once and it will stay.
+
+Everything new in Statusify 2.0 is listed under v2.0.0 below.
 
 ---
 
