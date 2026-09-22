@@ -30,8 +30,11 @@ import sys
 # PyInstaller unpacks bundled data. Running from source the two are the same
 # folder, which is why one variable sufficed until now.
 _FROZEN  = bool(getattr(sys, "frozen", False))
-_APP_DIR = (os.path.dirname(os.path.abspath(sys.executable)) if _FROZEN
-            else os.path.dirname(os.path.abspath(__file__)))
+# STATUSIFY_DATA_DIR overrides it — the test suite points it at a temp folder
+# so a test run never writes into the real statusify.log / history / config.
+_APP_DIR = (os.environ.get("STATUSIFY_DATA_DIR")
+            or (os.path.dirname(os.path.abspath(sys.executable)) if _FROZEN
+                else os.path.dirname(os.path.abspath(__file__))))
 _RES_DIR = (getattr(sys, "_MEIPASS", _APP_DIR) if _FROZEN
             else os.path.dirname(os.path.abspath(__file__)))
 
