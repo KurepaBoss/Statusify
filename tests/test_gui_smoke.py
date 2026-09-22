@@ -116,3 +116,31 @@ def test_native_frame_and_theme_round_trip(app):
     app._set_theme("dark"); _pump(app, 5)
     st = main.ttk.Style(app._root)
     assert st.lookup(app.SCROLLBAR_STYLE, "troughcolor") == main.BG
+
+
+def test_album_tint_recolours_window_and_reverts(app, monkeypatch):
+    """A cover recolours every widget in place; no cover restores the theme."""
+    monkeypatch.setattr(main, "ALBUM_TINT", True)
+    app._build_deferred_pages()
+    neutral_bg = main.BG
+    app._apply_album_tint("#c83c28")
+    _pump(app, 3)
+    assert main.BG != neutral_bg
+    assert app.lbl_lyric.cget("bg") == main.BG            # widgets followed
+    assert app._pages["SETTINGS"].cget("bg") == main.BG
+    app._apply_album_tint(None)
+    _pump(app, 3)
+    assert main.BG == neutral_bg and app.lbl_lyric.cget("bg") == neutral_bg
+
+
+def test_sheet_shows_lines_around_the_playhead(app, monkeypatch):
+    st = main.state
+    monkeypatch.setattr(st, "lyrics_mode", "synced", raising=False)
+    monkeypatch.setattr(st, "synced", [{"startMs": 0, "words": "one"},
+                                       {"startMs": 5000, "words": "two"},
+                                       {"startMs": 9000, "words": "three"}], raising=False)
+    monkeypatch.setattr(app, "_estimate_pos_ms", lambda: 6000)
+    monkeypatch.setattr(main, "_track_offset_ms", lambda uri=None: 0)
+    app._update_sheet(force=True)
+    assert (app.lbl_prev.cget("text"), app.lbl_lyric.cget("text"),
+            app.lbl_next.cget("text")) == ("one", "two", "three")

@@ -13,210 +13,219 @@ M = None   # the main module
 
 class NowPlayingPage:
 
-    # ── NOW PLAYING ───────────────────────────────────────────────
+    # ── LYRICS (the lyric sheet) ──────────────────────────────────
+    # Layout, top to bottom:
+    #   [art] title / artist · source          [● On Discord]
+    #
+    #   previous line                        (muted)
+    #   CURRENT LINE, LARGE                  (display face)
+    #   next line                            (secondary)
+    #
+    #   ━━━━━━━━━━━━━━━░░░░░░░   1:38 / 6:26
+    #   Delay [− 0.0s +]              Mini   On top   Copy
+    #   ● Spicetify  ● Discord                     (errors)
+    # The window's colours come from the cover (_apply_album_tint), so the
+    # page itself stays typographic: no cards, no boxes, just the words.
+    SHEET_LYRIC_PT = 21      # current line, before the user's size boost
+    SHEET_SIDE_PT  = 11      # previous / next lines
+
+    def _display_family(self):
+        """Windows 11's display cut of Segoe when present, else Segoe UI."""
+        fam = getattr(self, "_disp_family", None)
+        if fam is None:
+            try:
+                have = set(tkfont.families(self._root))
+            except tk.TclError:
+                have = set()
+            fam = next((f for f in ("Segoe UI Variable Display", "Segoe UI Semibold")
+                        if f in have), "Segoe UI")
+            self._disp_family = fam
+        return fam
+
+    def _lyric_font(self):
+        size = max(12, self.SHEET_LYRIC_PT + M.LYRIC_FONT_BOOST)
+        key = ("lyric", size)
+        cache = self.__dict__.setdefault("_font_cache", {})
+        f = cache.get(key)
+        if f is None:
+            f = tkfont.Font(family=self._display_family(), size=size, weight="bold")
+            cache[key] = f
+        return f
+
     def _build_now_playing(self):
         p = tk.Frame(self._container, bg=M.BG); self._pages["NOW PLAYING"] = p
+        PAD = M.SP_XL
 
-        # ── Hero card: large album art + title/artist/info ───────────────
-        # Every pad on this page is one of SP_XS…SP_XL. It previously mixed
-        # 14/12/10/6/4/2 more or less at random, which is why nothing on the
-        # page shared a left edge or a rhythm.
-        card = tk.Frame(p, bg=M.BG2); card.pack(fill="x", padx=M.SP_LG, pady=(M.SP_MD, M.SP_XS))
-        self.canvas = tk.Canvas(card, width=M.HERO_ART_PX, height=M.HERO_ART_PX,
-                                bg=M.BG2, highlightthickness=0)
-        self.canvas.pack(side="left", padx=M.SP_LG, pady=M.SP_LG); self._default_art()
+        # ── Track row ─────────────────────────────────────────────
+        top = tk.Frame(p, bg=M.BG); top.pack(fill="x", padx=PAD, pady=(M.SP_LG, 0))
+        self.canvas = tk.Canvas(top, width=M.HERO_ART_PX, height=M.HERO_ART_PX,
+                                bg=M.BG, highlightthickness=0)
+        self.canvas.pack(side="left"); self._default_art()
 
-        inf = tk.Frame(card, bg=M.BG2)
-        inf.pack(side="left", fill="both", expand=True, padx=(0, M.SP_LG))
-        # Centre the text block against the 120 px artwork instead of pushing
-        # it down with a magic 18 px top pad — that only lined up at one font
-        # size and drifted the moment the title wrapped to two lines.
-        inf.pack_propagate(False)
-        spacer_top = tk.Frame(inf, bg=M.BG2); spacer_top.pack(fill="both", expand=True)
-        self.lbl_title  = tk.Label(inf, text="Waiting for Spotify...", fg=M.TEXT, bg=M.BG2,
-                                   font=self._f(M.FS_HERO, True), anchor="w",
-                                   wraplength=300, justify="left")
+        self._rpc_btn = tk.Label(top, text="", font=self._f(M.FS_SMALL, True),
+                                 cursor="hand2", padx=M.SP_MD, pady=M.SP_XS)
+        self._rpc_btn.pack(side="right")
+        self._rpc_btn.bind("<Button-1>", lambda e: self._toggle_rpc_btn())
+        self._paint_rpc_btn()
+
+        inf = tk.Frame(top, bg=M.BG); inf.pack(side="left", fill="x", expand=True, padx=(M.SP_MD, M.SP_MD))
+        self.lbl_title = tk.Label(inf, text="Waiting for Spotify…", fg=M.TEXT, bg=M.BG,
+                                  font=self._f(M.FS_LARGE + 1, True), anchor="w")
         self.lbl_title.pack(fill="x")
-        self.lbl_artist = tk.Label(inf, text="", fg=M.TEXT2, bg=M.BG2,
-                                   font=self._f(M.FS_LARGE), anchor="w")
-        self.lbl_artist.pack(fill="x", pady=(M.SP_XS // 2, 0))
-        self.lbl_info   = tk.Label(inf, text="", fg=M.MUTED, bg=M.BG2,
-                                   font=self._f(M.FS_SMALL), anchor="w")
-        self.lbl_info.pack(fill="x", pady=(M.SP_XS, 0))
-        tk.Frame(inf, bg=M.BG2).pack(fill="both", expand=True)
+        sub = tk.Frame(inf, bg=M.BG); sub.pack(fill="x")
+        self.lbl_artist = tk.Label(sub, text="", fg=M.TEXT2, bg=M.BG,
+                                   font=self._f(M.FS_BODY), anchor="w")
+        self.lbl_artist.pack(side="left")
+        self.lbl_info = tk.Label(sub, text="", fg=M.MUTED, bg=M.BG,
+                                 font=self._f(M.FS_SMALL), anchor="w")
+        self.lbl_info.pack(side="left", padx=(M.SP_SM, 0))
 
-        # ── Progress bar: track + fill, with elapsed / total times ───────
-        # Sits directly under the hero card and shares its horizontal inset,
-        # so the bar reads as belonging to the track above it.
-        prog_outer = tk.Frame(p, bg=M.BG)
-        prog_outer.pack(fill="x", padx=M.SP_LG, pady=(M.SP_SM, 0))
+        # ── Bottom block, packed before the sheet so the sheet takes
+        # whatever height is left ─────────────────────────────────
+        bottom = tk.Frame(p, bg=M.BG); bottom.pack(side="bottom", fill="x", padx=PAD, pady=(0, M.SP_XS))
+
+        prog_outer = tk.Frame(bottom, bg=M.BG); prog_outer.pack(fill="x")
         self._prog_cv = tk.Canvas(prog_outer, height=self.PROG_H, bg=M.BG,
                                   highlightthickness=0)
         self._prog_cv.pack(fill="x")
-        # NOTE: still no <Configure> binding here — see _redraw_progress.
         times = tk.Frame(prog_outer, bg=M.BG); times.pack(fill="x", pady=(M.SP_XS, 0))
         self._prog_elapsed = tk.Label(times, text="0:00", fg=M.MUTED, bg=M.BG,
                                       font=self._f(M.FS_MICRO), anchor="w")
         self._prog_elapsed.pack(side="left")
-        self._prog_total   = tk.Label(times, text="--:--", fg=M.MUTED, bg=M.BG,
-                                      font=self._f(M.FS_MICRO), anchor="e")
+        self._prog_total = tk.Label(times, text="--:--", fg=M.MUTED, bg=M.BG,
+                                    font=self._f(M.FS_MICRO), anchor="e")
         self._prog_total.pack(side="right")
-        # Draw the empty bar once; _tick_progress / _redraw_progress keep it current.
         self._redraw_progress()
 
-        lbox = tk.Frame(p, bg=M.BG3); lbox.pack(fill="x", padx=M.SP_LG, pady=(M.SP_SM, M.SP_XS))
-        tk.Label(lbox, text="Now on Discord", fg=M.MUTED, bg=M.BG3,
-                 font=self._f(M.FS_MICRO, True)).pack(anchor="w", padx=M.SP_LG,
-                                                    pady=(M.SP_MD, 0))
-        self.lbl_lyric = tk.Label(lbox, text="—", fg=M.MUTED, bg=M.BG3,
-                                  font=self._f(M.FS_TITLE + M.LYRIC_FONT_BOOST, True),
-                                  wraplength=430, justify="left", anchor="w",
-                                  pady=M.SP_SM + 2)
-        self.lbl_lyric.pack(anchor="w", fill="x", padx=M.SP_LG, pady=(0, M.SP_MD))
+        # Delay + quiet actions
+        ctl = tk.Frame(bottom, bg=M.BG); ctl.pack(fill="x", pady=(M.SP_MD, 0))
+        tk.Label(ctl, text="Delay", fg=M.MUTED, bg=M.BG,
+                 font=self._f(M.FS_SMALL)).pack(side="left", padx=(0, M.SP_SM))
+        chip = tk.Frame(ctl, bg=M.BG3); chip.pack(side="left")
 
-
-        # ── Lyric delay control ───────────────────────────────────────
-        delay_outer = tk.Frame(p, bg=M.BG2); delay_outer.pack(fill="x", padx=14, pady=(2,2))
-
-        # Header row: label + RESET
-        delay_header = tk.Frame(delay_outer, bg=M.BG2)
-        delay_header.pack(fill="x", padx=12, pady=(8,4))
-        tk.Label(delay_header, text="Lyric delay", fg=M.MUTED, bg=M.BG2,
-                 font=self._f(7,True)).pack(side="left")
-        rst = tk.Label(delay_header, text="Reset", fg=M.MUTED, bg=M.BG2,
-                       font=self._f(7), cursor="hand2")
-        rst.pack(side="right")
-        rst.bind("<Button-1>", lambda e: _reset_delay())
-        self._hoverable(rst, fg=lambda: M.MUTED, hover_fg=lambda: M.ACCENT)
-
-        # Control row: [hear first label] [−] [value] [+] [see first label]
-        delay_ctrl = tk.Frame(delay_outer, bg=M.BG2)
-        delay_ctrl.pack(fill="x", padx=12, pady=(0,8))
-
-        def _btn(parent, txt, cmd):
-            b = tk.Label(parent, text=txt, fg=M.TEXT2, bg=M.BG3,
-                         font=self._f(11,True), cursor="hand2",
-                         width=3, anchor="center", pady=1)
-            b.pack(side="left", padx=(0,2))
+        def _step(label, cmd):
+            b = tk.Label(chip, text=label, fg=M.TEXT2, bg=M.BG3, font=self._f(M.FS_LARGE, True),
+                         cursor="hand2", padx=M.SP_SM, pady=0)
+            b.pack(side="left")
             b.bind("<Button-1>", lambda e: cmd())
-            self._hoverable(b, fg=lambda: M.TEXT2, hover_fg=lambda: M.ACCENT, bg=lambda: M.BG3, hover_bg=lambda: M.ACCENT_SOFT)
+            self._hoverable(b, fg=lambda: M.TEXT2, hover_fg=lambda: M.ACCENT,
+                            bg=lambda: M.BG3, hover_bg=lambda: M.BG4)
             return b
 
         def _dec_delay():
-            M.LYRIC_DELAY_MS = max(-5000, M.LYRIC_DELAY_MS - 100)
-            self._update_delay_label()
+            M.LYRIC_DELAY_MS = max(-5000, M.LYRIC_DELAY_MS - 100); self._update_delay_label()
         def _inc_delay():
-            M.LYRIC_DELAY_MS = min(5000, M.LYRIC_DELAY_MS + 100)
-            self._update_delay_label()
-        def _reset_delay():
-            M.LYRIC_DELAY_MS = 0
-            self._update_delay_label()
+            M.LYRIC_DELAY_MS = min(5000, M.LYRIC_DELAY_MS + 100); self._update_delay_label()
+        def _reset_delay(_e=None):
+            M.LYRIC_DELAY_MS = 0; self._update_delay_label()
 
-        # Left side: hear first
-        hear_frame = tk.Frame(delay_ctrl, bg=M.BG2)
-        hear_frame.pack(side="left", fill="y")
-        tk.Label(hear_frame, text="◀ hear first", fg=M.MUTED, bg=M.BG2,
-                 font=self._f(7), anchor="e").pack(side="left", padx=(0,6))
-        _btn(delay_ctrl, "−", _dec_delay)
+        _step("−", _dec_delay)
+        s0 = M.LYRIC_DELAY_MS / 1000
+        self.lbl_delay = tk.Label(chip, text=f"{'+' if s0 > 0 else ''}{s0:.1f}s",
+                                  fg=M.ACCENT if M.LYRIC_DELAY_MS else M.TEXT, bg=M.BG3,
+                                  font=self._f(M.FS_SMALL, True), width=5, anchor="center",
+                                  cursor="hand2")
+        self.lbl_delay.pack(side="left")
+        # Double-click the value to reset — the old separate Reset link.
+        self.lbl_delay.bind("<Double-Button-1>", _reset_delay)
+        _step("+", _inc_delay)
 
-        # Center: value display — initialise from persisted value
-        _init_delay_s = M.LYRIC_DELAY_MS / 1000
-        _init_delay_sign = "+" if _init_delay_s > 0 else ""
-        _init_delay_text = f"{_init_delay_sign}{_init_delay_s:.1f}s"
-        _init_delay_fg   = M.ACCENT if M.LYRIC_DELAY_MS != 0 else M.TEXT
-        self.lbl_delay = tk.Label(delay_ctrl, text=_init_delay_text, fg=_init_delay_fg, bg=M.BG,
-                                  font=self._f(11,True), width=6, anchor="center",
-                                  relief="flat", padx=4)
-        self.lbl_delay.pack(side="left", padx=4)
-
-        # Right side: see first
-        _btn(delay_ctrl, "+", _inc_delay)
-        tk.Label(delay_ctrl, text="see first ▶", fg=M.MUTED, bg=M.BG2,
-                 font=self._f(7), anchor="w").pack(side="left", padx=(6,0))
-
-        # ── Quick actions ─────────────────────────────────────────
-        # Everything here was previously either hotkey-only or impossible.
-        acts = tk.Frame(p, bg=M.BG); acts.pack(fill="x", padx=M.SP_LG, pady=(M.SP_SM, M.SP_XS))
-
-        def _act(label, cmd, tip=None, accent=False):
-            b = tk.Label(acts, text=label,
-                         fg=M.ACCENT_FG if accent else M.TEXT2,
-                         bg=M.ACCENT if accent else M.BG3,
-                         font=self._f(M.FS_MICRO, True), cursor="hand2",
-                         padx=M.SP_MD, pady=M.SP_XS + 1)
-            b.pack(side="left", padx=(0, M.SP_SM))
+        def _quiet(label, cmd):
+            b = tk.Label(ctl, text=label, fg=M.MUTED, bg=M.BG, font=self._f(M.FS_SMALL, True),
+                         cursor="hand2", padx=M.SP_SM)
+            b.pack(side="right")
             b.bind("<Button-1>", lambda e: cmd())
-            if not accent:
-                # Tint the chip's surface as well as its label. Recolouring
-                # only the text left the button's own shape completely inert
-                # under the pointer.
-                self._hoverable(b, fg=lambda: M.TEXT2, hover_fg=lambda: M.ACCENT,
-                                bg=lambda: M.BG3, hover_bg=lambda: M.ACCENT_SOFT)
             return b
-
-        # RPC and ON TOP are *state* toggles, not plain buttons: their resting
-        # colours depend on whether the feature is on. The generic two-colour
-        # hover can't express that — on <Leave> it would repaint an enabled
-        # toggle in the disabled colour and silently lie about the state. Both
-        # therefore get a hover whose rest position is read from the live flag.
-        def _stateful_hover(btn, rest_fg, rest_bg, hov_fg, hov_bg):
-            key = f"hover:{btn}"
-            btn.bind("<Enter>", lambda e: self._fade_colors(
-                key, btn, 110, fg=hov_fg(), bg=hov_bg()))
-            btn.bind("<Leave>", lambda e: self._fade_colors(
-                key, btn, 110, fg=rest_fg(), bg=rest_bg()))
-
-        self._rpc_btn = _act("RPC on", self._toggle_rpc_btn, accent=True)
-        _stateful_hover(
-            self._rpc_btn,
-            rest_fg=lambda: M.ACCENT_FG if M._rpc_enabled else M.MUTED,
-            rest_bg=lambda: M.ACCENT if M._rpc_enabled else M.BG3,
-            # Lift the accent toward its own foreground when armed, so the
-            # primary action finally has some press-me feedback of its own.
-            hov_fg=lambda: M.ACCENT_FG if M._rpc_enabled else M.ACCENT,
-            hov_bg=lambda: (M._blend(M.ACCENT, M.ACCENT_FG, 0.18) if M._rpc_enabled
-                            else M.ACCENT_SOFT),
-        )
-        self._paint_rpc_btn()
-        _act("Mini", self._toggle_mini)
-        self._top_btn = _act("On top", self._toggle_topmost)
-        _stateful_hover(
-            self._top_btn,
-            rest_fg=lambda: M.ACCENT if M.ALWAYS_ON_TOP else M.MUTED,
-            rest_bg=lambda: M.BG3,
-            hov_fg=lambda: M.ACCENT,
-            hov_bg=lambda: M.ACCENT_SOFT,
-        )
+        cp = _quiet("Copy", self._copy_current_lyric)
+        self._hoverable(cp, fg=lambda: M.MUTED, hover_fg=lambda: M.TEXT)
+        self._top_btn = _quiet("On top", self._toggle_topmost)
+        self._top_btn.bind("<Enter>", lambda e: self._top_btn.config(fg=M.TEXT))
+        self._top_btn.bind("<Leave>", lambda e: self._paint_topmost_btn())
         self._paint_topmost_btn()
-        _act("Copy", self._copy_current_lyric)
+        mn = _quiet("Mini", self._toggle_mini)
+        self._hoverable(mn, fg=lambda: M.MUTED, hover_fg=lambda: M.TEXT)
 
-        sb = tk.Frame(p, bg=M.BG); sb.pack(fill="x", padx=M.SP_LG, pady=(M.SP_SM, M.SP_XS))
+        # Connection status + reasons
+        sb = tk.Frame(bottom, bg=M.BG); sb.pack(fill="x", pady=(M.SP_MD, 0))
         self.dot_sp = tk.Label(sb, text="●", fg=M.MUTED, bg=M.BG, font=self._f(M.FS_MICRO)); self.dot_sp.pack(side="left")
-        tk.Label(sb, text=" Spicetify", fg=M.MUTED, bg=M.BG, font=self._f(M.FS_SMALL)).pack(side="left")
-        tk.Label(sb, text="   ", bg=M.BG).pack(side="left")
-        self.dot_dc = tk.Label(sb, text="●", fg=M.MUTED, bg=M.BG, font=self._f(M.FS_MICRO)); self.dot_dc.pack(side="left")
-        tk.Label(sb, text=" Discord RPC", fg=M.MUTED, bg=M.BG, font=self._f(M.FS_SMALL)).pack(side="left")
+        tk.Label(sb, text=" Spotify", fg=M.MUTED, bg=M.BG, font=self._f(M.FS_SMALL)).pack(side="left")
+        self.dot_dc = tk.Label(sb, text="●", fg=M.MUTED, bg=M.BG, font=self._f(M.FS_MICRO)); self.dot_dc.pack(side="left", padx=(M.SP_MD, 0))
+        tk.Label(sb, text=" Discord", fg=M.MUTED, bg=M.BG, font=self._f(M.FS_SMALL)).pack(side="left")
         self.lbl_rl = tk.Label(sb, text="", fg=M.MUTED, bg=M.BG, font=self._f(M.FS_SMALL)); self.lbl_rl.pack(side="right")
+        self.lbl_dropped = tk.Label(sb, text="", fg=M.MUTED, bg=M.BG, font=self._f(M.FS_SMALL))
+        self.lbl_dropped.pack(side="right", padx=(0, M.SP_SM))
+        self.lbl_err = tk.Label(bottom, text="", fg=M.DANGER, bg=M.BG, font=self._f(M.FS_SMALL),
+                                anchor="w", wraplength=440, justify="left")
+        self.lbl_err.pack(fill="x")
 
-        # Second status row (#14, #15). The two dots above are binary: when
-        # RPC drops you get a grey dot and have to open the log to find out
-        # why. These two labels put the reason and the per-song dropped-line
-        # count where you can actually see them.
-        sb2 = tk.Frame(p, bg=M.BG); sb2.pack(fill="x", padx=14, pady=(0,4))
-        self.lbl_err = tk.Label(sb2, text="", fg=M.DANGER, bg=M.BG, font=self._f(7),
-                                anchor="w", wraplength=330, justify="left")
-        self.lbl_err.pack(side="left", fill="x", expand=True)
-        self.lbl_dropped = tk.Label(sb2, text="", fg=M.MUTED, bg=M.BG, font=self._f(7))
-        self.lbl_dropped.pack(side="right")
+        # ── The sheet ─────────────────────────────────────────────
+        sheet = tk.Frame(p, bg=M.BG); sheet.pack(fill="both", expand=True, padx=PAD)
+        # Grid, not pack, so the block can sit a little ABOVE centre (2:3
+        # spacer weights) — optically centred text reads as sagging.
+        sheet.grid_columnconfigure(0, weight=1)
+        sheet.grid_rowconfigure(0, weight=2)
+        sheet.grid_rowconfigure(4, weight=3)
+        tk.Frame(sheet, bg=M.BG).grid(row=0, column=0, sticky="nsew")
+        self.lbl_prev = tk.Label(sheet, text="", fg=M.MUTED, bg=M.BG,
+                                 font=self._f(self.SHEET_SIDE_PT), anchor="w",
+                                 justify="left", wraplength=440)
+        self.lbl_prev.grid(row=1, column=0, sticky="ew")
+        self.lbl_lyric = tk.Label(sheet, text="—", fg=M.MUTED, bg=M.BG,
+                                  font=self._lyric_font(), anchor="w",
+                                  justify="left", wraplength=440)
+        self.lbl_lyric.grid(row=2, column=0, sticky="ew", pady=M.SP_MD)
+        self.lbl_next = tk.Label(sheet, text="", fg=M.TEXT2, bg=M.BG,
+                                 font=self._f(self.SHEET_SIDE_PT), anchor="w",
+                                 justify="left", wraplength=440)
+        self.lbl_next.grid(row=3, column=0, sticky="ew")
+        tk.Frame(sheet, bg=M.BG).grid(row=4, column=0, sticky="nsew")
 
-        tk.Frame(p, bg=M.BORDER, height=1).pack(fill="x", padx=14, pady=(2,6))
-        tk.Label(p, text="Log", fg=M.MUTED, bg=M.BG, font=self._f(7,True)).pack(anchor="w", padx=14)
-        lf = tk.Frame(p, bg=M.BG2); lf.pack(fill="both", expand=True, padx=14, pady=(3,14))
-        self.log_txt = tk.Text(lf, bg=M.BG2, fg=M.TEXT2, font=tkfont.Font(family="Consolas", size=8),
-                               relief="flat", state="disabled", wrap="word", padx=8, pady=6)
-        self.log_txt.pack(fill="both", expand=True)
-        for tag, col in [("g",M.ACCENT),("m",M.MUTED),("y",M.WARN),("ts",M.BORDER)]:
-            self.log_txt.tag_config(tag, foreground=col)
+        def _rewrap(e):
+            w = max(200, e.width - 4)
+            if abs(w - getattr(self, "_sheet_wrap", 0)) > 6:
+                self._sheet_wrap = w
+                for lbl in (self.lbl_prev, self.lbl_lyric, self.lbl_next, self.lbl_err):
+                    lbl.config(wraplength=w)
+        sheet.bind("<Configure>", _rewrap)
+        self._sheet_idx = None
+
+    def _update_sheet(self, force=False):
+        """Show the previous / current / next synced lines around the playhead.
+
+        Driven from the progress tick and only touches the labels when the
+        line index changes. Plain-text and lyric-less tracks fall back to the
+        text the RPC loop publishes (the "line" event)."""
+        st = M.state
+        if st.lyrics_mode != "synced" or not st.synced:
+            if self._sheet_idx is not None:
+                self._sheet_idx = None
+                self.lbl_prev.config(text=""); self.lbl_next.config(text="")
+            return
+        pos = self._estimate_pos_ms() + M._track_offset_ms()
+        idx = -1
+        for i, e in enumerate(st.synced):
+            if e["startMs"] <= pos:
+                idx = i
+            else:
+                break
+        lines = st.synced
+        cur = lines[idx]["words"] if idx >= 0 else ""
+        # Paused, or before the first line / in an instrumental gap: dim.
+        fg = M.TEXT if (cur and st.is_playing) else M.MUTED
+        key = (idx, fg)
+        if key == self._sheet_idx and not force:
+            return
+        self._sheet_idx = key
+        prev = lines[idx - 1]["words"] if idx >= 1 else ""
+        nxt = lines[idx + 1]["words"] if idx + 1 < len(lines) else ""
+        if not cur:
+            cur = "♪"
+        try:
+            self.lbl_prev.config(text=prev)
+            self.lbl_lyric.config(text=cur, fg=fg)
+            self.lbl_next.config(text=nxt)
+        except tk.TclError:
+            pass
 
     def _update_delay_label(self):
         s = M.LYRIC_DELAY_MS / 1000
@@ -230,22 +239,36 @@ class NowPlayingPage:
         # cache that value, so changing the global has to drop the cache.
         M._invalidate_offset_cache()
         self._refresh_track_offset()
+        self._update_sheet(force=True)
         M.log(f"Lyric delay set to {sign}{s:.1f}s")
 
-
     def _default_art(self):
-        """Placeholder shown until artwork arrives (or when there is none).
-
-        Matches the rounded corner of the real artwork so the swap-in doesn't
-        change the silhouette."""
+        """Placeholder shown until artwork arrives (or when there is none)."""
+        self._hero_src = None
+        self._img = None
         self.canvas.delete("all")
+        self.canvas.config(bg=M.BG)
         self._rounded_rect(self.canvas, 0, 0, M.HERO_ART_PX - 1, M.HERO_ART_PX - 1,
-                           M.HERO_ART_RADIUS, fill=M.BG3, outline=M.BORDER)
+                           M.HERO_ART_RADIUS, fill=M.BG3, outline="")
         self.canvas.create_text(M.HERO_ART_PX // 2, M.HERO_ART_PX // 2,
-                                text="♫", fill=M.MUTED, font=self._f(20))
+                                text="♫", fill=M.MUTED, font=self._f(14))
+
+    def _show_hero_image(self, img):
+        """Round `img` onto the current page colour and show it. Cheap at this
+        size (64 px), so it runs on the Tk thread — which also guarantees the
+        corners match the palette that is on screen right now."""
+        try:
+            rounded = M._round_image(img, M.HERO_ART_RADIUS, M.BG)
+            self._img = M.ImageTk.PhotoImage(rounded)
+            self._hero_src = img
+            self.canvas.config(bg=M.BG)
+            self.canvas.delete("all")
+            self.canvas.create_image(0, 0, anchor="nw", image=self._img)
+        except Exception:
+            self._default_art()
 
     # ── Progress bar ──────────────────────────────────────────────
-    PROG_H = 6          # bar thickness in px; radius is half of this
+    PROG_H = 4          # bar thickness in px; radius is half of this
 
     def _prog_items(self):
         """Create (once) and return the bar's persistent canvas items.
@@ -411,6 +434,7 @@ class NowPlayingPage:
                 visible = (self._cur_page == "NOW PLAYING") and not self._hidden
                 if visible:
                     self._redraw_progress()
+                    self._update_sheet()
                     interval = 33 if (playing and M.ANIMATIONS_ENABLED) else 250
                 else:
                     interval = 500
@@ -437,22 +461,28 @@ class NowPlayingPage:
         _tick()
 
     def _set_art(self, url):
-        if not M.PIL_AVAILABLE or not url: self._default_art(); return
-        # Fetch on a worker thread — urllib.urlopen blocks for up to `timeout`
-        # seconds and must NEVER run on the Tk main loop (it freezes the UI).
-        # Round on the worker thread too — the 4× mask is the most expensive
-        # part of this path and has no business running on the Tk loop.
-        surface = M.BG2
+        """Load the cover, recolour the window from it, then show it.
+
+        The fetch and the tint extraction run on a worker thread. Back on the
+        Tk thread the palette is applied FIRST and the art rounded after, so
+        its corners are composited onto the colour actually behind them."""
+        self._art_token = url
+        if not M.PIL_AVAILABLE or not url:
+            self._default_art(); self._apply_album_tint(None); return
+
         def _fetch():
-            return M._round_image(M._fetch_art(url, M.HERO_ART_PX), M.HERO_ART_RADIUS, surface)
-        def _apply(result):
-            if result is None:
-                self._default_art(); return
-            try:
-                self._img = M.ImageTk.PhotoImage(result)
-                self.canvas.delete("all"); self.canvas.create_image(0,0, anchor="nw", image=self._img)
-            except Exception:
-                self._default_art()
+            img = M._fetch_art(url, M.HERO_ART_PX)
+            return img, M._dominant_tint(img)
+
+        def _apply(res):
+            if getattr(self, "_art_token", None) != url:
+                return      # skipped on since; a newer cover owns the window
+            img, tint = res if res else (None, None)
+            if img is None:
+                self._default_art(); self._apply_album_tint(None); return
+            self._apply_album_tint(tint)
+            self._show_hero_image(img)
+
         fut = M.image_executor.submit(_fetch)
         def _done(f):
             try: res = f.result()

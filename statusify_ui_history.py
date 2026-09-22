@@ -267,6 +267,7 @@ class HistoryPage:
                            fill=M.BG3, outline="")
         c.create_text(M.THUMB_PX // 2, M.THUMB_PX // 2, text="♫", fill=M.MUTED,
                       font=self._f(11))
+        row._statusify_thumb = c   # so a recolour can re-round it (_retint_artwork)
         if M.PIL_AVAILABLE and e.get("album_art"):
             self.win.after(80, lambda cv=c, u=e["album_art"]: self._load_thumb(cv, u))
 

@@ -144,3 +144,15 @@ def _fetch_art(url, size):
                 _ART_CACHE.pop(k, None)
         _ART_CACHE[key] = img
     return img
+
+
+def dominant_tint(img):
+    """Cover tint for the lyric-sheet theme (statusify_colors.tint_from_pixels)."""
+    if img is None or not PIL_AVAILABLE:
+        return None
+    try:
+        from statusify_colors import tint_from_pixels
+        small = img.convert("RGB").resize((24, 24), Image.BILINEAR)
+        return tint_from_pixels(small.getdata())
+    except Exception:
+        return None

@@ -234,7 +234,7 @@ class SettingsPage:
             # Debounced: A+/A− can be tapped rapidly; coalesce the disk writes.
             M._cfg_set_soon("preferences", "lyric_font_boost", str(M.LYRIC_FONT_BOOST))
             try:
-                self.lbl_lyric.config(font=self._f(M.FS_TITLE + M.LYRIC_FONT_BOOST, True))
+                self.lbl_lyric.config(font=self._lyric_font())
             except (AttributeError, tk.TclError):
                 pass
             _paint_lf()
@@ -329,6 +329,29 @@ class SettingsPage:
         self._accent_swatch.bind("<Button-1>", self._pick_accent)
         self._accent_swatch.bind("<Enter>", lambda e: self._accent_swatch.config(relief="solid"))
         self._accent_swatch.bind("<Leave>", lambda e: self._accent_swatch.config(relief="groove"))
+
+        # Album tint: the lyric sheet takes its colours from the cover.
+        row_at = tk.Frame(inner_a, bg=M.BG2); row_at.pack(fill="x", pady=(M.SP_SM, 0))
+        self._tint_btn = tk.Label(row_at, text="", fg=M.MUTED, bg=M.BG3,
+                                  font=self._f(M.FS_MICRO, True), cursor="hand2",
+                                  padx=M.SP_MD, pady=M.SP_XS)
+        self._tint_btn.pack(side="right")
+        tk.Label(row_at, text="Colour the window from the album art", fg=M.TEXT2, bg=M.BG2,
+                 font=self._f(M.FS_BODY), anchor="w").pack(side="left", fill="x", expand=True)
+
+        def _paint_tint():
+            on = M.ALBUM_TINT
+            self._tint_btn.config(text="On" if on else "Off",
+                                  bg=M.ACCENT if on else M.BG3,
+                                  fg=M.ACCENT_FG if on else M.MUTED)
+        def _toggle_tint(_e=None):
+            M.ALBUM_TINT = not M.ALBUM_TINT
+            M._cfg_set("preferences", "album_tint", str(M.ALBUM_TINT).lower())
+            self._repaint_everything()
+            _paint_tint()
+        self._tint_btn.bind("<Button-1>", _toggle_tint)
+        self._paint_album_tint_btn = _paint_tint
+        _paint_tint()
 
         # Motion toggle. Animation is an accessibility question before it is a
         # taste one, and it doubles as the escape hatch on hardware where the
@@ -698,11 +721,23 @@ class SettingsPage:
                 self._set_error(f"Could not create shortcut: {e}")
 
         row_sc = tk.Frame(inner_sy, bg=M.BG2); row_sc.pack(fill="x", pady=(6,0))
-        tk.Label(row_sc, text="Desktop Access", fg=M.TEXT2, bg=M.BG2, font=self._f(9), anchor="w").pack(side="left")
+        tk.Label(row_sc, text="Desktop shortcut", fg=M.TEXT2, bg=M.BG2, font=self._f(9), anchor="w").pack(side="left")
         btn_sc = tk.Label(row_sc, text="Create shortcut", fg=M.ACCENT_FG, bg=M.ACCENT, 
                           font=self._f(7,True), cursor="hand2", padx=10, pady=4)
         btn_sc.pack(side="right")
         btn_sc.bind("<Button-1>", lambda e: _do_shortcut())
+
+        # ── Section: Log ──────────────────────────────────────────
+        # Moved off the lyric sheet: diagnostics are for when something is
+        # wrong, not something to watch while listening.
+        log_card = self._collapsible(outer, "Log", "log")
+        lf = tk.Frame(log_card, bg=M.BG2); lf.pack(fill="x", padx=14, pady=10)
+        self.log_txt = tk.Text(lf, bg=M.BG2, fg=M.TEXT2, height=12,
+                               font=M.tkfont.Font(family="Consolas", size=8),
+                               relief="flat", state="disabled", wrap="word", padx=8, pady=6)
+        self.log_txt.pack(fill="x")
+        for tag, col in [("g", M.ACCENT), ("m", M.MUTED), ("y", M.WARN), ("ts", M.MUTED)]:
+            self.log_txt.tag_config(tag, foreground=col)
 
         # Wheel scrolling is handled by a single page-level binding set up at
         # the top of this method — no per-widget binding needed.
@@ -772,17 +807,41 @@ class SettingsPage:
 
     def _set_theme(self, key):
         """Set dark or light theme from the pill-button key."""
-        dark = (key == "dark")
-        M._apply_palette(dark, M.ACCENT)
-        M._cfg_set("preferences", "dark_mode", str(dark).lower())
+        M._DARK_MODE = (key == "dark")
+        M._cfg_set("preferences", "dark_mode", str(M._DARK_MODE).lower())
+        self._repaint_everything()
+        self._highlight_theme_btn()
+
+    def _repaint_everything(self):
+        """Rebuild the palette (theme + accent + album tint) and push it onto
+        every widget, the title bar, the scrollbars and the artwork."""
+        M._repalette()
         self._apply_titlebar_theme()
         self._style_scrollbars()
         self._rebuild_all()
-        # Re-highlight the active theme pill + active tab
-        self._highlight_theme_btn()
-        if self._cur_page:
-            for n, b in self._tab_btns.items():
-                b.config(fg=M.ACCENT if n == self._cur_page else M.MUTED)
+        self._paint_nav()
+        self._retint_artwork()
+
+    def _apply_album_tint(self, tint):
+        """Recolour the window for a new cover. No-op when the tint (or the
+        feature being off) means nothing on screen would change."""
+        if tint == M._CUR_TINT:
+            return
+        M._CUR_TINT = tint
+        if M.ALBUM_TINT:
+            self._repaint_everything()
+
+    def _retint_artwork(self):
+        """Re-round artwork onto the new surface colour. Rounded corners are
+        composited onto the colour behind them (Tk can't alpha-blend onto a
+        canvas), so after a recolour the old corners would show as squares."""
+        src = getattr(self, "_hero_src", None)
+        if src is not None:
+            self._show_hero_image(src)
+        for row, e in list(getattr(self, "_hist_rows", [])):
+            cv = getattr(row, "_statusify_thumb", None)
+            if cv is not None and e.get("album_art"):
+                self._load_thumb(cv, e["album_art"])
 
     def _highlight_theme_btn(self):
         """Update the Dark/Light pill visuals to reflect the current theme."""
@@ -797,12 +856,9 @@ class SettingsPage:
     def _pick_accent(self, _event=None):
         color = tkcolor.askcolor(color=M.ACCENT, title="Choose accent color")[1]
         if color:
-            M._apply_palette(M._DARK_MODE, color)
+            M.USER_ACCENT = color
             M._cfg_set("preferences", "accent_color", color)
-            self._rebuild_all()
-            if self._cur_page:
-                for n, b in self._tab_btns.items():
-                    b.config(fg=M.ACCENT if n == self._cur_page else M.MUTED)
+            self._repaint_everything()
 
     def _rebuild_all(self):
         """Recolour every widget in-place without destroying state."""
@@ -868,7 +924,10 @@ class SettingsPage:
         _recolour(self.win)
 
         # Accent-coloured widgets need explicit update
-        self._tab_line.config(bg=M.ACCENT)
+        self._paint_nav()
+        for fn in ("_paint_album_tint_btn",):
+            try: getattr(self, fn)()
+            except (AttributeError, tk.TclError): pass
         try: self._accent_swatch.config(bg=M.ACCENT)
         except (AttributeError, tk.TclError): pass
 
@@ -876,7 +935,7 @@ class SettingsPage:
         try:
             self.log_txt.tag_config("g",  foreground=M.ACCENT)
             self.log_txt.tag_config("m",  foreground=M.MUTED)
-            self.log_txt.tag_config("ts", foreground=M.BORDER)
+            self.log_txt.tag_config("ts", foreground=M.MUTED)
         except (AttributeError, tk.TclError): pass
 
         # The lyric label fg might be ACCENT (active lyric) or MUTED — don't touch it.

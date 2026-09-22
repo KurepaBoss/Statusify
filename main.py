@@ -172,7 +172,14 @@ def _write_icon():
     data = base64.b64decode(_ICON_B64)
     tf   = tempfile.NamedTemporaryFile(suffix=".ico", delete=False)
     tf.write(data); tf.close()
-    _atexit.register(lambda p=tf.name: __import__("os").unlink(p) if __import__("os").path.exists(p) else None)
+    def _cleanup(p=tf.name):
+        # Windows refuses the delete while Tk still has the icon open, which
+        # is normal at exit; the temp folder cleans it up later.
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    _atexit.register(_cleanup)
     return tf.name
 
 _ICON_PATH = None  # set on first use
@@ -536,7 +543,7 @@ MAX_RENDERED_ROWS = 60
 
 import statusify_art as _art_mod
 _art_mod.init(os.path.join(_APP_DIR, ".artcache"), log)
-from statusify_art import _prune_art_cache, _round_image, _fetch_art
+from statusify_art import _prune_art_cache, _round_image, _fetch_art, dominant_tint as _dominant_tint
 
 # ── Per-track lyric offset (#13) ──────────────────────────────────
 # LYRIC_DELAY_MS is a single global, but sync drift is a property of the
@@ -1561,9 +1568,10 @@ async def rpc_loop(rpc):
         log(f"RPC ({len(group)}L)  ·  {display[:55]}"); event_queue.put(("line", display))
 
 from statusify_colors import _hex_to_rgb, _blend, _readable_on
+from statusify_colors import tinted_palette as _tinted_palette
 
 # ── GUI colors ────────────────────────────────────────────────────
-def _apply_palette(dark: bool, accent: str):
+def _apply_palette(dark: bool, accent: str, tint=None):
     global BG, BG2, BG3, BG4, ACCENT, MUTED, TEXT, TEXT2, BORDER, _DARK_MODE
     global ACCENT_SOFT, ACCENT_FG, HOVER_BG, SHADOW, DANGER, WARN
     global _PREV_BG, _PREV_BG2, _PREV_BG3, _PREV_BG4
@@ -1630,20 +1638,36 @@ def _apply_palette(dark: bool, accent: str):
     # Accent-derived tokens. Hover backgrounds used to be the literal
     # "#1a2a1a" — a green tint baked in regardless of the chosen accent, and
     # near-black in light mode.
+    if tint:
+        # Lyric-sheet mode: surfaces, text and accent all come from the album
+        # cover's hue at fixed lightness (statusify_colors.tinted_palette).
+        _t = _tinted_palette(tint, dark)
+        BG, BG2, BG3, BG4 = _t["BG"], _t["BG2"], _t["BG3"], _t["BG4"]
+        MUTED, TEXT, TEXT2 = _t["MUTED"], _t["TEXT"], _t["TEXT2"]
+        BORDER, SHADOW, ACCENT = _t["BORDER"], _t["SHADOW"], _t["ACCENT"]
     ACCENT_SOFT = _blend(BG3, ACCENT, 0.22 if dark else 0.16)
     ACCENT_FG   = _readable_on(ACCENT)
     HOVER_BG    = _blend(BG2, TEXT, 0.06 if dark else 0.05)
+
+# USER_ACCENT is the colour picked in Settings; ACCENT is what is on screen,
+# which in album-tint mode comes from the cover instead.
+USER_ACCENT  = ACCENT
+ALBUM_TINT   = (_cfg_get("preferences", "album_tint", "true").lower() == "true")
+_CUR_TINT    = None    # tint of the current cover, or None
+
+def _repalette():
+    """Rebuild the palette from theme + accent + (if enabled) album tint."""
+    _apply_palette(_DARK_MODE, USER_ACCENT, _CUR_TINT if ALBUM_TINT else None)
 
 _apply_palette(_DARK_MODE, ACCENT)
 # After _apply_palette the names BG, BG2 … ACCENT … are module-level strings.
 
 # Hero album-art size — single source of truth shared by the Now-Playing
 # canvas, the placeholder art (_default_art) and the live art loader (_set_art).
-HERO_ART_PX = 120
-TAB_ANIM_MS = 120   # tab label fade + underline slide
+HERO_ART_PX = 64
 # Corner radii. Album art was the one large square in a UI made entirely of
 # squares, so it read as an unstyled <img> dropped into the layout.
-HERO_ART_RADIUS = 10
+HERO_ART_RADIUS = 8
 THUMB_PX, THUMB_RADIUS = 44, 6
 
 # ── UI scale ──────────────────────────────────────────────────────
@@ -2074,9 +2098,9 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
         if btn is None:
             return
         try:
-            btn.config(text="RPC on" if _rpc_enabled else "RPC off",
-                       bg=ACCENT if _rpc_enabled else BG3,
-                       fg=ACCENT_FG if _rpc_enabled else MUTED)
+            btn.config(text="●  On Discord" if _rpc_enabled else "○  Not sharing",
+                       bg=ACCENT_SOFT if _rpc_enabled else BG3,
+                       fg=ACCENT if _rpc_enabled else MUTED)
         except tk.TclError:
             pass
 
@@ -2438,30 +2462,26 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
 
     def _build(self):
         W = self.win
-        # ── Tab bar ───────────────────────────────────────────────
-        tabs = tk.Frame(W, bg=BG2, height=36); tabs.pack(fill="x"); tabs.pack_propagate(False)
+        # ── Page switcher ─────────────────────────────────────────
+        # A segmented control pinned to the bottom, like a media app, so the
+        # lyric sheet gets the whole top of the window. Packed before the page
+        # container so it keeps its height when the window shrinks.
+        nav_row = tk.Frame(W, bg=BG); nav_row.pack(side="bottom", fill="x", pady=(SP_XS, SP_MD))
+        nav = tk.Frame(nav_row, bg=BG2, padx=3, pady=3); nav.pack()
+        self._nav = nav
         self._tab_btns = {}
-        for name in ("NOW PLAYING", "HISTORY", "SETTINGS"):
-            b = tk.Label(tabs, text=name.capitalize(), fg=MUTED, bg=BG2,
+        for name, label in (("NOW PLAYING", "Lyrics"), ("HISTORY", "History"),
+                            ("SETTINGS", "Settings")):
+            b = tk.Label(nav, text=label, fg=MUTED, bg=BG2,
                          font=self._f(FS_SMALL, True), cursor="hand2",
-                         padx=SP_LG, pady=SP_SM + 2)
-            b.pack(side="left")
+                         padx=SP_LG, pady=SP_XS + 1)
+            b.pack(side="left", padx=1)
             b.bind("<Button-1>", lambda e, n=name: self._show(n))
-            # Inactive tabs had no hover feedback at all, so there was nothing
-            # to tell you they were clickable.
-            # Only the inactive tabs respond — the active one already owns
-            # ACCENT and must not be dragged off it by a stray hover.
             b.bind("<Enter>", lambda e, w=b, n=name:
-                   None if self._cur_page == n
-                   else self._fade_colors(f"tabfg:{n}", w, 110, fg=TEXT2))
+                   None if self._cur_page == n else w.config(fg=TEXT2))
             b.bind("<Leave>", lambda e, w=b, n=name:
-                   None if self._cur_page == n
-                   else self._fade_colors(f"tabfg:{n}", w, 110, fg=MUTED))
+                   None if self._cur_page == n else w.config(fg=MUTED))
             self._tab_btns[name] = b
-
-        # Thin accent line under active tab
-        self._tab_line = tk.Frame(W, bg=ACCENT, height=2)
-        self._tab_line.place(x=0, y=78, width=112)  # approx width of "NOW PLAYING"
 
         # ── Page container ────────────────────────────────────────
         self._container = tk.Frame(W, bg=BG); self._container.pack(fill="both", expand=True)
@@ -2509,64 +2529,27 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
         if name == "SETTINGS" and hasattr(self, "set_cv"):
             pos = getattr(self, "_set_scroll_pos", 0.0)
             self._root.after_idle(lambda: self._safe_yview(self.set_cv, pos))
-        # Cross-fade the labels over the same time the underline takes to
-        # travel, so the colour change reads as one movement with the slide
-        # rather than as a separate flash. Kept short: a tab switch should
-        # feel instant, and 220 ms read as lag.
-        for n, b in self._tab_btns.items():
-            self._fade_colors(f"tabfg:{n}", b, TAB_ANIM_MS, fg=ACCENT if n == name else MUTED)
-        self._move_tab_line()
+        self._paint_nav()
+
+    def _paint_nav(self):
+        """Raise the selected segment of the page switcher; mute the rest.
+        Instant on purpose — a switcher that animates reads as lag."""
+        nav = getattr(self, "_nav", None)
+        if nav is None:
+            return
+        try:
+            nav.config(bg=BG2)
+            for n, b in self._tab_btns.items():
+                sel = (n == self._cur_page)
+                b.config(bg=BG4 if sel else BG2, fg=TEXT if sel else MUTED)
+        except tk.TclError:
+            pass
 
     @staticmethod
     def _safe_yview(canvas, fraction):
         """Scroll a canvas to a fraction, swallowing teardown races."""
         try:
             canvas.yview_moveto(max(0.0, min(1.0, fraction)))
-        except tk.TclError:
-            pass
-
-    def _move_tab_line(self, animate=True):
-        """Slide the accent underline to the active tab.
-
-        Position is measured from the real widgets, never hardcoded. An
-        earlier version used a fixed lookup — x/width of 0/120, 120/88,
-        208/90 — taken once at 96 DPI. _f() enforces a 10 pt font floor and
-        __init__ multiplies Tk's scaling by dpi/72, so on any HiDPI display
-        the tabs grew while the underline did not move: it marked the wrong
-        tab entirely.
-
-        The move itself is tweened. Snapping the underline between tabs gave
-        no sense of direction — the eye had to re-find it after every click,
-        because nothing connected where it was to where it went."""
-        btn = self._tab_btns.get(self._cur_page)
-        if btn is None:
-            return
-        try:
-            bar = btn.master
-            target_w = btn.winfo_width()
-            if target_w <= 1:
-                # Not laid out yet (first call happens during _build) — the
-                # named slot means repeated retries can't stack up.
-                self._schedule("tabline", 30, self._move_tab_line)
-                return
-            target_x = btn.winfo_x() + bar.winfo_x()
-            y = bar.winfo_y() + bar.winfo_height() - 2
-
-            cur_x = self._tab_line.winfo_x()
-            cur_w = self._tab_line.winfo_width()
-            # First placement, or the underline is somewhere nonsensical:
-            # put it straight down rather than sliding in from the corner.
-            if not animate or cur_w <= 1 or not self._tab_line.winfo_ismapped():
-                self._tab_line.place(x=target_x, y=y, width=target_w)
-            else:
-                def _apply(t):
-                    self._tab_line.place(
-                        x=int(round(cur_x + (target_x - cur_x) * t)),
-                        y=y,
-                        width=int(round(cur_w + (target_w - cur_w) * t)),
-                    )
-                self._animate("tabline", TAB_ANIM_MS, _apply)
-            self._tab_line.lift()
         except tk.TclError:
             pass
 
@@ -2616,6 +2599,11 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
         reflow per poll."""
         buf = getattr(self, "_log_buf", None)
         if not buf:
+            return
+        if not hasattr(self, "log_txt"):
+            # The log view lives on the Settings page, built just after the
+            # first paint. Keep the newest lines until it exists.
+            del buf[:-300]
             return
         self._log_buf = []
         # Build the whole block once, insert once, scroll once.
@@ -2707,6 +2695,8 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
                     _, ar, ti, art = ev
                     self.lbl_title.config(text=ti); self.lbl_artist.config(text=ar)
                     self.lbl_lyric.config(text="—", fg=MUTED); self.lbl_info.config(text="")
+                    self.lbl_prev.config(text=""); self.lbl_next.config(text="")
+                    self._sheet_idx = None
                     # Named slot: rapid skipping coalesces to the latest track
                     # instead of firing one art fetch per skipped song.
                     self._schedule("setart", 30, lambda u=art: self._set_art(u))
@@ -2715,13 +2705,21 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
                     _, src, mode, n = ev
                     lbl = src if mode in ("synced","plain") else "No lyrics"
                     if mode == "plain": lbl += " (plain)"
-                    self.lbl_info.config(text=f"{lbl}  ·  {n} lines")
+                    self.lbl_info.config(text=f"·  {lbl}")
+                    self._sheet_idx = None
                 elif k == "line":
                     t = ev[1]
-                    self.lbl_lyric.config(text=t or "—", fg=ACCENT if t and t not in ("—","— ") else MUTED)
+                    # Synced tracks: the sheet shows the lines around the
+                    # playhead (_update_sheet). Plain / lyric-less tracks show
+                    # what the RPC loop publishes.
+                    if not (state.lyrics_mode == "synced" and state.synced):
+                        self.lbl_lyric.config(text=t or "—", fg=TEXT if t and t not in ("—", "— ") else MUTED)
                     self._refresh_mini()
                     self._highlight_active_lyric()
-                elif k == "paused":      self.lbl_lyric.config(text="Paused", fg=MUTED)
+                elif k == "paused":
+                    self.lbl_lyric.config(fg=MUTED)
+                    if not (state.lyrics_mode == "synced" and state.synced):
+                        self.lbl_lyric.config(text="Paused")
                 elif k == "rl":
                     w = ev[1]; self._start_rl_countdown(w)
                 elif k == "history_add":
