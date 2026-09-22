@@ -32,6 +32,8 @@ Lyrics come straight from Spicetify over a local WebSocket — no API keys, no p
 
 **Lyrics more often, and faster.** Lyrics for a track you've heard before come from a local cache instantly, with no network wait. When Spicy Lyrics and Spotify both come up empty, Statusify tries [LRCLIB](https://lrclib.net) and only accepts a result that matches the track's length, so a same-named song can't put the wrong words on your profile.
 
+**A real Windows window.** Statusify now uses the native Windows frame, tinted to your theme, instead of a hand-drawn title bar. That brings back Snap Layouts, the drop shadow, dragging to snap, and resizing from any edge. Switching tabs is instant, the scrollbars match the theme, and labels use normal sentence case.
+
 **Your friends see the song, not "Spotify".** The member list now reads *Listening to &lt;song&gt;* instead of your Discord application's name, the song title and album art link to the track on Spotify, and the progress bar is millisecond-accurate. Each can be switched off under *Discord RPC Behaviour*.
 
 ---
