@@ -1,15 +1,15 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/KurepaBoss/Statusify/main/statusify_icon_preview.png" width="128" />
-  <h1>Statusify v1.4.0</h1>
+  <h1>Statusify v1.5.0</h1>
   <p><strong>The ultimate Discord Rich Presence & Spotify Lyrics bridge.</strong></p>
 
-  ![Statusify v1.4.0](https://img.shields.io/badge/Statusify-v1.4.0-brightgreen?style=for-the-badge)
+  ![Statusify v1.5.0](https://img.shields.io/badge/Statusify-v1.5.0-brightgreen?style=for-the-badge)
   ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge)
   ![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078d6?style=for-the-badge)
   ![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
   [![Tests](https://github.com/KurepaBoss/Statusify/actions/workflows/tests.yml/badge.svg)](https://github.com/KurepaBoss/Statusify/actions/workflows/tests.yml)
 
-  <img src="docs/preview.svg" alt="Illustration: a Discord profile showing Listening to Statusify with the current lyric line, next to the Statusify window" width="760" />
+  <img src="docs/preview.svg" alt="Illustration: a Discord profile showing the current lyric line, next to the Statusify lyric sheet coloured from the same album cover" width="760" />
   <br><sub>Illustration: your Discord status shows the lyric line playing right now.</sub>
 </div>
 
@@ -22,7 +22,9 @@ Lyrics come straight from Spicetify over a local WebSocket — no API keys, no p
 
 ---
 
-## 🆕 Coming in the next release
+## 🆕 What's New in v1.5.0
+
+**A new look: the lyric sheet.** The main screen is now built around the words. The line playing right now is set large, with the line before and after either side of it, and the whole window — title bar included — takes its colour from the album cover, so every song looks different. Colours are built from the cover's hue and checked against accessibility contrast rules, so text stays readable on any cover; grey covers keep the normal theme. Pages switch from a control at the bottom, and the log moved into Settings. Prefer a fixed colour? Turn off *Colour the window from the album art* under *Appearance*.
 
 **History that actually persists.** History used to be written only when you clicked Quit, so logging off, shutting down, a crash or an update threw the whole session away. It now lives in a small SQLite database (`history.db`) and every play is saved the moment it starts. Your old `history.json` is imported automatically on first launch.
 
@@ -32,7 +34,7 @@ Lyrics come straight from Spicetify over a local WebSocket — no API keys, no p
 
 **Lyrics more often, and faster.** Lyrics for a track you've heard before come from a local cache instantly, with no network wait. When Spicy Lyrics and Spotify both come up empty, Statusify tries [LRCLIB](https://lrclib.net) and only accepts a result that matches the track's length, so a same-named song can't put the wrong words on your profile.
 
-**A real Windows window.** Statusify now uses the native Windows frame, tinted to your theme, instead of a hand-drawn title bar. That brings back Snap Layouts, the drop shadow, dragging to snap, and resizing from any edge. Switching tabs is instant, the scrollbars match the theme, and labels use normal sentence case.
+**A real Windows window.** Statusify now uses the native Windows frame instead of a hand-drawn title bar. That brings back Snap Layouts, the drop shadow, dragging to snap, and resizing from any edge. Switching pages is instant, the scrollbars match the theme, and labels use normal sentence case.
 
 **Your friends see the song, not "Spotify".** The member list now reads *Listening to &lt;song&gt;* instead of your Discord application's name, the song title and album art link to the track on Spotify, and the progress bar is millisecond-accurate. Each can be switched off under *Discord RPC Behaviour*.
 
