@@ -28,11 +28,34 @@ _recv_executor = None   # bounded pipe reads
 executor = None         # pipe writes (SET_ACTIVITY sends)
 
 
-def configure(log_fn, emit_fn, recv_executor, send_executor, max_state=None):
-    global log, emit, _recv_executor, executor, MAX_STATE
+uri_fn = lambda: ""     # returns the current Spotify track URI
+
+# What the member list shows after "Listening to": the song (details line,
+# STATUS_DISPLAY_DETAILS) or the Discord application's name (NAME). Without
+# the field Discord always used the app name, so every friend saw
+# "Listening to Spotify" rather than what was actually playing.
+STATUS_DISPLAY_NAME    = 0
+STATUS_DISPLAY_DETAILS = 2
+status_display_type = STATUS_DISPLAY_DETAILS
+link_track = True       # title/art link to the track on open.spotify.com
+
+
+def configure(log_fn, emit_fn, recv_executor, send_executor, max_state=None,
+              current_uri=None):
+    global log, emit, _recv_executor, executor, MAX_STATE, uri_fn
     log, emit, _recv_executor, executor = log_fn, emit_fn, recv_executor, send_executor
     if max_state is not None:
         MAX_STATE = max_state
+    if current_uri is not None:
+        uri_fn = current_uri
+
+
+def track_url(uri):
+    """open.spotify.com link for a spotify:track: URI, else None (local files,
+    podcasts and ads have no public track page)."""
+    if not uri or not uri.startswith("spotify:track:"):
+        return None
+    return "https://open.spotify.com/track/" + uri.rsplit(":", 1)[-1]
 
 
 class DiscordRPC:
@@ -148,17 +171,20 @@ class DiscordRPC:
         # details/state — showing the full "title — artist" there just repeated
         # the top line, so use it for the creator only.
         act = {"type": 2, "details": label,
+               "status_display_type": status_display_type,
                "assets": {"large_image": art or "spotify", "large_text": (artist or label)[:128]}}
+        url = track_url(uri_fn()) if link_track else None
+        if url:
+            act["details_url"] = url
+            act["assets"]["large_url"] = url
         f = [l for l in lines if l]
         act["state"] = join_lines(f)[:MAX_STATE] if f else "— "
         # Add elapsed/remaining timer — this is part of the activity payload,
         # NOT a separate RPC call, so it does not count against the rate limit.
+        # Milliseconds: whole seconds let the progress bar drift up to 1 s.
         if position_ms is not None and duration_ms and duration_ms > 0:
-            import time as _time
-            now_unix   = int(_time.time())
-            start_unix = now_unix - (position_ms // 1000)
-            end_unix   = start_unix + (duration_ms // 1000)
-            act["timestamps"] = {"start": start_unix, "end": end_unix}
+            start_ms = int(time.time() * 1000) - int(position_ms)
+            act["timestamps"] = {"start": start_ms, "end": start_ms + int(duration_ms)}
         return act
     async def set_activity(self, title, artist, lines, art, position_ms=None, duration_ms=None):
         if not self._connected: return

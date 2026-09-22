@@ -113,3 +113,36 @@ def test_set_activity_never_blocks_on_a_stalled_pipe():
     start = time.monotonic()
     asyncio.run(fire())
     assert time.monotonic() - start < 1.0
+
+
+# ── Activity payload ───────────────────────────────────────────────
+def _act(monkeypatch, uri="spotify:track:abc123", **kw):
+    monkeypatch.setattr(rpc_mod, "uri_fn", lambda: uri)
+    return rpc_mod.DiscordRPC("1")._activity("Song", "Artist", ["line"], "art", **kw)
+
+
+def test_member_list_shows_the_song_by_default(monkeypatch):
+    assert _act(monkeypatch)["status_display_type"] == rpc_mod.STATUS_DISPLAY_DETAILS
+
+
+def test_member_list_can_show_the_app_name(monkeypatch):
+    monkeypatch.setattr(rpc_mod, "status_display_type", rpc_mod.STATUS_DISPLAY_NAME)
+    assert _act(monkeypatch)["status_display_type"] == 0
+
+
+def test_title_links_to_the_track(monkeypatch):
+    a = _act(monkeypatch)
+    assert a["details_url"] == "https://open.spotify.com/track/abc123"
+    assert a["assets"]["large_url"] == a["details_url"]
+
+
+def test_no_link_for_local_files_or_when_disabled(monkeypatch):
+    assert "details_url" not in _act(monkeypatch, uri="spotify:local:x:y:z:1")
+    monkeypatch.setattr(rpc_mod, "link_track", False)
+    assert "details_url" not in _act(monkeypatch)
+
+
+def test_timestamps_are_milliseconds(monkeypatch):
+    ts = _act(monkeypatch, position_ms=61_500, duration_ms=200_250)["timestamps"]
+    assert ts["end"] - ts["start"] == 200_250
+    assert abs(ts["start"] - (time.time() * 1000 - 61_500)) < 2000

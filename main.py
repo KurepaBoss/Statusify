@@ -1339,7 +1339,13 @@ _ACTIVE_RPC = {"rpc": None}
 # and pipe-read executor injected rather than importing main.
 import statusify_rpc as _rpc_mod
 from statusify_rpc import DiscordRPC
-_rpc_mod.configure(log, event_queue.put, _recv_executor, executor, MAX_STATE)
+_rpc_mod.configure(log, event_queue.put, _recv_executor, executor, MAX_STATE,
+                   current_uri=lambda: state.track_uri)
+_rpc_mod.status_display_type = (
+    _rpc_mod.STATUS_DISPLAY_DETAILS
+    if _cfg_get("preferences", "status_shows_song", "true").lower() == "true"
+    else _rpc_mod.STATUS_DISPLAY_NAME)
+_rpc_mod.link_track = _cfg_get("preferences", "link_track", "true").lower() == "true"
 
 # ── WebSocket ─────────────────────────────────────────────────────
 async def ws_handler(ws):
@@ -4272,6 +4278,31 @@ class App:
             log(f'Paused RPC {"enabled" if SHOW_PAUSED_RPC else "disabled"}')
         tk.Checkbutton(row_ps, variable=self._paused_var, bg=BG2, activebackground=BG2,
                        selectcolor=BG3, command=_toggle_paused_rpc).pack(side="right")
+
+        # Member-list text and track link (statusify_rpc). Both apply from
+        # the next presence update; no reconnect needed.
+        row_sd = tk.Frame(inner_rpc, bg=BG2); row_sd.pack(fill="x", pady=(0,6))
+        tk.Label(row_sd, text='Member list shows the song, not the app name', fg=TEXT2, bg=BG2,
+                 font=self._f(9), anchor="w").pack(side="left")
+        self._status_song_var = tk.BooleanVar(
+            value=_rpc_mod.status_display_type == _rpc_mod.STATUS_DISPLAY_DETAILS)
+        def _toggle_status_song():
+            on = self._status_song_var.get()
+            _rpc_mod.status_display_type = (_rpc_mod.STATUS_DISPLAY_DETAILS if on
+                                            else _rpc_mod.STATUS_DISPLAY_NAME)
+            _cfg_set("preferences", "status_shows_song", str(on).lower())
+        tk.Checkbutton(row_sd, variable=self._status_song_var, bg=BG2, activebackground=BG2,
+                       selectcolor=BG3, command=_toggle_status_song).pack(side="right")
+
+        row_lk = tk.Frame(inner_rpc, bg=BG2); row_lk.pack(fill="x", pady=(0,6))
+        tk.Label(row_lk, text='Song title links to Spotify', fg=TEXT2, bg=BG2,
+                 font=self._f(9), anchor="w").pack(side="left")
+        self._link_var = tk.BooleanVar(value=_rpc_mod.link_track)
+        def _toggle_link():
+            _rpc_mod.link_track = self._link_var.get()
+            _cfg_set("preferences", "link_track", str(_rpc_mod.link_track).lower())
+        tk.Checkbutton(row_lk, variable=self._link_var, bg=BG2, activebackground=BG2,
+                       selectcolor=BG3, command=_toggle_link).pack(side="right")
 
         # Feature 5 — custom instrumental text
         row_it = tk.Frame(inner_rpc, bg=BG2); row_it.pack(fill="x")
