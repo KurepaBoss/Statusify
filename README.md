@@ -22,6 +22,20 @@ Lyrics come straight from Spicetify over a local WebSocket — no API keys, no p
 
 ---
 
+## 🆕 Coming in the next release
+
+**History that actually persists.** History used to be written only when you clicked Quit, so logging off, shutting down, a crash or an update threw the whole session away. It now lives in a small SQLite database (`history.db`) and every play is saved the moment it starts. Your old `history.json` is imported automatically on first launch.
+
+**The History tab shows your history again.** Since v1.3.0 it only listed tracks from the current session; restored history is drawn again. Search now covers *everything* you've played — title, artist and lyrics — not just the newest 60 rows, and every entry has a real date.
+
+**Long-term stats.** Alongside this session's numbers, Settings → *Listening stats* shows the last 7 days and all time: plays, listening time and top artists.
+
+**Lyrics more often, and faster.** Lyrics for a track you've heard before come from a local cache instantly, with no network wait. When Spicy Lyrics and Spotify both come up empty, Statusify tries [LRCLIB](https://lrclib.net) and only accepts a result that matches the track's length, so a same-named song can't put the wrong words on your profile.
+
+**Your friends see the song, not "Spotify".** The member list now reads *Listening to &lt;song&gt;* instead of your Discord application's name, the song title and album art link to the track on Spotify, and the progress bar is millisecond-accurate. Each can be switched off under *Discord RPC Behaviour*.
+
+---
+
 ## 🆕 What's New in v1.4.0
 
 **One-click updates.** When a new version is out, *Install update* downloads the new installer, checks it against the SHA-256 published with the release (and refuses to run it if they differ), installs it silently and restarts Statusify. Installs from `Statusify-Setup.exe` only; portable and source copies still get the download link.
@@ -73,18 +87,20 @@ Lyrics come straight from Spicetify over a local WebSocket — no API keys, no p
 - 🎸 **Instrumental handling** — detects instrumental gaps and shows your own custom text instead of a blank line.
 - ⏸️ **Paused indicator** — optionally keep a "Paused" status instead of clearing your presence.
 - 🖼️ **Album art** on the presence, with a local disk cache so the same track never re-downloads.
+- 📚 **Three lyric sources** — Spicy Lyrics, then Spotify's own, then [LRCLIB](https://lrclib.net); lyrics you've heard before load instantly from a local cache.
+- 👥 **Shows the song in the member list** — *Listening to &lt;song&gt;*, with the title linking to the track on Spotify.
 - ⏱️ **Lyric timing offset** — a global delay slider, plus a per-track offset that is remembered for songs whose lyrics are permanently early or late.
 
 **The app itself**
 - 🚀 **Zero-config startup** — a setup wizard on first run and self-installing dependencies.
-- 📂 **Session history** — a searchable database of everything you've listened to; filter by song, artist, or even lyric content, and export any track's lyrics as a timestamped `.lrc` or plain `.txt`.
+- 📂 **Listening history** — every play saved as it happens, with its date; search everything you've played by song, artist, or even lyric content, and export any track's lyrics as a timestamped `.lrc` or plain `.txt`.
 - 🎭 **Multi-profile support** — manage multiple Discord Application IDs and switch between them instantly.
 - 🪟 **Mini mode** — collapse to a compact, always-visible bar.
 - 🔔 **System tray** — close-to-tray, so Statusify keeps running out of the way.
 - 🎨 **Themes** — smooth dark and light modes with custom accent colours.
 - ⌨️ **Global hotkeys** for toggling RPC, skipping the current track, and skipping instrumentals.
 - 🚫 **Blacklist** — case-insensitive terms matched against artist and title, so anything you'd rather not broadcast never reaches Discord.
-- 📊 **Session stats** — songs played and total listening time.
+- 📊 **Listening stats** — this session, the last 7 days and all time: plays, listening time and top artists.
 - ⚙️ **Start with Windows**, optionally minimised.
 - 🔄 **Update checker** — reads the repo's releases in the background and shows you the changelog for anything newer.
 - 🖥️ **Retina-ready UI** — native High-DPI support for crystal-clear text on any Windows scaling mode.
@@ -95,13 +111,15 @@ Lyrics come straight from Spicetify over a local WebSocket — no API keys, no p
 
 <div align="center">
 
-### **[Download Statusify.exe](https://github.com/KurepaBoss/Statusify/releases/latest)**
+### **[Download Statusify-Setup.exe](https://github.com/KurepaBoss/Statusify/releases/latest)**
 
 </div>
 
-One file, no Python required — Python and every dependency are compiled in. Put it in a folder you intend to keep (it stores your settings, history and logs beside itself), then double-click it.
+The installer is the recommended download: it installs Statusify, sets up Spicetify and the lyrics bridge, and enables one-click updates. See [Easy Setup](#-easy-setup) below.
 
-> **Windows will warn you the first time.** The exe is unsigned, so SmartScreen shows "Windows protected your PC" → **More info** → **Run anyway**. Each release publishes a `Statusify.exe.sha256` you can check against `Get-FileHash Statusify.exe -Algorithm SHA256` if you want to confirm the download is byte-for-byte what the build workflow produced. Some antivirus engines also flag it, because Statusify registers a global keyboard hook (for the hotkeys) and opens a local socket (for the Spicetify bridge) — both visible in the source above.
+A portable `Statusify.exe` is on the same release page if you'd rather not install anything — one file with Python and every dependency compiled in. Put it in a folder you intend to keep (it stores your settings, history and logs beside itself), then double-click it. You'll need to set up Spicetify yourself (see [INSTALL.md](INSTALL.md)).
+
+> **Windows will warn you the first time.** The exe is unsigned, so SmartScreen shows "Windows protected your PC" → **More info** → **Run anyway**. Each release publishes a `.sha256` file for every exe you can check against `Get-FileHash <file> -Algorithm SHA256` if you want to confirm the download is byte-for-byte what the build workflow produced. Some antivirus engines also flag it, because Statusify registers global hotkeys and opens a local socket (for the Spicetify bridge) — both visible in the source above.
 
 Prefer running from source? That's the next section, and it's still the better option if you want to modify anything.
 
@@ -147,7 +165,7 @@ Spotify updates remove Spicetify's changes. Run **Start Menu → Statusify → R
 > `spicetify apply` updates it. The installer and the Repair shortcut both do
 > this for you and verify the result.
 
-> If Spicy Lyrics has no lyrics for a track, Statusify falls back to Spotify's own lyrics and says so in the log. If neither has lyrics, it still publishes the title, artist and album art, so a lyric problem never means a blank Rich Presence.
+> If Spicy Lyrics has no lyrics for a track, Statusify falls back to Spotify's own lyrics, then to LRCLIB, and says which in the log. If none of them has lyrics, it still publishes the title, artist and album art, so a lyric problem never means a blank Rich Presence.
 
 ---
 
@@ -162,8 +180,8 @@ Your preferences live in `statusify.cfg`, written next to `main.py` — or next 
 | **Lyric delay** | Global offset in ms, with a per-track override for stubborn songs. |
 | **Behaviour** | Close-to-tray, always-on-top, start minimised. |
 | **Startup** | Launch Statusify with Windows. |
-| **Discord RPC** | Paused indicator, custom instrumental text, profile switching. |
-| **History** | Toggle session recording on/off. |
+| **Discord RPC** | Paused indicator, custom instrumental text, profile switching, song vs app name in the member list, Spotify link, LRCLIB fallback. |
+| **History** | Toggle history on/off. Turning it off deletes what's recorded when you quit. |
 
 **Files Statusify creates at runtime**, in its own folder (all gitignored):
 
@@ -171,7 +189,7 @@ Your preferences live in `statusify.cfg`, written next to `main.py` — or next 
 | --- | --- |
 | `statusify.cfg` | Your preferences and window geometry. |
 | `.env` | Your Discord Application ID. |
-| `history.json` | Session history, including stored lyrics. |
+| `history.db` | Listening history and the lyrics cache (SQLite). A legacy `history.json` is imported once and renamed `history.json.migrated`. |
 | `statusify.log` | Timestamped diagnostic log; rotates to `.old` past 512 KB. |
 | `.artcache/` | Cached album art, keyed by URL hash. |
 | `exports/` | Lyrics you export as `.lrc` / `.txt`. |
@@ -199,7 +217,7 @@ Spotify + Spicetify ──[ lyrics-bridge.js ]──► ws://127.0.0.1:8765 ─�
 
 **"Statusify is already running" but there's no window.** Launch it again — the running instance will bring its window to the front. If it tells you the running copy isn't responding, quit it from the system-tray icon and start it again.
 
-**No lyrics on one specific track.** Confirm Spicy Lyrics itself has lyrics for it in Spotify. Statusify falls back to Spotify's own lyrics and logs the fallback; if neither source has them, presence still shows title, artist and album art.
+**No lyrics on one specific track.** Confirm Spicy Lyrics itself has lyrics for it in Spotify. Statusify then tries Spotify's own lyrics and LRCLIB, and logs each fallback; if no source has them, presence still shows title, artist and album art.
 
 **Verify the bridge is connected.** Open Spotify DevTools (`Ctrl+Shift+I`) and look for `[LyricsBridge] Connected to Python.` in the Console tab.
 
@@ -213,7 +231,7 @@ pip install pytest
 pytest
 ```
 
-The suite is headless — it stubs out tkinter, Discord and Spotify, so it needs no display, Discord or Spotify, but it does need Windows (named pipes, the registry and live hotkey registration). CI runs it on every push.
+The suite stubs out Discord, Spotify and the network, so it needs neither running, but it does need Windows (named pipes, the registry and live hotkey registration). `tests/test_gui_smoke.py` builds the real window and every page, so it also needs a desktop session. Tests never touch your real data: `tests/conftest.py` points `STATUSIFY_DATA_DIR` at a temp folder, and the same variable works for running a throwaway copy of the app. CI runs the suite on every push.
 
 ### Building the release executable
 
@@ -226,7 +244,7 @@ That creates its own `.buildenv` venv, installs PyInstaller, and runs `Statusify
 Two notes for anyone touching the packaging:
 
 - **`_APP_DIR` vs `_RES_DIR`.** User data (config, history, logs, caches) resolves from `_APP_DIR`, which points at the folder holding the exe when frozen. Bundled read-only files (`lyrics-bridge.js`, `statusify.ico`) resolve from `_RES_DIR`, which is `sys._MEIPASS`. Mixing them up means either losing every setting on exit or never being able to install the bridge.
-- **`upx=False` in the spec is deliberate.** UPX packing is a strong antivirus heuristic trigger, and a global keyboard hook plus a listening socket is already an awkward combination for scanners.
+- **`upx=False` in the spec is deliberate.** UPX packing is a strong antivirus heuristic trigger, and global hotkeys plus a listening socket is already an awkward combination for scanners.
 
 `build_launcher.ps1` is a different, smaller thing: it compiles a 9 KB shim that launches `main.py` with your local `pythonw.exe`, for running from source without a console window.
 
