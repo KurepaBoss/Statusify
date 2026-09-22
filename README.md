@@ -1,16 +1,16 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/KurepaBoss/Statusify/main/statusify_icon_preview.png" width="128" />
-  <h1>Statusify v1.5.0</h1>
+  <h1>Statusify v2.0.0</h1>
   <p><strong>The ultimate Discord Rich Presence & Spotify Lyrics bridge.</strong></p>
 
-  ![Statusify v1.5.0](https://img.shields.io/badge/Statusify-v1.5.0-brightgreen?style=for-the-badge)
+  ![Statusify v2.0.0](https://img.shields.io/badge/Statusify-v2.0.0-brightgreen?style=for-the-badge)
   ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge)
   ![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078d6?style=for-the-badge)
   ![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
   [![Tests](https://github.com/KurepaBoss/Statusify/actions/workflows/tests.yml/badge.svg)](https://github.com/KurepaBoss/Statusify/actions/workflows/tests.yml)
 
-  <img src="docs/preview.svg" alt="Illustration: a Discord profile showing the current lyric line, next to the Statusify lyric sheet coloured from the same album cover" width="760" />
-  <br><sub>Illustration: your Discord status shows the lyric line playing right now.</sub>
+  <img src="docs/preview.png" alt="Statusify 2.0: the lyric sheet over the album's flowing colours with playback controls, and the Settings page with listening stats" width="760" />
+  <br><sub>The lyric sheet takes its colours from the cover. The cover, song and lyrics in this screenshot are made up.</sub>
 </div>
 
 ---
@@ -22,21 +22,27 @@ Lyrics come straight from Spicetify over a local WebSocket — no API keys, no p
 
 ---
 
-## 🆕 What's New in v1.5.0
+## 🆕 What's New in v2.0.0
 
-**A new look: the lyric sheet.** The main screen is now built around the words. The line playing right now is set large, with the line before and after either side of it, and the whole window — title bar included — takes its colour from the album cover, so every song looks different. Colours are built from the cover's hue and checked against accessibility contrast rules, so text stays readable on any cover; grey covers keep the normal theme. Pages switch from a control at the bottom, and the log moved into Settings. Prefer a fixed colour? Turn off *Colour the window from the album art* under *Appearance*.
+Statusify 2.0 is a new app on the outside. Everything since v1.4.0 is in this release.
 
-**History that actually persists.** History used to be written only when you clicked Quit, so logging off, shutting down, a crash or an update threw the whole session away. It now lives in a small SQLite database (`history.db`) and every play is saved the moment it starts. Your old `history.json` is imported automatically on first launch.
+**A lyric sheet that moves with the music.** The Lyrics page is rebuilt from scratch. The background is the album cover's own colours drifting slowly like thick water, heavily blurred, and it flows into the next cover's colours when the track changes. When a new line starts, the sheet glides up: the new line sharpens and brightens, and lines further away soften and dim. Colours are kept dark (or light) enough that the words stay readable on any cover. Japanese, Chinese, Korean and Thai lyrics are drawn with the right fonts.
 
-**The History tab shows your history again.** Since v1.3.0 it only listed tracks from the current session; restored history is drawn again. Search now covers *everything* you've played — title, artist and lyrics — not just the newest 60 rows, and every entry has a real date.
+**Control Spotify from Statusify.** Previous, play/pause and next buttons sit under the progress bar. The bar is a seek bar: hover it to see the time under the pointer, then click or drag. Scroll the lyrics with the mouse wheel to read ahead or back, hover a line to highlight it, and click it to jump there. The sheet drifts back to the line being sung a few seconds after you stop. Keyboard: `Space` play/pause, `←`/`→` seek 5 s, `Ctrl+←`/`Ctrl+→` previous/next.
 
-**Long-term stats.** Alongside this session's numbers, Settings → *Listening stats* shows the last 7 days and all time: plays, listening time and top artists.
+**A redesigned Settings page.** Grouped cards, one clear row per setting with a short explanation, proper switches and buttons, and scrolling that no longer tears or leaves rows behind. The Listening section now shows big, readable numbers for this session, the last 7 days and all time, plus your top five artists for each.
 
-**Lyrics more often, and faster.** Lyrics for a track you've heard before come from a local cache instantly, with no network wait. When Spicy Lyrics and Spotify both come up empty, Statusify tries [LRCLIB](https://lrclib.net) and only accepts a result that matches the track's length, so a same-named song can't put the wrong words on your profile.
+**Faster on slower PCs.** The lyric page measures how long it takes to draw and eases off on its own (fewer frames, then a still background) when a PC is struggling. You can also pick *Auto*, *Smooth* or *Fast* under *Appearance → Performance*. Unchanged frames are skipped, lyric lines are drawn only when they come on screen, lines land exactly on time even at a low frame rate, and the stats queries moved off the UI thread. Pausing no longer makes Statusify rewrite its database twice a second.
 
-**A real Windows window.** Statusify now uses the native Windows frame instead of a hand-drawn title bar. That brings back Snap Layouts, the drop shadow, dragging to snap, and resizing from any edge. Switching pages is instant, the scrollbars match the theme, and labels use normal sentence case.
+**History that actually persists.** History used to be written only when you clicked Quit, so logging off, a crash or an update threw the session away. It now lives in a small SQLite database (`history.db`) and every play is saved the moment it starts. Your old `history.json` is imported automatically. The History tab shows restored history again, and search covers everything you've played: title, artist and lyrics.
 
-**Your friends see the song, not "Spotify".** The member list now reads *Listening to &lt;song&gt;* instead of your Discord application's name, the song title and album art link to the track on Spotify, and the progress bar is millisecond-accurate. Each can be switched off under *Discord RPC Behaviour*.
+**Lyrics more often, and faster.** Lyrics for a track you've heard before load instantly from a local cache. When Spicy Lyrics and Spotify both come up empty, Statusify tries [LRCLIB](https://lrclib.net) and accepts a result only if it matches the track's length.
+
+**Your friends see the song, not "Spotify".** The member list reads *Listening to &lt;song&gt;*, the title and album art link to the track, and the progress bar is millisecond-accurate. Each can be switched off in Settings.
+
+**A real Windows window.** The native frame is back, with Snap Layouts, the drop shadow and resizing from any edge. Its title bar takes the album's colour.
+
+**Updating from 1.x:** the Spotify bridge gained the playback commands, so it has to be re-applied once. The installer does this for you. If you run from source, click the *Lyrics bridge out of date* message under the status dots after updating.
 
 ---
 
@@ -96,6 +102,8 @@ Lyrics come straight from Spicetify over a local WebSocket — no API keys, no p
 - ⏱️ **Lyric timing offset** — a global delay slider, plus a per-track offset that is remembered for songs whose lyrics are permanently early or late.
 
 **The app itself**
+- 🌊 **A living lyric sheet** — album colours flowing behind the words, lines that glide, sharpen and fade.
+- ⏯️ **Playback controls** — previous, play/pause, next, a seek bar, and click-a-lyric-line to jump there.
 - 🚀 **Zero-config startup** — a setup wizard on first run and self-installing dependencies.
 - 📂 **Listening history** — every play saved as it happens, with its date; search everything you've played by song, artist, or even lyric content, and export any track's lyrics as a timestamped `.lrc` or plain `.txt`.
 - 🎭 **Multi-profile support** — manage multiple Discord Application IDs and switch between them instantly.
