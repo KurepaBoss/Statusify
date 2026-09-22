@@ -39,7 +39,8 @@ def app(tmp_path, monkeypatch):
             a = main.App()
             break
         except tk.TclError as e:
-            if "installed properly" not in str(e) or attempt == 2:
+            transient = ("installed properly" in str(e) or "tcl_findLibrary" in str(e))
+            if not transient or attempt == 2:
                 raise
             time.sleep(0.2)
     yield a
@@ -79,7 +80,9 @@ def test_history_search_reaches_lyrics_in_the_database(app):
 def test_long_term_stats_render(app):
     app._build_deferred_pages()
     app._refresh_stats(reschedule=False)
+    app._refresh_long_stats(sync=True)
     assert "5 plays" in app.lbl_stats_all.cget("text")
+    assert app._stats_data["all"]["plays"] == 5
     assert "15m" in app.lbl_stats_all.cget("text")
     assert app.lbl_stats_week.cget("text").startswith("Last 7 days")
 
@@ -126,11 +129,11 @@ def test_album_tint_recolours_window_and_reverts(app, monkeypatch):
     app._apply_album_tint("#c83c28")
     _pump(app, 3)
     assert main.BG != neutral_bg
-    assert app.lbl_lyric.cget("bg") == main.BG            # widgets followed
+    assert app.np_cv.cget("bg") == main.BG                # widgets followed
     assert app._pages["SETTINGS"].cget("bg") == main.BG
     app._apply_album_tint(None)
     _pump(app, 3)
-    assert main.BG == neutral_bg and app.lbl_lyric.cget("bg") == neutral_bg
+    assert main.BG == neutral_bg and app.np_cv.cget("bg") == neutral_bg
 
 
 def test_sheet_shows_lines_around_the_playhead(app, monkeypatch):
@@ -144,3 +147,80 @@ def test_sheet_shows_lines_around_the_playhead(app, monkeypatch):
     app._update_sheet(force=True)
     assert (app.lbl_prev.cget("text"), app.lbl_lyric.cget("text"),
             app.lbl_next.cget("text")) == ("one", "two", "three")
+
+
+def test_settings_page_is_drawn_not_widget_per_row(app):
+    """Scrolling stays tear-free only while rows are canvas items; a native
+    window per row is what made the old page tear."""
+    app._build_deferred_pages()
+    app._show("SETTINGS"); _pump(app, 5)
+    kids = app.set_cv.winfo_children()
+    assert len(kids) <= 8, kids                         # only the text inputs
+    assert len(app.set_cv.find_all()) > 100
+    app._set_scroll_to(400, animate=False); _pump(app, 2)
+    assert app.set_cv.canvasy(0) == 400
+
+
+def test_settings_switch_toggles_and_animates(app, monkeypatch):
+    monkeypatch.setattr(main, "_cfg_set", lambda *a, **k: None)
+    app._build_deferred_pages()
+    sw = app._switches[0]                                  # LRCLIB fallback
+    before = sw.get()
+    sw.click()
+    assert sw.get() != before
+    sw.click()
+    assert sw.get() == before
+
+
+def test_lyric_sheet_glides_to_the_next_line(app, monkeypatch):
+    st = main.state
+    monkeypatch.setattr(st, "lyrics_mode", "synced", raising=False)
+    monkeypatch.setattr(st, "synced", [{"startMs": i * 1000, "words": f"line {i}"} for i in range(6)],
+                        raising=False)
+    monkeypatch.setattr(main, "_track_offset_ms", lambda uri=None: 0)
+    pos = {"ms": 1500}
+    monkeypatch.setattr(app, "_estimate_pos_ms", lambda: pos["ms"])
+    app._np_size = (480, 600)
+    app._update_sheet(force=True)
+    ly = app._np_lyric_model(480)
+    assert ly["idx"] == 2                                  # +1: the intro dots line
+    pos["ms"] = 2500
+    app._update_sheet()
+    ly = app._np_lyric_model(480)
+    assert ly["idx"] == 3 and ly["from"] < ly["to"]        # gliding upwards
+    assert app.lbl_lyric.cget("text") == "line 2"
+    assert app._np_render() is True                        # busy while gliding
+
+
+def test_transport_and_seek_go_to_the_bridge(app, monkeypatch):
+    sent = []
+    monkeypatch.setattr(main, "_send_bridge", lambda obj: sent.append(obj) or True)
+    main.state.is_playing = True
+    app._np_transport("toggle")
+    assert sent[-1] == {"type": "player", "action": "toggle"}
+    assert app._np_playing() is False                      # optimistic until confirmed
+    app._np_transport("next")
+    assert sent[-1]["action"] == "next"
+    main.state.duration_ms = 200_000
+    app._np_seek(61_000)
+    assert sent[-1] == {"type": "seek", "position_ms": 61_000}
+    assert main.state.position_ms == 61_000
+
+
+def test_clicking_a_lyric_line_seeks_to_its_start(app, monkeypatch):
+    sent = []
+    monkeypatch.setattr(main, "_send_bridge", lambda obj: sent.append(obj) or True)
+    st = main.state
+    monkeypatch.setattr(st, "lyrics_mode", "synced", raising=False)
+    monkeypatch.setattr(st, "synced", [{"startMs": i * 1000 + 500, "words": f"l{i}"} for i in range(5)],
+                        raising=False)
+    monkeypatch.setattr(main, "_track_offset_ms", lambda uri=None: 200)
+    app._np_seek_line(3)                                   # sheet line 3 = synced[2]
+    assert sent[-1]["position_ms"] == 2500 - 200 + 40
+
+
+def test_seek_without_spotify_reports_instead_of_failing(app, monkeypatch):
+    monkeypatch.setattr(main, "_send_bridge", lambda obj: False)
+    assert app._np_seek(1000) is False
+    assert "isn't connected" in app.lbl_err.cget("text")
+

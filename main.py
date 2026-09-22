@@ -527,6 +527,11 @@ START_MINIMIZED   = (_cfg_get("preferences", "start_minimized", "false").lower()
 # the UI cheap on a very weak machine, so it is user-controllable rather
 # than compiled in. Off degrades to the old instant snap, never to breakage.
 ANIMATIONS_ENABLED = (_cfg_get("preferences", "animations", "true").lower() == "true")
+# Lyric sheet quality: "auto" measures frame cost and steps down on slow
+# PCs; "high" always animates everything; "low" keeps the background still.
+RENDER_QUALITY = _cfg_get("preferences", "render_quality", "auto").lower()
+if RENDER_QUALITY not in ("auto", "high", "low"):
+    RENDER_QUALITY = "auto"
 # Point-size bump applied to the big "now on Discord" lyric line only.
 try:
     LYRIC_FONT_BOOST = int(_cfg_get("preferences", "lyric_font_boost", "0"))
@@ -1108,6 +1113,36 @@ async def _lrclib_task(uri, artist, title, duration_ms):
         return
     _apply_lyrics(*picked, "LRCLIB")
 
+def _handle_pause():
+    state.is_playing = False
+    event_queue.put(("paused",))
+    _on_track_pause()
+    _finish_play()
+
+def _send_bridge(obj):
+    """Send one command to the Spicetify bridge from any thread. Returns
+    False when Spotify isn't connected."""
+    ws = _spicetify_ws
+    if ws is None or _backend_loop is None:
+        return False
+    try:
+        asyncio.run_coroutine_threadsafe(ws.send(json.dumps(obj)), _backend_loop)
+        return True
+    except Exception:
+        return False
+
+def player_command(action):
+    """prev / next / toggle / play / pause, sent to Spotify via the bridge."""
+    return _send_bridge({"type": "player", "action": action})
+
+def seek_to(ms):
+    """Seek Spotify to `ms`. The UI moves at once; the bridge confirms."""
+    ms = max(0, int(ms))
+    if not _send_bridge({"type": "seek", "position_ms": ms}):
+        return False
+    state.position_ms = ms
+    return True
+
 async def ws_handler(ws):
     global _spicetify_ws, _dropped_lines, _BRIDGE_UPDATED
     _spicetify_ws = ws
@@ -1129,9 +1164,12 @@ async def ws_handler(ws):
             except ValueError: continue
             t = data.get("type")
             if t == "paused":
-                state.is_playing = False; event_queue.put(("paused",))
-                _on_track_pause()
-                _finish_play()
+                # Older bridges repeat "paused" every 500 ms. Act on the
+                # transition only: each one wrote SQLite and re-ran the stats
+                # queries on the Tk thread, twice a second, for as long as
+                # playback stayed paused.
+                if state.is_playing:
+                    _handle_pause()
             elif t == "track_change":
                 state.artist    = data.get("artist",""); state.title = data.get("title","")
                 state.album_art = data.get("album_art","")
@@ -1183,9 +1221,13 @@ async def ws_handler(ws):
                 was = state.is_playing
                 state.position_ms = int(data.get("position_ms",0))
                 state.duration_ms = int(data.get("duration_ms", state.duration_ms))
-                state.is_playing  = data.get("is_playing", True)
-                if not was and state.is_playing:
+                playing = bool(data.get("is_playing", True))
+                if was and not playing:
+                    _handle_pause()
+                state.is_playing = playing
+                if not was and playing:
                     _on_track_resume()
+                    event_queue.put(("resumed",))
             elif t == "lyrics_debug":
                 msg = data.get("message", "")
                 if msg:
@@ -1938,6 +1980,8 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
             btn.config(fg=ACCENT if ALWAYS_ON_TOP else MUTED)
         except tk.TclError:
             pass
+        # Ctrl+T and the lyric page's "On top" also move the Settings switch.
+        self._sync_settings_switches()
 
     # ── In-app keyboard shortcuts ─────────────────────────────────
     def _bind_shortcuts(self):
@@ -1954,12 +1998,35 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
             "<Control-c>":        lambda e: self._copy_current_lyric(),
             "<Control-m>":        lambda e: self._toggle_mini(),
             "<Control-t>":        lambda e: self._toggle_topmost(),
+            # Playback. Plain keys only while not typing into a field.
+            "<space>":            lambda e: self._key_player(e, "toggle"),
+            "<Control-Left>":     lambda e: self._key_player(e, "prev"),
+            "<Control-Right>":    lambda e: self._key_player(e, "next"),
+            "<Left>":             lambda e: self._key_seek(e, -5000),
+            "<Right>":            lambda e: self._key_seek(e, 5000),
         }
         for seq, fn in binds.items():
             try:
                 W.bind(seq, fn)
             except tk.TclError:
                 pass
+
+    @staticmethod
+    def _typing(e):
+        return isinstance(e.widget, (tk.Entry, tk.Text, ttk.Entry))
+
+    def _key_player(self, e, action):
+        if not self._typing(e):
+            self._np_transport(action)
+            return "break"
+
+    def _key_seek(self, e, delta):
+        if self._typing(e) or self._cur_page != "NOW PLAYING":
+            return
+        dur = getattr(state, "duration_ms", 0) or 0
+        if dur:
+            self._np_seek(max(0, min(dur - 1000, self._estimate_pos_ms() + delta)))
+        return "break"
 
     def _focus_history_search(self):
         try:
@@ -2525,15 +2592,23 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
             page.place(x=0, y=0, relwidth=1, relheight=1)
         page.tkraise()
         self._cur_page = name
+        if name == "SETTINGS":
+            self._refresh_long_stats()      # throttled off-page; fresh on show
+        # The lyric sheet stops drawing while hidden; wake it at once.
+        if name == "NOW PLAYING":
+            self._schedule("progress", 0, self._tick_progress)
         # Restore where the user last was on the Settings page.
         if name == "SETTINGS" and hasattr(self, "set_cv"):
             pos = getattr(self, "_set_scroll_pos", 0.0)
             self._root.after_idle(lambda: self._safe_yview(self.set_cv, pos))
-        self._paint_nav()
+        self._paint_nav(animate=True)
 
-    def _paint_nav(self):
+    def _paint_nav(self, animate=False):
         """Raise the selected segment of the page switcher; mute the rest.
-        Instant on purpose — a switcher that animates reads as lag."""
+
+        On a click the old segment sinks and the new one rises over 140 ms.
+        The page itself switches at once; only the switcher eases, so it
+        reads as feedback rather than lag. Palette changes repaint instantly."""
         nav = getattr(self, "_nav", None)
         if nav is None:
             return
@@ -2541,7 +2616,11 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
             nav.config(bg=BG2)
             for n, b in self._tab_btns.items():
                 sel = (n == self._cur_page)
-                b.config(bg=BG4 if sel else BG2, fg=TEXT if sel else MUTED)
+                bg, fg = (BG4 if sel else BG2), (TEXT if sel else MUTED)
+                if animate:
+                    self._fade_colors(f"hover:{b}", b, 140, bg=bg, fg=fg)
+                else:
+                    b.config(bg=bg, fg=fg)
         except tk.TclError:
             pass
 

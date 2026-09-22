@@ -83,6 +83,20 @@
                     }
                 } else if (msg.type === "skip_track") {
                     Spicetify.Player.next();
+                } else if (msg.type === "player") {
+                    // Transport buttons in Statusify.
+                    const P = Spicetify.Player;
+                    if (msg.action === "next") P.next();
+                    else if (msg.action === "prev") P.back();
+                    else if (msg.action === "pause") P.pause();
+                    else if (msg.action === "play") P.play();
+                    else P.togglePlay();
+                    setTimeout(reportState, 150);
+                } else if (msg.type === "seek") {
+                    // Seek bar and clickable lyric lines in Statusify.
+                    const ms = Math.max(0, parseInt(msg.position_ms || 0));
+                    Spicetify.Player.seek(ms);
+                    setTimeout(reportState, 120);
                 } else if (msg.type === "skip_instrumental") {
                     // ── Skip instrumental: seek to the next lyric line ──
                     if (!currentLyrics || currentLyrics.mode !== "synced" || !currentLyrics.synced?.length) {
@@ -536,6 +550,21 @@
         }
     }
 
+    // Position and play state right now, sent after a command so Statusify
+    // doesn't wait for the next half-second tick to see the result.
+    function reportState() {
+        const item = Spicetify.Player.data?.item;
+        if (!item) return;
+        const durMs = parseInt(item.metadata?.["duration"] || item.duration_ms || 0);
+        const playing = Spicetify.Player.isPlaying();
+        send({ type: "position", position_ms: Spicetify.Player.getProgress(),
+               duration_ms: durMs, is_playing: playing });
+        if (!playing) send({ type: "paused" });
+        wasPlaying = playing;
+    }
+
+    let wasPlaying = true;
+
     async function tick() {
         const data = Spicetify.Player.data;
         if (!data?.item) return;
@@ -546,7 +575,16 @@
         const durMs    = parseInt(item.metadata?.["duration"] || item.duration_ms || 0);
         const playing  = Spicetify.Player.isPlaying();
 
-        if (!playing) { send({ type: "paused" }); return; }
+        if (!playing) {
+            // "paused" once per pause, not every tick: each one made Statusify
+            // close the play record and repaint. The position still goes out
+            // (as not playing), so a seek while paused shows up.
+            if (wasPlaying) send({ type: "paused" });
+            wasPlaying = false;
+            send({ type: "position", position_ms: posMs, duration_ms: durMs, is_playing: false });
+            return;
+        }
+        wasPlaying = true;
 
         // New track (or just connected) — send full track+lyrics
         if (trackUri !== lastTrackUri) {

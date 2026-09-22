@@ -1,9 +1,22 @@
 """The Settings page, listening stats and theming.
 
-Moved verbatim out of main.App (which inherits SettingsPage). Names that
-belong to main are reached through M, the live main module, bound by
-main at import time: palette colours and settings are rebound at
-runtime, so they must be read from main on every use, never copied.
+Layout: a page title, then grouped cards. Every row is the same shape: a
+title with an optional one-line explanation on the left, one control on the
+right, hairline dividers between rows.
+
+The whole page is drawn on ONE canvas: text items, and small anti-aliased
+PIL images for cards, switches and buttons. Only the text inputs are real
+widgets. That's what keeps scrolling clean. When every row, label and
+switch was its own native window, Windows repainted them one by one as the
+page moved, so mid-scroll the view was a patchwork of rows at their old and
+new positions. A canvas redraws its items double-buffered in one pass.
+
+The page is rebuilt from self._set_spec by _set_render() whenever the width,
+the palette or a multi-line text changes; it takes a few milliseconds.
+
+Names that belong to main are reached through M, the live main module:
+palette colours and settings are rebound at runtime, so they must be read
+from main on every use, never copied.
 """
 import datetime
 import os
@@ -12,146 +25,774 @@ import sys
 import tkinter as tk
 import tkinter.colorchooser as tkcolor
 
+try:
+    from PIL import Image, ImageDraw
+except ImportError:
+    Image = ImageDraw = None
+
 M = None   # the main module
+
+
+def _rgb(c):
+    c = c.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+
+class _Text:
+    """Text on the settings canvas, standing in for the Label it replaced
+    (main and the tests call .config(text=…) / .cget("text") on these)."""
+
+    def __init__(self, page, text="", fg=None, font=None):
+        self._page = page
+        self._o = {"text": text, "fg": fg}
+        self.font = font
+        self.item = None
+
+    def config(self, **kw):
+        if not any(self._o.get(k) != v for k, v in kw.items()):
+            return
+        self._o.update(kw)
+        self._page._set_text_changed(self)
+    configure = config
+
+    def cget(self, key):
+        return M.BG2 if key == "bg" else self._o.get(key, "")
+
+
+class _Switch:
+    """Toggle switch. The knob slides and the track fades over 160 ms."""
+
+    def __init__(self, page, get, toggle):
+        self.p, self.get, self.toggle = page, get, toggle
+        self.t = 1.0 if get() else 0.0
+        self.item = None
+        self.tag = f"sw{id(self)}"
+
+    def size(self):
+        return self.p._ss(40), self.p._ss(22)
+
+    def image(self):
+        w, h = self.size()
+        q = round(self.t * 20) / 20
+        key = ("sw", w, h, q, M.BG2, M.BG4, M.ACCENT, M.TEXT2, M.ACCENT_FG)
+        cache = self.p.__dict__.setdefault("_pill_cache", {})
+        ph = cache.get(key)
+        if ph is None:
+            sc = 4
+            off, on = _rgb(M.BG4), _rgb(M.ACCENT)
+            col = tuple(int(off[i] + (on[i] - off[i]) * q) for i in range(3))
+            ko, kn = _rgb(M.TEXT2), _rgb(M.ACCENT_FG)
+            kcol = tuple(int(ko[i] + (kn[i] - ko[i]) * q) for i in range(3))
+            big = Image.new("RGB", (w * sc, h * sc), _rgb(M.BG2))
+            d = ImageDraw.Draw(big)
+            d.rounded_rectangle((0, 0, w * sc - 1, h * sc - 1), radius=h * sc // 2, fill=col)
+            pad = 3 * sc
+            k = h * sc - 2 * pad
+            x = pad + (w * sc - 2 * pad - k) * q
+            d.ellipse((x, pad, x + k, pad + k), fill=kcol)
+            ph = M.ImageTk.PhotoImage(big.resize((w, h), Image.LANCZOS))
+            cache[key] = ph
+        return ph
+
+    def draw(self, cv, x, y):
+        self.item = cv.create_image(x, y, anchor="nw", image=self.image(), tags=(self.tag,))
+        self.p._set_bind(self.tag, self.click)
+
+    def sync(self, animate=True):
+        target = 1.0 if self.get() else 0.0
+        start = self.t
+        if start == target:
+            return
+
+        def apply(e):
+            self.t = start + (target - start) * e
+            try:
+                self.p.set_cv.itemconfigure(self.item, image=self.image())
+            except tk.TclError:
+                pass
+        if animate:
+            self.p._animate(f"switch:{self.tag}", 160, apply)
+        else:
+            apply(1.0)
+
+    def click(self, _e=None):
+        self.toggle()
+        self.sync()
+
+
+class _Buttons:
+    """One or more rounded buttons in a row, with an optional value between.
+
+    items: ("btn", text, cmd, kind) or ("value", _Text, min_width)."""
+
+    def __init__(self, page, *items):
+        self.p = page
+        self.items = items
+
+    def _w(self, it):
+        if it[0] == "btn":
+            return self.p._f(M.FS_SMALL, True).measure(it[1]) + self.p._ss(24)
+        f = self.p._f(M.FS_SMALL, True)
+        return max(self.p._ss(it[2]), f.measure(it[1].cget("text")) + self.p._ss(12))
+
+    def size(self):
+        gap = self.p._ss(6)
+        return sum(self._w(i) for i in self.items) + gap * (len(self.items) - 1), self.p._ss(28)
+
+    def draw(self, cv, x, y):
+        gap = self.p._ss(6)
+        h = self.p._ss(28)
+        for it in self.items:
+            w = self._w(it)
+            if it[0] == "btn":
+                self.p._set_button(cv, x, y, w, h, it[1], it[2], it[3])
+            else:
+                slot = it[1]
+                col = slot.cget("fg") or M.TEXT2
+                slot.item = cv.create_text(x + w // 2, y + h // 2, text=slot.cget("text"),
+                                           fill=col, font=self.p._f(M.FS_SMALL, True))
+            x += w + gap
+
+
+class _Segmented:
+    """A rounded track with the chosen segment raised; it slides on change."""
+
+    def __init__(self, page, options, get, choose):
+        self.p, self.options, self.get, self.choose = page, options, get, choose
+        self.x = None
+        self.hover = None
+        self.item = None
+        self.tag = f"seg{id(self)}"
+
+    def dims(self):
+        f = self.p._f(M.FS_SMALL, True)
+        seg = max(f.measure(t) for t, _ in self.options) + self.p._ss(28)
+        return seg, seg * len(self.options) + self.p._ss(6), self.p._ss(30)
+
+    def size(self):
+        _, w, h = self.dims()
+        return w, h
+
+    def target(self):
+        keys = [k for _, k in self.options]
+        seg, _, _ = self.dims()
+        return (keys.index(self.get()) if self.get() in keys else 0) * seg
+
+    def image(self):
+        seg, tw, h = self.dims()
+        x = self.x if self.x is not None else self.target()
+        S = self.p._ss
+        sc = 4
+        big = Image.new("RGB", (tw * sc, h * sc), _rgb(M.BG2))
+        d = ImageDraw.Draw(big)
+        d.rounded_rectangle((0, 0, tw * sc - 1, h * sc - 1), radius=S(8) * sc, fill=_rgb(M.BG3))
+        p = S(3) * sc
+        d.rounded_rectangle((x * sc + p, p, (x + seg) * sc + p - 1, h * sc - p - 1),
+                            radius=S(6) * sc, fill=_rgb(M.BG4 if M._DARK_MODE else M.BG2))
+        img = big.resize((tw, h), Image.LANCZOS)
+        dr = ImageDraw.Draw(img)
+        TR = self.p._np_text
+        px = self.p._px(M.FS_SMALL + 1)
+        cur = self.get()
+        for i, (label, key) in enumerate(self.options):
+            sx = S(3) + i * seg
+            col = M.TEXT if key == cur else (M.TEXT2 if self.hover == i else M.MUTED)
+            lw = TR.measure(label, "semibold", px)
+            TR.draw(dr, (sx + (seg - lw) / 2, (h - TR.line_height("semibold", px)) / 2),
+                    label, "semibold", px, _rgb(col))
+        self.ph = M.ImageTk.PhotoImage(img)
+        return self.ph
+
+    def refresh(self):
+        try:
+            self.p.set_cv.itemconfigure(self.item, image=self.image())
+        except tk.TclError:
+            pass
+
+    def draw(self, cv, x, y):
+        self.x = self.target()
+        self.item = cv.create_image(x, y, anchor="nw", image=self.image(), tags=(self.tag,))
+        self.ox = x
+        cv.tag_bind(self.tag, "<Button-1>", self.click)
+        cv.tag_bind(self.tag, "<Motion>", self.motion)
+        cv.tag_bind(self.tag, "<Enter>", lambda e: cv.config(cursor="hand2"))
+        cv.tag_bind(self.tag, "<Leave>", self.leave)
+
+    def _at(self, e):
+        seg, _, _ = self.dims()
+        x = self.p.set_cv.canvasx(e.x) - self.ox - self.p._ss(3)
+        return max(0, min(len(self.options) - 1, int(x // seg)))
+
+    def click(self, e):
+        self.choose(self.options[self._at(e)][1])
+        self.slide()
+
+    def slide(self, animate=True):
+        tx = self.target()
+        sx = self.x if self.x is not None else tx
+        if sx == tx:
+            self.refresh()
+            return
+
+        def apply(e):
+            self.x = sx + (tx - sx) * e
+            self.refresh()
+        if animate:
+            self.p._animate(f"seg:{self.tag}", 220, apply)
+        else:
+            apply(1.0)
+
+    def motion(self, e):
+        i = self._at(e)
+        if i != self.hover:
+            self.hover = i
+            self.refresh()
+
+    def leave(self, _e):
+        self.p.set_cv.config(cursor="")
+        self.hover = None
+        self.refresh()
+
+
+class _Swatch:
+    def __init__(self, page, cmd):
+        self.p, self.cmd = page, cmd
+        self.tag = f"swatch{id(self)}"
+
+    def size(self):
+        return self.p._ss(44), self.p._ss(24)
+
+    def draw(self, cv, x, y):
+        w, h = self.size()
+        ph = self.p._pill_photo(w, h, M.USER_ACCENT, M.BG2, radius=self.p._ss(7), outline=M.BORDER)
+        cv.create_image(x, y, anchor="nw", image=ph, tags=(self.tag,))
+        self.p._set_bind(self.tag, self.cmd)
+
+
+class _Widget:
+    """A real widget embedded in a row (an Entry) or across a card.
+
+    Under each one sits a drawn stand-in: a field box with a snapshot of the
+    widget's text. While the page glides, the real widget is hidden and the
+    stand-in scrolls with the canvas, because a native child window lags a
+    frame behind a canvas that moves (the last source of tearing here)."""
+
+    def __init__(self, widget, full=False, height=None):
+        self.w, self.full, self.h = widget, full, height
+        self.win = self.ph = None
+
+    def size(self):
+        return self.w.winfo_reqwidth(), self.h or self.w.winfo_reqheight()
+
+    def draw(self, cv, x, y, width=None):
+        w = width or self.w.winfo_reqwidth()
+        h = self.h or self.w.winfo_reqheight()
+        cv.create_rectangle(x, y, x + w - 1, y + h - 1, fill=self.w.cget("bg"),
+                            outline=M.BORDER, tags=("embedph",))
+        self.ph = cv.create_text(x + 6, y + 4, anchor="nw", text="", fill=self.w.cget("fg"),
+                                 font=self.w.cget("font"), width=max(10, w - 12),
+                                 tags=("embedph",))
+        self.ph_h = h
+        kw = {"width": width} if width else {}
+        if self.h:
+            kw["height"] = self.h
+        self.win = cv.create_window(x, y, anchor="nw", window=self.w, tags=("embed",), **kw)
+        cv.page_widgets.append(self)
+
+    def snapshot(self):
+        w = self.w
+        try:
+            if isinstance(w, tk.Entry):
+                # One line, cut to the field like the Entry itself would.
+                t, f = w.get(), M.tkfont.Font(font=w.cget("font"))
+                room = w.winfo_width() - 12
+                while t and f.measure(t) > room:
+                    t = t[:-1]
+                return t
+            if isinstance(w, tk.Listbox):
+                return chr(10).join(w.get(0, "end"))
+            if isinstance(w, tk.Text):
+                first = w.index("@0,0")
+                last = w.index(f"@0,{w.winfo_height()}")
+                return w.get(first, f"{last} lineend")
+        except tk.TclError:
+            pass
+        return ""
 
 
 class SettingsPage:
 
-    # ── SETTINGS ──────────────────────────────────────────────────
-    def _collapsible(self, parent, title, key):
-        """Section header that folds its card away on click.
+    # ── Helpers ──────────────────────────────────────────────────
+    def _ss(self, v):
+        """Scale a 96-dpi pixel length to this screen."""
+        s = getattr(self, "_np_s", None)
+        if s is None:
+            try:
+                s = float(self._root.winfo_fpixels("1p")) / (96 / 72)
+            except tk.TclError:
+                s = 1.0
+        return int(round(v * s))
 
-        Returns the card frame to pack the section's content into. Collapsed
-        state is keyed by `key` and persisted (debounced) so the page reopens
-        the way you left it — the main lever for taming the long settings
-        scroll. Header padding is uniform here, which also gives every section
-        a consistent rhythm (the old code hand-tuned pady per header)."""
-        collapsed = key in getattr(self, "_collapsed_sections", set())
-        header = tk.Frame(parent, bg=M.BG); header.pack(fill="x", pady=(6, 4))
-        caret = tk.Label(header, text="▸" if collapsed else "▾", fg=M.MUTED, bg=M.BG,
-                         font=self._f(7, True), cursor="hand2")
-        caret.pack(side="left", padx=(0, 5))
-        lbl = tk.Label(header, text=title, fg=M.MUTED, bg=M.BG, font=self._f(7, True),
-                       cursor="hand2", anchor="w")
-        lbl.pack(side="left", fill="x", expand=True)
+    def _pill_photo(self, w, h, fill, bg, radius=None, outline=None):
+        """Rounded rectangle composited onto `bg`, as a PhotoImage. Cached."""
+        key = (w, h, fill, bg, radius, outline)
+        cache = self.__dict__.setdefault("_pill_cache", {})
+        ph = cache.get(key)
+        if ph is not None:
+            return ph
+        r = h // 2 if radius is None else radius
+        sc = 4
+        big = Image.new("RGB", (w * sc, h * sc), _rgb(bg))
+        d = ImageDraw.Draw(big)
+        if outline:
+            d.rounded_rectangle((0, 0, w * sc - 1, h * sc - 1), radius=r * sc, fill=_rgb(outline))
+            d.rounded_rectangle((sc, sc, w * sc - 1 - sc, h * sc - 1 - sc),
+                                radius=max(0, r * sc - sc), fill=_rgb(fill))
+        else:
+            d.rounded_rectangle((0, 0, w * sc - 1, h * sc - 1), radius=r * sc, fill=_rgb(fill))
+        ph = M.ImageTk.PhotoImage(big.resize((w, h), Image.LANCZOS))
+        if len(cache) > 600:
+            cache.clear()
+        cache[key] = ph
+        return ph
 
-        card = tk.Frame(parent, bg=M.BG2)
-        if not collapsed:
-            card.pack(fill="x", pady=(0, 10), after=header)
+    def _corner(self, r, q):
+        """Anti-aliased card corner (quadrant q: 0 tl, 1 tr, 2 bl, 3 br)."""
+        key = ("corner", r, q, M.BG, M.BG2, M.BORDER)
+        cache = self.__dict__.setdefault("_pill_cache", {})
+        ph = cache.get(key)
+        if ph is None:
+            sc = 4
+            d2 = 2 * r * sc
+            big = Image.new("RGB", (d2, d2), _rgb(M.BG))
+            d = ImageDraw.Draw(big)
+            d.ellipse((0, 0, d2 - 1, d2 - 1), fill=_rgb(M.BORDER))
+            d.ellipse((sc, sc, d2 - 1 - sc, d2 - 1 - sc), fill=_rgb(M.BG2))
+            img = big.resize((2 * r, 2 * r), Image.LANCZOS)
+            box = [(0, 0, r, r), (r, 0, 2 * r, r), (0, r, r, 2 * r), (r, r, 2 * r, 2 * r)][q]
+            ph = M.ImageTk.PhotoImage(img.crop(box))
+            cache[key] = ph
+        return ph
 
-        def _toggle(_e=None):
-            if card.winfo_ismapped():
-                card.pack_forget(); caret.config(text="▸")
-                self._collapsed_sections.add(key)
+    def _set_bind(self, tag, cmd):
+        cv = self.set_cv
+        cv.tag_bind(tag, "<Button-1>", lambda e: cmd())
+        cv.tag_bind(tag, "<Enter>", lambda e: cv.config(cursor="hand2"))
+        cv.tag_bind(tag, "<Leave>", lambda e: cv.config(cursor=""))
+
+    def _set_button(self, cv, x, y, w, h, text, cmd, kind="secondary"):
+        """A rounded button drawn on the canvas, with a 120 ms hover fade."""
+        tag = f"btn{int(x)}_{int(y)}_{abs(hash(text))}"
+        def colours(hover):
+            if kind == "primary":
+                return (M._blend(M.ACCENT, M.TEXT, 0.15) if hover else M.ACCENT), M.ACCENT_FG
+            if kind == "ghost":
+                return (M.BG3 if hover else M.BG2), (M.TEXT if hover else M.TEXT2)
+            return (M.BG4 if hover else M.BG3), M.TEXT
+        fill, fg = colours(False)
+        img = cv.create_image(x, y, anchor="nw", tags=(tag,),
+                              image=self._pill_photo(w, h, fill, M.BG2, radius=self._ss(7)))
+        txt = cv.create_text(x + w // 2, y + h // 2, text=text, fill=fg,
+                             font=self._f(M.FS_SMALL, True), tags=(tag,))
+        st = {"t": 0.0}
+
+        def fade(to):
+            a = st["t"]
+            def apply(e):
+                st["t"] = a + (to - a) * e
+                f0, g0 = colours(False)
+                f1, g1 = colours(True)
+                f = M._blend(f0, f1, round(st["t"] * 6) / 6)
+                try:
+                    cv.itemconfigure(img, image=self._pill_photo(w, h, f, M.BG2, radius=self._ss(7)))
+                    cv.itemconfigure(txt, fill=M._blend(g0, g1, st["t"]))
+                except tk.TclError:
+                    pass
+            self._animate(f"hover:{tag}", 120, apply)
+        cv.tag_bind(tag, "<Enter>", lambda e: (cv.config(cursor="hand2"), fade(1.0)))
+        cv.tag_bind(tag, "<Leave>", lambda e: (cv.config(cursor=""), fade(0.0)))
+        cv.tag_bind(tag, "<Button-1>", lambda e: cmd())
+
+    def _wbutton(self, parent, text, cmd, kind="secondary", bg_tok="BG"):
+        """Widget version of the rounded button, for dialogs."""
+        font = self._f(M.FS_SMALL, True)
+        h, w = self._ss(28), font.measure(text) + self._ss(24)
+        lbl = tk.Label(parent, text=text, compound="center", bd=0, font=font,
+                       cursor="hand2", highlightthickness=0, padx=0, pady=0)
+        def paint(hover=False):
+            bg = getattr(M, bg_tok)
+            if kind == "primary":
+                fill, fg = (M._blend(M.ACCENT, M.TEXT, 0.15) if hover else M.ACCENT), M.ACCENT_FG
+            elif kind == "ghost":
+                fill, fg = (M.BG3 if hover else bg), (M.TEXT if hover else M.TEXT2)
             else:
-                card.pack(fill="x", pady=(0, 10), after=header)
-                caret.config(text="▾")
-                self._collapsed_sections.discard(key)
-            M._cfg_set_soon("ui", "collapsed_sections",
-                          ",".join(sorted(self._collapsed_sections)))
-            if getattr(self, "_recalc_set_scroll", None):
-                self._recalc_set_scroll()
+                fill, fg = (M.BG4 if hover else M.BG3), M.TEXT
+            lbl.config(image=self._pill_photo(w, h, fill, bg, radius=self._ss(7)), fg=fg, bg=bg)
+        lbl.bind("<Enter>", lambda e: paint(True))
+        lbl.bind("<Leave>", lambda e: paint(False))
+        lbl.bind("<Button-1>", lambda e: cmd())
+        paint()
+        return lbl
 
-        def _enter(_e): caret.config(fg=M.TEXT); lbl.config(fg=M.TEXT)
-        def _leave(_e): caret.config(fg=M.MUTED); lbl.config(fg=M.MUTED)
-        for w in (caret, lbl):
-            w.bind("<Button-1>", _toggle)
-            w.bind("<Enter>", _enter)
-            w.bind("<Leave>", _leave)
-        return card
+    def _entry(self, var, width):
+        e = tk.Entry(self.set_cv, textvariable=var, bg=M.BG3, fg=M.TEXT, insertbackground=M.TEXT,
+                     relief="flat", font=self._f(M.FS_BODY), width=width)
+        self._focus_ring(e)
+        return e
 
+    def _sync_settings_switches(self):
+        for s in getattr(self, "_switches", []):
+            s.sync()
+
+    # ── Spec helpers ─────────────────────────────────────────────
+    def _switch_ctl(self, get, toggle):
+        sw = _Switch(self, get, toggle)
+        self.__dict__.setdefault("_switches", []).append(sw)
+        return sw
+
+    def _set_text_changed(self, slot):
+        cv = getattr(self, "set_cv", None)
+        if cv is None or slot.item is None:
+            return
+        try:
+            before = cv.bbox(slot.item)
+            cv.itemconfigure(slot.item, text=slot.cget("text"),
+                             fill=slot.cget("fg") or M.TEXT2)
+            after = cv.bbox(slot.item)
+        except tk.TclError:
+            return
+        if not before or not after or (before[3] - before[1]) != (after[3] - after[1]) \
+                or (after[2] - after[0]) > (before[2] - before[0]) + 4:
+            self._set_relayout_soon()
+
+    def _set_relayout_soon(self):
+        self._schedule("setrender", 30, self._set_render)
+
+    # ── Rendering ────────────────────────────────────────────────
+    def _set_render(self):
+        cv = getattr(self, "set_cv", None)
+        if cv is None:
+            return
+        W = cv.winfo_width()
+        if W < 120:
+            return
+        top = cv.canvasy(0)
+        cv.delete("all")
+        cv.page_widgets = []
+        S = self._ss
+        x0, x1 = S(2), W - S(2)
+        y = S(18)
+        for spec in self._set_spec:
+            y = getattr(self, "_set_draw_" + spec[0])(cv, x0, x1, y, *spec[1:])
+        total = y + S(28)
+        self._set_total = total
+        cv.config(scrollregion=(0, 0, W, total))
+        self._set_scroll_to(top, animate=False)
+
+    def _set_draw_title(self, cv, x0, x1, y, title, sub):
+        S = self._ss
+        t = cv.create_text(x0, y, anchor="nw", text=title, fill=M.TEXT,
+                           font=self._f(M.FS_HERO + 4, True))
+        y = cv.bbox(t)[3]
+        s = cv.create_text(x0, y, anchor="nw", text=sub, fill=M.MUTED, font=self._f(M.FS_SMALL))
+        return cv.bbox(s)[3] + S(4)
+
+    def _set_draw_section(self, cv, x0, x1, y, title, sub=None):
+        S = self._ss
+        y += S(22)
+        t = cv.create_text(x0, y, anchor="nw", text=title, fill=M.TEXT,
+                           font=self._f(M.FS_LARGE + 1, True))
+        y = cv.bbox(t)[3]
+        if sub:
+            s = cv.create_text(x0, y, anchor="nw", text=sub, fill=M.MUTED,
+                               font=self._f(M.FS_SMALL), width=x1 - x0)
+            y = cv.bbox(s)[3]
+        return y + S(8)
+
+    def _set_draw_card(self, cv, x0, x1, y, rows):
+        S = self._ss
+        top = y
+        pad, vpad = S(16), S(12)
+        first = True
+        tag = f"card{top}"
+        for row in rows:
+            if not first and not row.get("nodiv"):
+                cv.create_line(x0 + pad, y, x1, y, fill=M.BORDER)
+            first = False
+            kind = row.get("kind", "row")
+            if kind == "row":
+                y += self._set_draw_row(cv, x0 + pad, x1 - pad, y, row, vpad)
+            elif kind == "full":
+                w = row["widget"]
+                y += row.get("top", 0)
+                w.draw(cv, x0 + pad, y, width=x1 - x0 - 2 * pad)
+                y += w.size()[1] + row.get("bottom", vpad)
+            elif kind == "extra":
+                y += row["draw"](cv, x0 + pad, x1 - pad, y)
+        bottom = y
+        self._set_card_bg(cv, x0, top, x1, bottom, tag)
+        return bottom
+
+    def _set_card_bg(self, cv, x0, y0, x1, y1, tag):
+        r = self._ss(10)
+        b = M.BORDER
+        ids = [
+            cv.create_rectangle(x0 + r, y0, x1 - r, y1, fill=M.BG2, outline="", tags=(tag,)),
+            cv.create_rectangle(x0, y0 + r, x1, y1 - r, fill=M.BG2, outline="", tags=(tag,)),
+            cv.create_image(x0, y0, anchor="nw", image=self._corner(r, 0), tags=(tag,)),
+            cv.create_image(x1, y0, anchor="ne", image=self._corner(r, 1), tags=(tag,)),
+            cv.create_image(x0, y1, anchor="sw", image=self._corner(r, 2), tags=(tag,)),
+            cv.create_image(x1, y1, anchor="se", image=self._corner(r, 3), tags=(tag,)),
+            cv.create_line(x0 + r, y0, x1 - r, y0, fill=b, tags=(tag,)),
+            cv.create_line(x0 + r, y1 - 1, x1 - r, y1 - 1, fill=b, tags=(tag,)),
+            cv.create_line(x0, y0 + r, x0, y1 - r, fill=b, tags=(tag,)),
+            cv.create_line(x1 - 1, y0 + r, x1 - 1, y1 - r, fill=b, tags=(tag,)),
+        ]
+        for i in ids:
+            cv.tag_lower(i)
+
+    def _set_draw_row(self, cv, x0, x1, y, row, vpad):
+        S = self._ss
+        ctl = row.get("ctl")
+        cw, ch = ctl.size() if ctl else (0, 0)
+        tw = max(S(80), (x1 - x0) - (cw + S(16) if ctl else 0))
+        tag = f"row{y}"
+        t = cv.create_text(x0, y + vpad, anchor="nw", text=row["title"], fill=M.TEXT,
+                           font=self._f(M.FS_BODY), width=tw, tags=(tag,))
+        th = cv.bbox(t)[3] - (y + vpad)
+        if row.get("desc"):
+            d = cv.create_text(x0, y + vpad + th + S(1), anchor="nw", text=row["desc"],
+                               fill=M.MUTED, font=self._f(M.FS_SMALL), width=tw, tags=(tag,))
+            th = cv.bbox(d)[3] - (y + vpad)
+        h = max(th, ch) + 2 * vpad
+        if ctl:
+            ctl.draw(cv, x1 - cw, y + (h - ch) // 2)
+            if isinstance(ctl, _Switch):
+                # The whole row toggles, like a native settings list.
+                self._set_bind(tag, ctl.click)
+        return h
+
+    # ── Scrolling ────────────────────────────────────────────────
+    def _set_scroll_to(self, y, animate=True):
+        """Glide the view's top edge to y pixels. Wheel notches extend the
+        same glide instead of restarting it."""
+        cv = self.set_cv
+        total = max(1, getattr(self, "_set_total", 1))
+        view = cv.winfo_height()
+        maxy = max(0, total - view)
+        y = max(0.0, min(float(maxy), float(y)))
+        self._set_target = y
+        if not animate or not M.ANIMATIONS_ENABLED:
+            cv.yview_moveto(y / total)
+            self._set_draw_thumb()
+            return
+        if getattr(self, "_set_gliding", False):
+            return
+        self._set_gliding = True
+        self._set_embeds(False)
+
+        def step():
+            cur = cv.canvasy(0)
+            diff = self._set_target - cur
+            if abs(diff) < 1.0:
+                cv.yview_moveto(self._set_target / total)
+                self._set_gliding = False
+                self._set_draw_thumb()
+                self._set_embeds(True)
+                return
+            cv.yview_moveto((cur + diff * 0.25) / total)
+            self._set_draw_thumb()
+            self._schedule("setscroll", 15, step)
+        step()
+
+    def _set_embeds(self, show):
+        """Swap the real input widgets for their drawn stand-ins (see _Widget)."""
+        cv = self.set_cv
+        for wd in getattr(cv, "page_widgets", []):
+            try:
+                if not show:
+                    cv.itemconfigure(wd.ph, text=wd.snapshot())
+                cv.itemconfigure(wd.win, state="normal" if show else "hidden")
+            except tk.TclError:
+                pass
+
+    def _set_scroll_by(self, dy):
+        base = self._set_target if getattr(self, "_set_gliding", False) else self.set_cv.canvasy(0)
+        self._set_scroll_to(base + dy)
+
+    def _set_draw_thumb(self):
+        sb = getattr(self, "_set_sb", None)
+        if sb is None:
+            return
+        try:
+            total = max(1, getattr(self, "_set_total", 1))
+            view = max(1, self.set_cv.winfo_height())
+            h = sb.winfo_height()
+            top = self.set_cv.canvasy(0)
+        except tk.TclError:
+            return
+        sb.delete("all")
+        if total <= view:
+            return
+        th = max(self._ss(28), h * view / total)
+        ty = (h - th) * (top / max(1, total - view))
+        w = self._ss(4) if not getattr(self, "_set_sb_hot", False) else self._ss(6)
+        x = (sb.winfo_width() - w) // 2
+        col = M.MUTED if getattr(self, "_set_sb_hot", False) else M.BG4
+        self._rounded_rect(sb, x, ty, x + w, ty + th, w // 2, fill=col, outline="")
+
+    # ── Build ────────────────────────────────────────────────────
     def _build_settings(self):
         p = tk.Frame(self._container, bg=M.BG); self._pages["SETTINGS"] = p
-
-        container = tk.Frame(p, bg=M.BG); container.pack(fill="both", expand=True, padx=14, pady=(10,14))
-        self._set_vsb = self._scrollbar(container)
-        self.set_cv = tk.Canvas(container, bg=M.BG, highlightthickness=0, yscrollcommand=self._set_vsb.set)
+        S = self._ss
+        area = tk.Frame(p, bg=M.BG)
+        area.pack(fill="both", expand=True, padx=(S(20), S(6)), pady=(0, S(4)))
+        # The scrollbar is packed first and never unpacked, so the content
+        # width can't change while the page scrolls.
+        self._set_sb = tk.Canvas(area, width=S(12), bg=M.BG, highlightthickness=0, bd=0)
+        self._set_sb.pack(side="right", fill="y", padx=(S(6), 0))
+        self.set_cv = tk.Canvas(area, bg=M.BG, highlightthickness=0, bd=0,
+                                yscrollincrement=1, confine=True)
         self.set_cv.pack(side="left", fill="both", expand=True)
-        self._set_vsb.config(command=self.set_cv.yview)
+        cv = self.set_cv
+        self._set_total = 1
+        self._set_target = 0.0
+        self._switches = []
 
-        outer = tk.Frame(self.set_cv, bg=M.BG)
-        self._set_hw = self.set_cv.create_window((0,0), window=outer, anchor="nw")
-
-        def _update_set_scroll(e=None):
-            self.set_cv.configure(scrollregion=self.set_cv.bbox("all"))
-            if outer.winfo_reqheight() > self.set_cv.winfo_height():
-                self._set_vsb.pack(side="right", fill="y")
-                self._set_scroll_enabled = True
+        last_w = {"w": 0}
+        def _cfg(e):
+            if e.width != last_w["w"]:
+                last_w["w"] = e.width
+                self._set_render()
             else:
-                self._set_vsb.pack_forget()
-                self.set_cv.yview_moveto(0)
-                self._set_scroll_enabled = False
-        # Exposed so the collapsible-section helper can re-measure after a
-        # section is folded/unfolded.
-        self._recalc_set_scroll = _update_set_scroll
+                self._set_scroll_to(cv.canvasy(0), animate=False)
+        cv.bind("<Configure>", _cfg)
 
-        outer.bind("<Configure>", _update_set_scroll)
-        self.set_cv.bind("<Configure>",
-            lambda e: (self.set_cv.itemconfig(self._set_hw, width=e.width), _update_set_scroll()))
+        def _wheel(e):
+            if self._cur_page != "SETTINGS":
+                return
+            if e.widget is getattr(self, "log_txt", None):
+                return          # the log scrolls itself
+            self._set_scroll_by(-(e.delta / 120.0) * S(84))
+        cv.bind_all("<MouseWheel>", _wheel, add="+")
 
-        # ONE wheel handler for the whole page instead of binding it onto every
-        # widget in the tree (the old approach did a recursive bind over ~150
-        # widgets at build time). It only scrolls while Settings is the visible
-        # page, so it never fights the History page's own wheel binding.
-        def _on_mousewheel(e):
-            if self._cur_page == "SETTINGS" and getattr(self, "_set_scroll_enabled", False):
-                self.set_cv.yview_scroll(int(-1*(e.delta/120)), "units")
-        self.set_cv.bind_all("<MouseWheel>", _on_mousewheel, add="+")
+        sb = self._set_sb
+        def _sb_hot(v):
+            self._set_sb_hot = v
+            self._set_draw_thumb()
+        sb.bind("<Enter>", lambda e: _sb_hot(True))
+        sb.bind("<Leave>", lambda e: _sb_hot(False))
+        sb.bind("<Configure>", lambda e: self._set_draw_thumb())
+        def _sb_drag(e):
+            view = cv.winfo_height()
+            frac = max(0.0, min(1.0, e.y / max(1, sb.winfo_height())))
+            self._set_scroll_to(frac * max(0, self._set_total - view), animate=False)
+        sb.bind("<Button-1>", _sb_drag)
+        sb.bind("<B1-Motion>", _sb_drag)
 
-        # Per-section collapse state, remembered across launches.
-        self._collapsed_sections = set(
-            s for s in M._cfg_get("ui", "collapsed_sections", "").split(",") if s)
+        T = lambda text="", fg=None: _Text(self, text, fg)
+        spec = [("title", "Settings", "Changes save as you make them.")]
 
-        # ── Section: Session Stats ─────────────────────────────────
-        stats_card = self._collapsible(outer, "Listening stats", "stats")
-        inner_s = tk.Frame(stats_card, bg=M.BG2); inner_s.pack(fill="x", padx=14, pady=10)
-        self.lbl_stats_songs = tk.Label(inner_s, text="Songs played:  0",
-                                        fg=M.TEXT2, bg=M.BG2, font=self._f(9), anchor="w")
-        self.lbl_stats_songs.pack(fill="x")
-        self.lbl_stats_time = tk.Label(inner_s, text="Listening time:  0m 0s",
-                                       fg=M.TEXT2, bg=M.BG2, font=self._f(9), anchor="w")
-        self.lbl_stats_time.pack(fill="x", pady=(4,0))
-        # From the history database, so they survive restarts.
-        self.lbl_stats_week = tk.Label(inner_s, text="", fg=M.TEXT2, bg=M.BG2,
-                                       font=self._f(9), anchor="w", justify="left")
-        self.lbl_stats_week.pack(fill="x", pady=(10,0))
-        self.lbl_stats_all = tk.Label(inner_s, text="", fg=M.TEXT2, bg=M.BG2,
-                                      font=self._f(9), anchor="w", justify="left")
-        self.lbl_stats_all.pack(fill="x", pady=(4,0))
-        self._refresh_stats()
+        # ── Listening ──────────────────────────────────────────────
+        self.lbl_stats_songs = T("0", M.TEXT)
+        self.lbl_stats_time = T("0m 0s", M.TEXT)
+        self.lbl_stats_week = T("", M.TEXT2)
+        self.lbl_stats_all = T("", M.TEXT2)
 
-        # ── Section: Behaviour (tray + blacklist + per-track offset) ─
-        beh_card = self._collapsible(outer, "Behaviour", "behaviour")
-        inner_b  = tk.Frame(beh_card, bg=M.BG2); inner_b.pack(fill="x", padx=14, pady=10)
+        def _stats(cv, x0, x1, y):
+            """2x2 grid of big numbers, then top artists for both periods as
+            ranked lists with a bar each."""
+            col_w = (x1 - x0) // 2
+            big, cap = self._f(M.FS_HERO + 3, True), self._f(M.FS_SMALL)
+            data = getattr(self, "_stats_data", None)
 
-        # Close-to-tray toggle (#12)
-        row_ct = tk.Frame(inner_b, bg=M.BG2); row_ct.pack(fill="x", pady=(0,6))
-        self._ct_btn = tk.Label(row_ct, text="", fg=M.ACCENT_FG, bg=M.ACCENT,
-                                font=self._f(M.FS_MICRO, True), cursor="hand2",
-                                padx=M.SP_MD, pady=M.SP_XS)
-        self._ct_btn.pack(side="right")
-        tk.Label(row_ct, text="Close hides to tray", fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(M.FS_BODY), anchor="w").pack(side="left", fill="x", expand=True)
+            def tile(x, yy, value, caption, slot=None):
+                v = cv.create_text(x, yy, anchor="nw", text=value, fill=M.TEXT, font=big)
+                if slot is not None:
+                    slot.item = v
+                c = cv.create_text(x, cv.bbox(v)[3], anchor="nw", text=caption, fill=M.MUTED,
+                                   font=cap, width=col_w - S(12))
+                return cv.bbox(c)[3]
 
-        def _paint_ct():
-            on = M.CLOSE_TO_TRAY
-            self._ct_btn.config(text="On" if on else "Off",
-                                bg=M.ACCENT if on else M.BG3,
-                                fg=M.ACCENT_FG if on else M.MUTED)
-        def _toggle_ct(_e=None):
-            M.CLOSE_TO_TRAY = not M.CLOSE_TO_TRAY
-            M._cfg_set("preferences", "close_to_tray", str(M.CLOSE_TO_TRAY).lower())
-            _paint_ct()
-            if M.CLOSE_TO_TRAY and not getattr(self, "_tray", None):
-                M.log("Note: pystray not installed — close will minimise instead")
-        self._ct_btn.bind("<Button-1>", _toggle_ct)
-        _paint_ct()
+            def hm(ms):
+                h, m = divmod(int(ms // 60000), 60)
+                return f"{h}h {m}m" if h else f"{m}m"
 
-        # Per-track lyric offset (#13)
-        row_to = tk.Frame(inner_b, bg=M.BG2); row_to.pack(fill="x", pady=(0,6))
-        self.lbl_track_off = tk.Label(row_to, text="global", fg=M.MUTED, bg=M.BG2,
-                                      font=self._f(M.FS_SMALL))
+            yy = y + S(14)
+            b1 = tile(x0, yy, self.lbl_stats_songs.cget("text"), "songs this session",
+                      self.lbl_stats_songs)
+            b2 = tile(x0 + col_w, yy, self.lbl_stats_time.cget("text"), "listened this session",
+                      self.lbl_stats_time)
+            yy = max(b1, b2) + S(14)
+            if not data:
+                cv.create_line(x0, yy, x1 + S(16), yy, fill=M.BORDER)
+                self.lbl_stats_week.item = cv.create_text(
+                    x0, yy + S(12), anchor="nw", text=self.lbl_stats_week.cget("text"),
+                    fill=M.TEXT2, font=self._f(M.FS_BODY), width=x1 - x0)
+                self.lbl_stats_all.item = None
+                return cv.bbox(self.lbl_stats_week.item)[3] + S(16) - y
+            wk, al = data["week"], data["all"]
+            cv.create_line(x0, yy, x1 + S(16), yy, fill=M.BORDER)
+            yy += S(14)
+            b1 = tile(x0, yy, f"{wk['plays']:,}", f"plays in the last 7 days · {hm(wk['listened_ms'])}")
+            b2 = tile(x0 + col_w, yy, f"{al['plays']:,}", f"plays all time · {hm(al['listened_ms'])}")
+            self.lbl_stats_week.item = self.lbl_stats_all.item = None
+            yy = max(b1, b2) + S(14)
 
+            if not (wk["top_artists"] or al["top_artists"]):
+                return yy - y
+            cv.create_line(x0, yy, x1 + S(16), yy, fill=M.BORDER)
+            yy += S(14)
+            body = self._f(M.FS_BODY)
+            small_b = self._f(M.FS_SMALL, True)
+            bottom = yy
+            for k, (title, d) in enumerate((("Top artists · 7 days", wk), ("Top artists · all time", al))):
+                x = x0 + k * col_w
+                w = col_w - S(18)
+                t = cv.create_text(x, yy, anchor="nw", text=title, fill=M.MUTED, font=small_b)
+                ry = cv.bbox(t)[3] + S(8)
+                tops = d["top_artists"]
+                if not tops:
+                    cv.create_text(x, ry, anchor="nw", text="Nothing yet", fill=M.MUTED, font=body)
+                    bottom = max(bottom, ry + S(20))
+                    continue
+                most = max(n for _, n in tops) or 1
+                for rank, (name, n) in enumerate(tops, 1):
+                    cnt = f"{n}"
+                    cw = small_b.measure(cnt)
+                    label = f"{rank}. {name}"
+                    room = w - cw - S(10)
+                    while label and body.measure(label) > room:
+                        label = label[:-2] + "…" if len(label) > 2 else ""
+                    cv.create_text(x, ry, anchor="nw", text=label,
+                                   fill=M.TEXT if rank == 1 else M.TEXT2, font=body)
+                    cv.create_text(x + w, ry, anchor="ne", text=cnt, fill=M.MUTED, font=small_b)
+                    by = ry + body.metrics("linespace") + S(3)
+                    cv.create_rectangle(x, by, x + w, by + S(3), fill=M.BG3, outline="")
+                    cv.create_rectangle(x, by, x + max(S(3), int(w * n / most)), by + S(3),
+                                        fill=M.ACCENT, outline="")
+                    ry = by + S(10)
+                bottom = max(bottom, ry)
+            return bottom + S(6) - y
+        spec += [("section", "Listening"), ("card", [{"kind": "extra", "draw": _stats}])]
+
+        # ── Lyrics ─────────────────────────────────────────────────
+        self.lbl_lyric_size = T()
+        def _paint_lf():
+            b = M.LYRIC_FONT_BOOST
+            self.lbl_lyric_size.config(text="Default" if b == 0 else f"{b:+d}",
+                                       fg=M.ACCENT if b else M.TEXT2)
+        def _nudge_lf(delta):
+            M.LYRIC_FONT_BOOST = max(-2, min(10, M.LYRIC_FONT_BOOST + delta))
+            M._cfg_set_soon("preferences", "lyric_font_boost", str(M.LYRIC_FONT_BOOST))
+            try:
+                self._np_relayout()
+            except AttributeError:
+                pass
+            _paint_lf()
+        _paint_lf()
+
+        self.lbl_track_off = T()
         def _nudge_track_offset(delta):
             uri = getattr(M.state, "track_uri", "")
             if not uri:
@@ -159,262 +800,166 @@ class SettingsPage:
                 return
             M._set_track_offset_ms(uri, M._track_offset_ms(uri) + delta)
             self._refresh_track_offset()
-        def _clear_track_offset(_e=None):
+        def _clear_track_offset():
             uri = getattr(M.state, "track_uri", "")
             if uri:
                 M._set_track_offset_ms(uri, None)
                 self._refresh_track_offset()
-
-        # side="right" stacks right-to-left, so iterate in reverse to get
-        # "RESET  −250  value  +250" reading order on screen.
-        b_clr = tk.Label(row_to, text="Reset", fg=M.MUTED, bg=M.BG3,
-                         font=self._f(M.FS_MICRO, True), cursor="hand2",
-                         padx=M.SP_SM, pady=M.SP_XS)
-        b_clr.pack(side="right", padx=(M.SP_XS, 0))
-        b_clr.bind("<Button-1>", _clear_track_offset)
-        for label, delta in (("+250", 250), ("−250", -250)):
-            b = tk.Label(row_to, text=label, fg=M.TEXT, bg=M.BG3,
-                         font=self._f(M.FS_MICRO, True), cursor="hand2",
-                         padx=M.SP_SM, pady=M.SP_XS)
-            b.pack(side="right", padx=(M.SP_XS, 0))
-            b.bind("<Button-1>", lambda e, d=delta: _nudge_track_offset(d))
-        self.lbl_track_off.pack(side="right", padx=(M.SP_SM, M.SP_XS))
-        tk.Label(row_to, text="Offset for this track", fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(M.FS_BODY), anchor="w").pack(side="left", fill="x", expand=True)
         self._refresh_track_offset()
 
-        # Always on top
-        row_top = tk.Frame(inner_b, bg=M.BG2); row_top.pack(fill="x", pady=(0, M.SP_XS + 2))
-        self._top_set_btn = tk.Label(row_top, text="", fg=M.MUTED, bg=M.BG3,
-                                     font=self._f(M.FS_MICRO, True), cursor="hand2",
-                                     padx=M.SP_MD, pady=M.SP_XS)
-        self._top_set_btn.pack(side="right")
-        tk.Label(row_top, text="Always on top  ·  Ctrl+T", fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(M.FS_BODY), anchor="w").pack(side="left", fill="x", expand=True)
+        def _toggle_lrclib():
+            M.LRCLIB_ENABLED = not M.LRCLIB_ENABLED
+            M._cfg_set("preferences", "lrclib_fallback", str(M.LRCLIB_ENABLED).lower())
 
-        def _paint_top_set():
-            self._top_set_btn.config(text="On" if M.ALWAYS_ON_TOP else "Off",
-                                     bg=M.ACCENT if M.ALWAYS_ON_TOP else M.BG3,
-                                     fg=M.ACCENT_FG if M.ALWAYS_ON_TOP else M.MUTED)
-        self._top_set_btn.bind("<Button-1>",
-                               lambda e: (self._toggle_topmost(), _paint_top_set()))
-        _paint_top_set()
+        spec += [("section", "Lyrics"), ("card", [
+            {"title": "Text size", "desc": "Size of the lines on the Lyrics page.",
+             "ctl": _Buttons(self, ("btn", "A−", lambda: _nudge_lf(-1), "secondary"),
+                             ("value", self.lbl_lyric_size, 64),
+                             ("btn", "A+", lambda: _nudge_lf(1), "secondary"))},
+            {"title": "Offset for this track",
+             "desc": "Shifts the timing of the song that's playing. The global delay is on the Lyrics page.",
+             "ctl": _Buttons(self, ("btn", "−250", lambda: _nudge_track_offset(-250), "secondary"),
+                             ("value", self.lbl_track_off, 64),
+                             ("btn", "+250", lambda: _nudge_track_offset(250), "secondary"),
+                             ("btn", "Reset", _clear_track_offset, "ghost"))},
+            {"title": "Search LRCLIB as a fallback",
+             "desc": "Used only when Spicy Lyrics and Spotify have nothing for a track.",
+             "ctl": self._switch_ctl(lambda: M.LRCLIB_ENABLED, _toggle_lrclib)},
+        ])]
 
-        # Start minimised to tray
-        row_sm = tk.Frame(inner_b, bg=M.BG2); row_sm.pack(fill="x", pady=(0, M.SP_XS + 2))
-        sm_btn = tk.Label(row_sm, text="", fg=M.MUTED, bg=M.BG3,
-                          font=self._f(M.FS_MICRO, True), cursor="hand2",
-                          padx=M.SP_MD, pady=M.SP_XS)
-        sm_btn.pack(side="right")
-        tk.Label(row_sm, text="Start minimised to tray", fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(M.FS_BODY), anchor="w").pack(side="left", fill="x", expand=True)
+        # ── Appearance ─────────────────────────────────────────────
+        self._theme_seg = _Segmented(self, [("Dark", "dark"), ("Light", "light")],
+                                     lambda: "dark" if M._DARK_MODE else "light", self._set_theme)
 
-        def _paint_sm():
-            sm_btn.config(text="On" if M.START_MINIMIZED else "Off",
-                          bg=M.ACCENT if M.START_MINIMIZED else M.BG3,
-                          fg=M.ACCENT_FG if M.START_MINIMIZED else M.MUTED)
-        def _toggle_sm(_e=None):
-            M.START_MINIMIZED = not M.START_MINIMIZED
-            M._cfg_set("preferences", "start_minimized", str(M.START_MINIMIZED).lower())
-            _paint_sm()
-        sm_btn.bind("<Button-1>", _toggle_sm)
-        _paint_sm()
-
-        # Lyric font size
-        row_lf = tk.Frame(inner_b, bg=M.BG2); row_lf.pack(fill="x", pady=(0, M.SP_XS + 2))
-        self.lbl_lyric_size = tk.Label(row_lf, text="", fg=M.MUTED, bg=M.BG2,
-                                       font=self._f(M.FS_SMALL))
-
-        def _paint_lf():
-            self.lbl_lyric_size.config(
-                text=("default" if M.LYRIC_FONT_BOOST == 0 else f"{M.LYRIC_FONT_BOOST:+d}"),
-                fg=M.ACCENT if M.LYRIC_FONT_BOOST else M.MUTED)
-        def _nudge_lf(delta):
-            M.LYRIC_FONT_BOOST = max(-2, min(10, M.LYRIC_FONT_BOOST + delta))
-            # Debounced: A+/A− can be tapped rapidly; coalesce the disk writes.
-            M._cfg_set_soon("preferences", "lyric_font_boost", str(M.LYRIC_FONT_BOOST))
-            try:
-                self.lbl_lyric.config(font=self._lyric_font())
-            except (AttributeError, tk.TclError):
-                pass
-            _paint_lf()
-        for lbl, d in (("A+", 1), ("A−", -1)):
-            b = tk.Label(row_lf, text=lbl, fg=M.TEXT, bg=M.BG3, font=self._f(M.FS_MICRO, True),
-                         cursor="hand2", padx=M.SP_SM + 2, pady=M.SP_XS)
-            b.pack(side="right", padx=(M.SP_XS, 0))
-            b.bind("<Button-1>", lambda e, dd=d: _nudge_lf(dd))
-        self.lbl_lyric_size.pack(side="right", padx=(M.SP_SM, M.SP_XS))
-        tk.Label(row_lf, text="Lyric text size", fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(M.FS_BODY), anchor="w").pack(side="left", fill="x", expand=True)
-        _paint_lf()
-
-        # Discord diagnostics
-        row_dx = tk.Frame(inner_b, bg=M.BG2); row_dx.pack(fill="x", pady=(M.SP_XS, M.SP_XS + 2))
-        for lbl, cmd in (("Reconnect", self._reconnect_rpc), ("Test", self._test_presence)):
-            b = tk.Label(row_dx, text=lbl, fg=M.TEXT2, bg=M.BG3, font=self._f(M.FS_MICRO, True),
-                         cursor="hand2", padx=M.SP_MD, pady=M.SP_XS)
-            b.pack(side="right", padx=(M.SP_SM, 0))
-            b.bind("<Button-1>", lambda e, c=cmd: c())
-            self._hoverable(b, fg=lambda: M.TEXT2, hover_fg=lambda: M.ACCENT, bg=lambda: M.BG3, hover_bg=lambda: M.ACCENT_SOFT)
-        tk.Label(row_dx, text="Discord", fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(M.FS_BODY), anchor="w").pack(side="left", fill="x", expand=True)
-
-        # Blacklist (#16)
-        tk.Label(inner_b, text="Blacklist — one term per line; matches artist or title",
-                 fg=M.MUTED, bg=M.BG2, font=self._f(7), anchor="w").pack(fill="x", pady=(4,2))
-        # width=1 is deliberate. A tk.Text defaults to 80 columns, and pack()
-        # will not shrink a widget below its requested size — so the default
-        # forced the entire settings frame far wider than the 520 px window and
-        # pushed every right-aligned control off the visible area. width=1 lets
-        # fill="x" decide the real width.
-        self._bl_txt = tk.Text(inner_b, bg=M.BG3, fg=M.TEXT, font=self._f(M.FS_SMALL),
-                               height=4, width=1,
-                               relief="flat", wrap="word", padx=6, pady=4,
-                               insertbackground=M.TEXT)
-        self._focus_ring(self._bl_txt)
-        self._bl_txt.pack(fill="x")
-        self._bl_txt.insert("1.0", "\n".join(M._BLACKLIST))
-
-        def _save_blacklist(_e=None):
-            raw = self._bl_txt.get("1.0", "end").strip()
-            # configparser can't hold raw newlines in a value, so store them
-            # escaped and unescape on load.
-            M._cfg_set_soon("preferences", "blacklist", raw.replace("\n", "\\n"))
-            M._BLACKLIST = M._load_blacklist()
-            M.state.blacklisted = M._is_blacklisted(
-                getattr(M.state, "artist", ""), getattr(M.state, "title", ""))
-        # Auto-save: debounce while typing, and flush on focus-out — no button.
-        self._bl_txt.bind("<KeyRelease>",
-                          lambda e: self._schedule("blsave", 700, _save_blacklist))
-        self._bl_txt.bind("<FocusOut>", _save_blacklist)
-        tk.Label(inner_b, text="saves automatically", fg=M.MUTED, bg=M.BG2,
-                 font=self._f(7)).pack(anchor="e", pady=(3,0))
-
-        # ── Section: Appearance ────────────────────────────────────
-        appear_card = self._collapsible(outer, "Appearance", "appearance")
-        inner_a = tk.Frame(appear_card, bg=M.BG2); inner_a.pack(fill="x", padx=14, pady=10)
-
-        # Dark/Light toggle — custom pill buttons (no ugly Tk radio circles)
-        row_dm = tk.Frame(inner_a, bg=M.BG2); row_dm.pack(fill="x", pady=(0,6))
-        tk.Label(row_dm, text="Theme", fg=M.TEXT2, bg=M.BG2, font=self._f(9), anchor="w").pack(side="left")
-
-        self._theme_btns = {}  # "dark"/"light" → Label widget
-        pill_frame = tk.Frame(row_dm, bg=M.BG3); pill_frame.pack(side="right")
-
-        for label_text, key in [("Dark", "dark"), ("Light", "light")]:
-            is_active = (key == "dark") == M._DARK_MODE
-            b = tk.Label(pill_frame, text=label_text,
-                         fg=M.TEXT if is_active else M.MUTED,
-                         bg=M.BG3 if not is_active else M.BG2,
-                         font=self._f(9, True),
-                         cursor="hand2", padx=10, pady=4)
-            b.pack(side="left")
-            b.bind("<Button-1>", lambda e, k=key: self._set_theme(k))
-            # Like the tabs, these are stateful: on <Leave> fade back to the
-            # colour the pill's own selected/unselected state calls for, not
-            # to a fixed resting colour.
-            b.bind("<Enter>", lambda e, w=b: self._fade_colors(
-                f"hover:{w}", w, 110, fg=M.ACCENT))
-            b.bind("<Leave>", lambda e, w=b, k=key: self._fade_colors(
-                f"hover:{w}", w, 110,
-                fg=M.TEXT if (k == "dark") == M._DARK_MODE else M.MUTED))
-            self._theme_btns[key] = b
-
-        # Accent color picker
-        row_ac = tk.Frame(inner_a, bg=M.BG2); row_ac.pack(fill="x")
-        tk.Label(row_ac, text="Accent color", fg=M.TEXT2, bg=M.BG2, font=self._f(9), anchor="w").pack(side="left")
-        self._accent_swatch = tk.Label(row_ac, bg=M.ACCENT, width=5, height=1,
-                                       cursor="hand2", relief="groove", bd=2)
-        self._accent_swatch.pack(side="right")
-        self._accent_swatch.bind("<Button-1>", self._pick_accent)
-        self._accent_swatch.bind("<Enter>", lambda e: self._accent_swatch.config(relief="solid"))
-        self._accent_swatch.bind("<Leave>", lambda e: self._accent_swatch.config(relief="groove"))
-
-        # Album tint: the lyric sheet takes its colours from the cover.
-        row_at = tk.Frame(inner_a, bg=M.BG2); row_at.pack(fill="x", pady=(M.SP_SM, 0))
-        self._tint_btn = tk.Label(row_at, text="", fg=M.MUTED, bg=M.BG3,
-                                  font=self._f(M.FS_MICRO, True), cursor="hand2",
-                                  padx=M.SP_MD, pady=M.SP_XS)
-        self._tint_btn.pack(side="right")
-        tk.Label(row_at, text="Colour the window from the album art", fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(M.FS_BODY), anchor="w").pack(side="left", fill="x", expand=True)
-
-        def _paint_tint():
-            on = M.ALBUM_TINT
-            self._tint_btn.config(text="On" if on else "Off",
-                                  bg=M.ACCENT if on else M.BG3,
-                                  fg=M.ACCENT_FG if on else M.MUTED)
-        def _toggle_tint(_e=None):
+        def _toggle_tint():
             M.ALBUM_TINT = not M.ALBUM_TINT
             M._cfg_set("preferences", "album_tint", str(M.ALBUM_TINT).lower())
             self._repaint_everything()
-            _paint_tint()
-        self._tint_btn.bind("<Button-1>", _toggle_tint)
-        self._paint_album_tint_btn = _paint_tint
-        _paint_tint()
-
-        # Motion toggle. Animation is an accessibility question before it is a
-        # taste one, and it doubles as the escape hatch on hardware where the
-        # 30 fps progress bar is not free. Turning it off degrades every
-        # transition to the instant snap this UI used to do — nothing becomes
-        # unreachable or invisible.
-        row_an = tk.Frame(inner_a, bg=M.BG2); row_an.pack(fill="x", pady=(M.SP_SM, 0))
-        self._anim_btn = tk.Label(row_an, text="", fg=M.MUTED, bg=M.BG3,
-                                  font=self._f(M.FS_MICRO, True), cursor="hand2",
-                                  padx=M.SP_MD, pady=M.SP_XS)
-        self._anim_btn.pack(side="right")
-        tk.Label(row_an, text="Smooth animations", fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(M.FS_BODY), anchor="w").pack(side="left", fill="x", expand=True)
-
-        def _paint_anim():
-            on = M.ANIMATIONS_ENABLED
-            self._anim_btn.config(text="On" if on else "Off",
-                                  bg=M.ACCENT if on else M.BG3,
-                                  fg=M.ACCENT_FG if on else M.MUTED)
-        def _toggle_anim(_e=None):
+        def _toggle_anim():
             M.ANIMATIONS_ENABLED = not M.ANIMATIONS_ENABLED
             M._cfg_set("preferences", "animations", str(M.ANIMATIONS_ENABLED).lower())
-            _paint_anim()
-            # The progress tick reads the flag when it re-arms, so switching
-            # off takes effect within one frame rather than one track.
             M.log(f"Smooth animations {'enabled' if M.ANIMATIONS_ENABLED else 'disabled'}")
-        self._anim_btn.bind("<Button-1>", _toggle_anim)
-        _paint_anim()
+        def _set_quality(q):
+            M.RENDER_QUALITY = q
+            M._cfg_set("preferences", "render_quality", q)
+            # Auto starts measuring afresh.
+            self._np_auto_tier, self._np_frames, self._np_cost = 0, 0, None
+            self._np_fluid_cache = None
+        spec += [("section", "Appearance"), ("card", [
+            {"title": "Theme", "ctl": self._theme_seg},
+            {"title": "Colours from the album art",
+             "desc": "The window and the moving background take their colours from the cover.",
+             "ctl": self._switch_ctl(lambda: M.ALBUM_TINT, _toggle_tint)},
+            {"title": "Accent colour", "desc": "Used when album colours are off.",
+             "ctl": _Swatch(self, self._pick_accent)},
+            {"title": "Motion",
+             "desc": "Moving background, gliding lyrics and animated controls. "
+                     "Turn off to save CPU or reduce motion.",
+             "ctl": self._switch_ctl(lambda: M.ANIMATIONS_ENABLED, _toggle_anim)},
+            {"title": "Performance",
+             "desc": "Auto measures how long each frame takes and eases off on slower PCs. "
+                     "Fast keeps the background still.",
+             "ctl": _Segmented(self, [("Auto", "auto"), ("Smooth", "high"), ("Fast", "low")],
+                               lambda: M.RENDER_QUALITY, _set_quality)},
+        ])]
 
-        # ── Section: Hotkeys ───────────────────────────────────────
-        hotkey_card = self._collapsible(outer, "Global hotkeys", "hotkeys")
-        inner_h = tk.Frame(hotkey_card, bg=M.BG2); inner_h.pack(fill="x", padx=14, pady=10)
+        # ── Window ─────────────────────────────────────────────────
+        def _toggle_ct():
+            M.CLOSE_TO_TRAY = not M.CLOSE_TO_TRAY
+            M._cfg_set("preferences", "close_to_tray", str(M.CLOSE_TO_TRAY).lower())
+            if M.CLOSE_TO_TRAY and not getattr(self, "_tray", None):
+                M.log("Note: pystray not installed — close will minimise instead")
+        def _toggle_sm():
+            M.START_MINIMIZED = not M.START_MINIMIZED
+            M._cfg_set("preferences", "start_minimized", str(M.START_MINIMIZED).lower())
+        self._startup_on = M._get_startup_enabled()
+        def _toggle_startup():
+            self._startup_on = not self._startup_on
+            M._set_startup_enabled(self._startup_on)
+        spec += [("section", "Window and startup"), ("card", [
+            {"title": "Always on top", "desc": "Ctrl+T",
+             "ctl": self._switch_ctl(lambda: M.ALWAYS_ON_TOP, lambda: self._toggle_topmost())},
+            {"title": "Close to the tray",
+             "desc": "Closing the window keeps Statusify and your Discord status running.",
+             "ctl": self._switch_ctl(lambda: M.CLOSE_TO_TRAY, _toggle_ct)},
+            {"title": "Start minimised to the tray",
+             "ctl": self._switch_ctl(lambda: M.START_MINIMIZED, _toggle_sm)},
+            {"title": "Launch when Windows starts",
+             "ctl": self._switch_ctl(lambda: self._startup_on, _toggle_startup)},
+            {"title": "Window position", "desc": "Move the window back to the centre of the screen.",
+             "ctl": _Buttons(self, ("btn", "Centre", lambda: self._center(force=True), "secondary"))},
+            {"title": "Desktop shortcut",
+             "ctl": _Buttons(self, ("btn", "Create", self._do_shortcut, "secondary"))},
+        ])]
 
+        # ── Discord ────────────────────────────────────────────────
+        rpc = M._rpc_mod
+        def _toggle_paused_rpc():
+            M.SHOW_PAUSED_RPC = not M.SHOW_PAUSED_RPC
+            M._cfg_set("preferences", "show_paused_rpc", str(M.SHOW_PAUSED_RPC).lower())
+            M.log(f'Paused RPC {"enabled" if M.SHOW_PAUSED_RPC else "disabled"}')
+        def _toggle_status_song():
+            on = rpc.status_display_type != rpc.STATUS_DISPLAY_DETAILS
+            rpc.status_display_type = rpc.STATUS_DISPLAY_DETAILS if on else rpc.STATUS_DISPLAY_NAME
+            M._cfg_set("preferences", "status_shows_song", str(on).lower())
+        def _toggle_link():
+            rpc.link_track = not rpc.link_track
+            M._cfg_set("preferences", "link_track", str(rpc.link_track).lower())
+
+        self._instr_var = tk.StringVar(value=M.INSTRUMENTAL_TEXT)
+        ent_it = self._entry(self._instr_var, 20)
+        def _save_instr(_e=None):
+            M.INSTRUMENTAL_TEXT = self._instr_var.get() or "🎵 ─ ─ ─ ─ ─ ─ ─ ─ ─ 🎵"
+            M._cfg_set_soon("preferences", "instrumental_text", M.INSTRUMENTAL_TEXT)
+        ent_it.bind("<Return>", _save_instr)
+        ent_it.bind("<FocusOut>", _save_instr)
+
+        self._prof_lb = tk.Listbox(cv, bg=M.BG3, fg=M.TEXT2, selectbackground=M.ACCENT,
+                                   selectforeground=M.ACCENT_FG, relief="flat", font=self._f(M.FS_BODY),
+                                   height=3, activestyle="none", bd=0, highlightthickness=0)
+        self._load_profiles()
+
+        def _prof_buttons(cv, x0, x1, y):
+            h = S(28)
+            f = self._f(M.FS_SMALL, True)
+            x = x0
+            for text, cmd in (("Add…", self._add_profile), ("Switch to selected", self._switch_profile)):
+                w = f.measure(text) + S(24)
+                self._set_button(cv, x, y, w, h, text, cmd)
+                x += w + S(6)
+            w = f.measure("Delete") + S(24)
+            self._set_button(cv, x1 - w, y, w, h, "Delete", self._del_profile, "ghost")
+            return h + S(14)
+
+        spec += [("section", "Discord"), ("card", [
+            {"title": "Connection", "desc": "Reconnect if your status stopped updating.",
+             "ctl": _Buttons(self, ("btn", "Test", self._test_presence, "secondary"),
+                             ("btn", "Reconnect", self._reconnect_rpc, "secondary"))},
+            {"title": "Show when paused", "desc": 'Keep the status up with a "Paused" state.',
+             "ctl": self._switch_ctl(lambda: M.SHOW_PAUSED_RPC, _toggle_paused_rpc)},
+            {"title": "Song in the member list",
+             "desc": "Show the song under your name instead of the app name.",
+             "ctl": self._switch_ctl(lambda: rpc.status_display_type == rpc.STATUS_DISPLAY_DETAILS,
+                                     _toggle_status_song)},
+            {"title": "Link the song to Spotify", "desc": "Clicking the title opens the track.",
+             "ctl": self._switch_ctl(lambda: rpc.link_track, _toggle_link)},
+            {"title": "Instrumental text", "desc": "Shown on Discord between sung lines.",
+             "ctl": _Widget(ent_it, height=S(28))},
+            {"title": "App profiles", "desc": "Save several Discord App IDs and switch between them."},
+            {"kind": "full", "widget": _Widget(self._prof_lb), "nodiv": True, "bottom": S(8)},
+            {"kind": "extra", "draw": _prof_buttons, "nodiv": True},
+        ])]
+
+        # ── Hotkeys ────────────────────────────────────────────────
+        hk_rows = []
         if not M.KEYBOARD_AVAILABLE:
-            tk.Label(inner_h, text="Global hotkeys are unavailable on this system.",
-                     fg=M.MUTED, bg=M.BG2, font=self._f(8), justify="left").pack(anchor="w")
+            hk_rows.append({"title": "Unavailable", "desc": "Global hotkeys aren't supported on this system."})
         else:
-            # Skip track
-            row_sk = tk.Frame(inner_h, bg=M.BG2); row_sk.pack(fill="x", pady=(0,4))
-            tk.Label(row_sk, text="Skip track", fg=M.TEXT2, bg=M.BG2, font=self._f(9), width=14, anchor="w").pack(side="left")
             self._skip_var = tk.StringVar(value=M._hotkey_skip_combo)
-            ent_sk = tk.Entry(row_sk, textvariable=self._skip_var, bg=M.BG3, fg=M.TEXT,
-                              insertbackground=M.TEXT, relief="flat", font=self._f(9), width=18)
-            self._focus_ring(ent_sk); ent_sk.pack(side="left", padx=(M.SP_XS,0))
-
-            # Skip instrumental
-            row_si = tk.Frame(inner_h, bg=M.BG2); row_si.pack(fill="x", pady=(0,4))
-            tk.Label(row_si, text="Skip instrumental", fg=M.TEXT2, bg=M.BG2, font=self._f(9), width=14, anchor="w").pack(side="left")
             self._skip_instr_var = tk.StringVar(value=M._hotkey_skip_instr_combo)
-            ent_si = tk.Entry(row_si, textvariable=self._skip_instr_var, bg=M.BG3, fg=M.TEXT,
-                              insertbackground=M.TEXT, relief="flat", font=self._f(9), width=18)
-            self._focus_ring(ent_si); ent_si.pack(side="left", padx=(M.SP_XS,0))
-
-            # Toggle RPC
-            row_tg = tk.Frame(inner_h, bg=M.BG2); row_tg.pack(fill="x", pady=(0,4))
-            tk.Label(row_tg, text="Toggle RPC", fg=M.TEXT2, bg=M.BG2, font=self._f(9), width=14, anchor="w").pack(side="left")
             self._toggle_var = tk.StringVar(value=M._hotkey_toggle_combo)
-            ent_tg = tk.Entry(row_tg, textvariable=self._toggle_var, bg=M.BG3, fg=M.TEXT,
-                              insertbackground=M.TEXT, relief="flat", font=self._f(9), width=18)
-            self._focus_ring(ent_tg); ent_tg.pack(side="left", padx=(M.SP_XS,0))
 
             def _save_hotkeys():
-                # _register_hotkeys replaces the whole set, releasing the old combos.
                 M._hotkey_skip_combo       = self._skip_var.get().strip()
                 M._hotkey_toggle_combo     = self._toggle_var.get().strip()
                 M._hotkey_skip_instr_combo = self._skip_instr_var.get().strip()
@@ -423,394 +968,306 @@ class SettingsPage:
                 M._cfg_set("preferences", "hotkey_skip_instr", M._hotkey_skip_instr_combo)
                 M._register_hotkeys(self)
                 M.log("Hotkeys saved & re-registered")
+            for title, var in (("Skip track", self._skip_var),
+                               ("Skip instrumental", self._skip_instr_var),
+                               ("Pause Discord status", self._toggle_var)):
+                e = self._entry(var, 18)
+                e.bind("<Return>", lambda ev: _save_hotkeys())
+                e.bind("<FocusOut>", lambda ev: _save_hotkeys())
+                hk_rows.append({"title": title, "ctl": _Widget(e, height=S(28))})
+        spec += [("section", "Global hotkeys",
+                  "Work while other apps have focus. Saved when you press Enter or click away."),
+                 ("card", hk_rows)]
 
-            # Auto-save when you finish editing a field (Enter or focus-out),
-            # rather than on a separate SAVE click. Saving per-keystroke would
-            # try to register half-typed combos, so we wait for the edit to end.
-            for _ent in (ent_sk, ent_si, ent_tg):
-                _ent.bind("<Return>",   lambda e: _save_hotkeys())
-                _ent.bind("<FocusOut>", lambda e: _save_hotkeys())
-            tk.Label(inner_h, text="saves on Enter / when you click away",
-                     fg=M.MUTED, bg=M.BG2, font=self._f(7)).pack(anchor="e", pady=(4,0))
-
-        # ── Section: Startup ───────────────────────────────────────
-        sys_card = self._collapsible(outer, "System", "system")
-        inner_sy = tk.Frame(sys_card, bg=M.BG2); inner_sy.pack(fill="x", padx=14, pady=10)
-
-        row_su = tk.Frame(inner_sy, bg=M.BG2); row_su.pack(fill="x")
-        tk.Label(row_su, text="Launch at Windows startup", fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(9), anchor="w").pack(side="left")
-        self._startup_var = tk.BooleanVar(value=M._get_startup_enabled())
-        def _toggle_startup():
-            M._set_startup_enabled(self._startup_var.get())
-        tk.Checkbutton(row_su, variable=self._startup_var, bg=M.BG2, activebackground=M.BG2,
-                       selectcolor=M.BG3, command=_toggle_startup).pack(side="right")
-
-        row_sh = tk.Frame(inner_sy, bg=M.BG2); row_sh.pack(fill="x", pady=(6,0))
-        tk.Label(row_sh, text="Remember history", fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(9), anchor="w").pack(side="left")
-        self._save_hist_var = tk.BooleanVar(value=M.SAVE_HISTORY)
+        # ── History & privacy ──────────────────────────────────────
         def _toggle_save_hist():
-            M.SAVE_HISTORY = self._save_hist_var.get()
+            M.SAVE_HISTORY = not M.SAVE_HISTORY
             M._cfg_set("preferences", "save_history", str(M.SAVE_HISTORY).lower())
             M.log(f'Session history {"enabled" if M.SAVE_HISTORY else "disabled"}')
-        tk.Checkbutton(row_sh, variable=self._save_hist_var, bg=M.BG2, activebackground=M.BG2,
-                       selectcolor=M.BG3, command=_toggle_save_hist).pack(side="right")
+        self._bl_txt = tk.Text(cv, bg=M.BG3, fg=M.TEXT, font=self._f(M.FS_BODY), height=4, width=1,
+                               relief="flat", wrap="word", padx=S(8), pady=S(6),
+                               insertbackground=M.TEXT)
+        self._focus_ring(self._bl_txt)
+        self._bl_txt.insert("1.0", "\n".join(M._BLACKLIST))
 
-        # Window position reset
-        row_wp = tk.Frame(inner_sy, bg=M.BG2); row_wp.pack(fill="x", pady=(6,0))
-        tk.Label(row_wp, text="Reset window position", fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(9), anchor="w").pack(side="left")
-        rst_pos = tk.Label(row_wp, text="Center", fg=M.MUTED, bg=M.BG2,
-                           font=self._f(7,True), cursor="hand2")
-        rst_pos.pack(side="right")
-        rst_pos.bind("<Button-1>", lambda e: self._center(force=True))
-        self._hoverable(rst_pos, fg=lambda: M.MUTED, hover_fg=lambda: M.ACCENT)
+        def _save_blacklist(_e=None):
+            raw = self._bl_txt.get("1.0", "end").strip()
+            M._cfg_set_soon("preferences", "blacklist", raw.replace("\n", "\\n"))
+            M._BLACKLIST = M._load_blacklist()
+            M.state.blacklisted = M._is_blacklisted(
+                getattr(M.state, "artist", ""), getattr(M.state, "title", ""))
+        self._bl_txt.bind("<KeyRelease>", lambda e: self._schedule("blsave", 700, _save_blacklist))
+        self._bl_txt.bind("<FocusOut>", _save_blacklist)
+        spec += [("section", "History and privacy"), ("card", [
+            {"title": "Remember history", "desc": "Keep plays and lyrics between sessions.",
+             "ctl": self._switch_ctl(lambda: M.SAVE_HISTORY, _toggle_save_hist)},
+            {"title": "Blacklist",
+             "desc": "Songs whose artist or title contains one of these terms never show on "
+                     "Discord. One term per line."},
+            {"kind": "full", "widget": _Widget(self._bl_txt), "nodiv": True},
+        ])]
 
-        # ── Section: Discord RPC Behaviour ────────────────────────
-        rpc_card = self._collapsible(outer, "Discord RPC behaviour", "rpc")
-        inner_rpc = tk.Frame(rpc_card, bg=M.BG2); inner_rpc.pack(fill="x", padx=14, pady=10)
-
-        # Feature 7 — paused state toggle
-        row_ps = tk.Frame(inner_rpc, bg=M.BG2); row_ps.pack(fill="x", pady=(0,6))
-        tk.Label(row_ps, text='Show "Paused" on Discord', fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(9), anchor="w").pack(side="left")
-        self._paused_var = tk.BooleanVar(value=M.SHOW_PAUSED_RPC)
-        def _toggle_paused_rpc():
-            M.SHOW_PAUSED_RPC = self._paused_var.get()
-            M._cfg_set("preferences", "show_paused_rpc", str(M.SHOW_PAUSED_RPC).lower())
-            M.log(f'Paused RPC {"enabled" if M.SHOW_PAUSED_RPC else "disabled"}')
-        tk.Checkbutton(row_ps, variable=self._paused_var, bg=M.BG2, activebackground=M.BG2,
-                       selectcolor=M.BG3, command=_toggle_paused_rpc).pack(side="right")
-
-        # Member-list text and track link (statusify_rpc). Both apply from
-        # the next presence update; no reconnect needed.
-        row_sd = tk.Frame(inner_rpc, bg=M.BG2); row_sd.pack(fill="x", pady=(0,6))
-        tk.Label(row_sd, text='Member list shows the song, not the app name', fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(9), anchor="w").pack(side="left")
-        self._status_song_var = tk.BooleanVar(
-            value=M._rpc_mod.status_display_type == M._rpc_mod.STATUS_DISPLAY_DETAILS)
-        def _toggle_status_song():
-            on = self._status_song_var.get()
-            M._rpc_mod.status_display_type = (M._rpc_mod.STATUS_DISPLAY_DETAILS if on
-                                            else M._rpc_mod.STATUS_DISPLAY_NAME)
-            M._cfg_set("preferences", "status_shows_song", str(on).lower())
-        tk.Checkbutton(row_sd, variable=self._status_song_var, bg=M.BG2, activebackground=M.BG2,
-                       selectcolor=M.BG3, command=_toggle_status_song).pack(side="right")
-
-        row_lk = tk.Frame(inner_rpc, bg=M.BG2); row_lk.pack(fill="x", pady=(0,6))
-        tk.Label(row_lk, text='Song title links to Spotify', fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(9), anchor="w").pack(side="left")
-        self._link_var = tk.BooleanVar(value=M._rpc_mod.link_track)
-        def _toggle_link():
-            M._rpc_mod.link_track = self._link_var.get()
-            M._cfg_set("preferences", "link_track", str(M._rpc_mod.link_track).lower())
-        tk.Checkbutton(row_lk, variable=self._link_var, bg=M.BG2, activebackground=M.BG2,
-                       selectcolor=M.BG3, command=_toggle_link).pack(side="right")
-
-        row_lr = tk.Frame(inner_rpc, bg=M.BG2); row_lr.pack(fill="x", pady=(0,6))
-        tk.Label(row_lr, text='Try LRCLIB when Spicy and Spotify have no lyrics', fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(9), anchor="w").pack(side="left")
-        self._lrclib_var = tk.BooleanVar(value=M.LRCLIB_ENABLED)
-        def _toggle_lrclib():
-            M.LRCLIB_ENABLED = self._lrclib_var.get()
-            M._cfg_set("preferences", "lrclib_fallback", str(M.LRCLIB_ENABLED).lower())
-        tk.Checkbutton(row_lr, variable=self._lrclib_var, bg=M.BG2, activebackground=M.BG2,
-                       selectcolor=M.BG3, command=_toggle_lrclib).pack(side="right")
-
-        # Feature 5 — custom instrumental text
-        row_it = tk.Frame(inner_rpc, bg=M.BG2); row_it.pack(fill="x")
-        tk.Label(row_it, text="Instrumental text", fg=M.TEXT2, bg=M.BG2,
-                 font=self._f(9), anchor="w").pack(anchor="w")
-        row_it2 = tk.Frame(inner_rpc, bg=M.BG2); row_it2.pack(fill="x", pady=(2,0))
-        self._instr_var = tk.StringVar(value=M.INSTRUMENTAL_TEXT)
-        ent_it = tk.Entry(row_it2, textvariable=self._instr_var, bg=M.BG3, fg=M.TEXT,
-                          insertbackground=M.TEXT, relief="flat", font=self._f(9))
-        self._focus_ring(ent_it)
-        ent_it.pack(side="left", fill="x", expand=True, padx=(0, M.SP_SM))
-        def _save_instr(_e=None):
-            M.INSTRUMENTAL_TEXT = self._instr_var.get() or "🎵 ─ ─ ─ ─ ─ ─ ─ ─ ─ 🎵"
-            M._cfg_set_soon("preferences", "instrumental_text", M.INSTRUMENTAL_TEXT)
-        # Auto-save on Enter / focus-out instead of a SAVE click.
-        ent_it.bind("<Return>",   _save_instr)
-        ent_it.bind("<FocusOut>", _save_instr)
-        tk.Label(row_it2, text="auto", fg=M.MUTED, bg=M.BG2,
-                 font=self._f(7)).pack(side="left")
-        # ── Section: Discord Profiles ──────────────────────────────
-        prof_card = self._collapsible(outer, "Discord profiles", "profiles")
-        inner_pr = tk.Frame(prof_card, bg=M.BG2); inner_pr.pack(fill="x", padx=14, pady=10)
-
-        tk.Label(inner_pr, text="Save multiple App IDs and switch between them.",
-                 fg=M.MUTED, bg=M.BG2, font=self._f(8), anchor="w").pack(anchor="w", pady=(0,6))
-
-        # Profile listbox
-        lb_frame = tk.Frame(inner_pr, bg=M.BG2); lb_frame.pack(fill="x")
-        self._prof_lb = tk.Listbox(lb_frame, bg=M.BG3, fg=M.TEXT2,
-                                   selectbackground=M.ACCENT, selectforeground=M.ACCENT_FG,
-                                   relief="flat", font=self._f(9), height=4,
-                                   activestyle="none", bd=0)
-        self._prof_lb.pack(fill="x")
-
-        def _load_profiles():
-            self._prof_lb.delete(0, "end")
-            cfg = M._load_config()
-            if not cfg.has_section("profiles"):
-                cfg.add_section("profiles")
-            for name, app_id in cfg.items("profiles"):
-                marker = " ✓" if app_id == M.DISCORD_APP_ID else ""
-                self._prof_lb.insert("end", f"{name}{marker}  —  {app_id}")
-        _load_profiles()
-
-        btn_row = tk.Frame(inner_pr, bg=M.BG2); btn_row.pack(fill="x", pady=(6,0))
-
-        def _mk_btn(parent, txt, cmd):
-            b = tk.Label(parent, text=txt, fg=M.MUTED, bg=M.BG2,
-                         font=self._f(7,True), cursor="hand2", padx=8)
-            b.pack(side="left", padx=(0,6))
-            b.bind("<Button-1>", lambda e: cmd())
-            self._hoverable(b, fg=lambda: M.MUTED, hover_fg=lambda: M.ACCENT)
-            return b
-
-        def _add_profile():
-            dlg = tk.Toplevel(self.win); dlg.title("Add Profile")
-            dlg.configure(bg=M.BG); dlg.resizable(False, False)
-            dlg.geometry("340x200")
-            dlg.transient(self.win); dlg.grab_set()
-
-            tk.Label(dlg, text="Profile name:", fg=M.TEXT2, bg=M.BG, font=self._f(9)).pack(pady=(12,2))
-            nv = tk.StringVar()
-            ent_n = tk.Entry(dlg, textvariable=nv, bg=M.BG2, fg=M.TEXT, insertbackground=M.TEXT,
-                             relief="flat", font=self._f(9))
-            self._focus_ring(ent_n)
-            ent_n.pack(fill="x", padx=20)
-            ent_n.focus_set()
-
-            tk.Label(dlg, text="App ID:", fg=M.TEXT2, bg=M.BG, font=self._f(9)).pack(pady=(8,2))
-            av = tk.StringVar()
-            self._focus_ring(
-                tk.Entry(dlg, textvariable=av, bg=M.BG2, fg=M.TEXT, insertbackground=M.TEXT,
-                         relief="flat", font=self._f(9))).pack(fill="x", padx=20)
-
-            err = tk.Label(dlg, text="", fg=M.DANGER, bg=M.BG, font=self._f(M.FS_MICRO),
-                           wraplength=300, justify="center")
-            err.pack(pady=(4,0))
-
-            def _ok():
-                n = nv.get().strip(); a = av.get().strip()
-                if not n or not a:
-                    err.config(text="Both a name and an App ID are required")
-                    return
-                # Profile names become configparser option keys, so anything
-                # the INI grammar treats as a delimiter has to go.
-                if any(ch in n for ch in "=:[]\n"):
-                    err.config(text="Name cannot contain  =  :  [  ]")
-                    return
-                if not a.isdigit() or len(a) < 16:
-                    err.config(text="App ID must be a long numeric ID")
-                    return
-                M._cfg_set("profiles", n, a)
-                _load_profiles()
-                M.log(f"Profile saved  ·  {n}")
-                dlg.destroy()
-
-            # Keep a real reference to the button. This used to be an
-            # unassigned tk.Label reached back through dlg.children["!label4"],
-            # which is not even the SAVE label's auto-generated name — the
-            # lookup raised KeyError every time the dialog opened and the
-            # button was simply dead. Only the Return key ever worked.
-            save_btn = tk.Label(dlg, text="Save", fg=M.ACCENT_FG, bg=M.ACCENT,
-                                font=self._f(M.FS_MICRO, True), cursor="hand2",
-                                padx=M.SP_MD, pady=M.SP_XS + 1)
-            save_btn.pack(pady=(8,0))
-            save_btn.bind("<Button-1>", lambda e: _ok())
-            dlg.bind("<Return>", lambda e: _ok())
-            dlg.bind("<Escape>", lambda e: dlg.destroy())
-
-        def _del_profile():
-            sel = self._prof_lb.curselection()
-            if not sel: return
-            text = self._prof_lb.get(sel[0])
-            name = text.split(" ✓")[0].split("  —  ")[0].strip()
-            cfg = M._load_config()
-            if cfg.has_option("profiles", name):
-                cfg.remove_option("profiles", name)
-                M._save_config(cfg)
-            _load_profiles()
-
-        def _switch_profile():
-            sel = self._prof_lb.curselection()
-            if not sel: return
-            text = self._prof_lb.get(sel[0])
-            # Parse: "name [✓]  —  app_id"
-            parts = text.split("  —  ")
-            if len(parts) < 2: return
-            new_id = parts[-1].strip()
-            M.DISCORD_APP_ID = new_id
-            M._cfg_set("preferences", "discord_app_id_active", new_id)
-            # Update .env
-            try:
-                lines = open(M._ENV_PATH, encoding="utf-8").readlines()
-                with open(M._ENV_PATH, "w", encoding="utf-8") as f:
-                    written = False
-                    for ln in lines:
-                        if ln.startswith("DISCORD_APP_ID="):
-                            f.write(f"DISCORD_APP_ID={new_id}\n"); written = True
-                        else:
-                            f.write(ln)
-                    if not written:
-                        f.write(f"DISCORD_APP_ID={new_id}\n")
-            except Exception: pass
-            _load_profiles()
-            M.log(f"Switched Discord profile to: {new_id}")
-
-        _mk_btn(btn_row, "Add",    _add_profile)
-        _mk_btn(btn_row, "Delete", _del_profile)
-        _mk_btn(btn_row, "Switch", _switch_profile)
-
-        # Desktop shortcut. This used to open a SECOND settings card, also
-        # headed "SYSTEM" — two identically-titled sections on one page, with
-        # the startup/history toggles in one and this in the other. It belongs
-        # in the existing SYSTEM card (inner_sy), so it is packed there.
-        _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-        def _do_shortcut():
-            app_dir  = M._APP_DIR
-
-            if M._FROZEN:
-                # A release build needs no launcher shim: the exe the user
-                # downloaded is already the thing a shortcut should point at,
-                # and it embeds its own icon. Running build_launcher.ps1 here
-                # would try to compile a Python launcher for a machine that
-                # need not have Python at all.
-                exe_path = sys.executable
-                ico_path = sys.executable
-            else:
-                exe_path = os.path.join(app_dir, "Statusify.exe")
-                ico_path = os.path.join(M._RES_DIR, "statusify.ico")
-
-                if not os.path.exists(exe_path):
-                    self._log("Building Statusify.exe…")
-                    try:
-                        subprocess.run(
-                            ["powershell.exe", "-NoProfile", "-NonInteractive",
-                             "-ExecutionPolicy", "Bypass", "-File", "build_launcher.ps1"],
-                            cwd=app_dir, check=True, capture_output=True,
-                            timeout=120, creationflags=_NO_WINDOW)
-                    except Exception as e:
-                        self._log(f"Build failed: {e}")
-                        self._set_error(f"Could not build Statusify.exe: {e}")
-                        return
-
-                if not os.path.exists(exe_path):
-                    self._log("Build reported success but Statusify.exe is missing")
-                    return
-
-            desk = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
-            lnk  = os.path.join(desk, "Statusify.lnk")
-            ps = (f"$s=(New-Object -COM WScript.Shell).CreateShortcut('{lnk}');"
-                  f"$s.TargetPath='{exe_path}';$s.WorkingDirectory='{app_dir}';"
-                  f"$s.IconLocation='{ico_path}';$s.Save()")
-            try:
-                subprocess.run(
-                    ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
-                    check=True, capture_output=True, timeout=30,
-                    creationflags=_NO_WINDOW)
-                self._log("Shortcut created on Desktop")
-            except Exception as e:
-                self._log(f"Shortcut failed: {e}")
-                self._set_error(f"Could not create shortcut: {e}")
-
-        row_sc = tk.Frame(inner_sy, bg=M.BG2); row_sc.pack(fill="x", pady=(6,0))
-        tk.Label(row_sc, text="Desktop shortcut", fg=M.TEXT2, bg=M.BG2, font=self._f(9), anchor="w").pack(side="left")
-        btn_sc = tk.Label(row_sc, text="Create shortcut", fg=M.ACCENT_FG, bg=M.ACCENT, 
-                          font=self._f(7,True), cursor="hand2", padx=10, pady=4)
-        btn_sc.pack(side="right")
-        btn_sc.bind("<Button-1>", lambda e: _do_shortcut())
-
-        # ── Section: Log ──────────────────────────────────────────
-        # Moved off the lyric sheet: diagnostics are for when something is
-        # wrong, not something to watch while listening.
-        log_card = self._collapsible(outer, "Log", "log")
-        lf = tk.Frame(log_card, bg=M.BG2); lf.pack(fill="x", padx=14, pady=10)
-        self.log_txt = tk.Text(lf, bg=M.BG2, fg=M.TEXT2, height=12,
-                               font=M.tkfont.Font(family="Consolas", size=8),
-                               relief="flat", state="disabled", wrap="word", padx=8, pady=6)
-        self.log_txt.pack(fill="x")
+        # ── Diagnostics ────────────────────────────────────────────
+        self.log_txt = tk.Text(cv, bg=M.BG3, fg=M.TEXT2, height=12, width=1,
+                               font=M.tkfont.Font(family="Consolas", size=9),
+                               relief="flat", state="disabled", wrap="word", padx=S(10), pady=S(8))
         for tag, col in [("g", M.ACCENT), ("m", M.MUTED), ("y", M.WARN), ("ts", M.MUTED)]:
             self.log_txt.tag_config(tag, foreground=col)
+        self.log_txt.bind("<MouseWheel>",
+                          lambda e: (self.log_txt.yview_scroll(int(-e.delta / 40), "units"), "break")[1])
+        self._log_shown = "log" not in set(M._cfg_get("ui", "collapsed_sections", "log").split(","))
 
-        # Wheel scrolling is handled by a single page-level binding set up at
-        # the top of this method — no per-widget binding needed.
-        self._recalc_set_scroll()
+        def _toggle_log():
+            self._log_shown = not self._log_shown
+            M._cfg_set_soon("ui", "collapsed_sections", "" if self._log_shown else "log")
+            log_card[:] = _log_rows()
+            self._set_render()
+            if self._log_shown:
+                self.log_txt.see("end")
 
+        def _log_rows():
+            rows = [{"title": "Log", "desc": "What Statusify has been doing. Useful when something's wrong.",
+                     "ctl": _Buttons(self, ("btn", "Hide" if self._log_shown else "Show",
+                                            _toggle_log, "secondary"))}]
+            if self._log_shown:
+                rows.append({"kind": "full", "widget": _Widget(self.log_txt), "nodiv": True})
+            return rows
+        log_card = _log_rows()
+        spec += [("section", "Diagnostics"), ("card", log_card)]
+
+        self._set_spec = spec
+        self._refresh_stats()
+        self._refresh_long_stats(sync=True)
+        self._set_render()
+
+    # ── Profiles ─────────────────────────────────────────────────
+    def _load_profiles(self):
+        self._prof_lb.delete(0, "end")
+        cfg = M._load_config()
+        if not cfg.has_section("profiles"):
+            cfg.add_section("profiles")
+        items = cfg.items("profiles")
+        for name, app_id in items:
+            marker = "  ✓" if app_id == M.DISCORD_APP_ID else ""
+            self._prof_lb.insert("end", f"{name}{marker}  —  {app_id}")
+        if not items:
+            self._prof_lb.insert("end", "No saved profiles")
+            self._prof_lb.itemconfig(0, fg=M.MUTED)
+
+    def _add_profile(self):
+        S = self._ss
+        dlg = tk.Toplevel(self.win); dlg.title("Add profile")
+        dlg.configure(bg=M.BG); dlg.resizable(False, False)
+        dlg.transient(self.win); dlg.grab_set()
+        body = tk.Frame(dlg, bg=M.BG); body.pack(fill="both", expand=True, padx=S(20), pady=S(18))
+        tk.Label(body, text="Add a Discord profile", fg=M.TEXT, bg=M.BG,
+                 font=self._f(M.FS_LARGE + 1, True), anchor="w").pack(fill="x", pady=(0, S(10)))
+        nv, av = tk.StringVar(), tk.StringVar()
+        for label, var in (("Name", nv), ("Application ID", av)):
+            tk.Label(body, text=label, fg=M.TEXT2, bg=M.BG, font=self._f(M.FS_SMALL),
+                     anchor="w").pack(fill="x", pady=(S(6), S(2)))
+            e = tk.Entry(body, textvariable=var, bg=M.BG2, fg=M.TEXT, insertbackground=M.TEXT,
+                         relief="flat", font=self._f(M.FS_BODY), width=34)
+            self._focus_ring(e); e.pack(fill="x", ipady=S(4))
+            if var is nv:
+                e.focus_set()
+        err = tk.Label(body, text="", fg=M.DANGER, bg=M.BG, font=self._f(M.FS_SMALL),
+                       anchor="w", justify="left", wraplength=S(300))
+        err.pack(fill="x", pady=(S(6), 0))
+
+        def _ok():
+            n = nv.get().strip(); a = av.get().strip()
+            if not n or not a:
+                err.config(text="Both a name and an App ID are required"); return
+            if any(ch in n for ch in "=:[]\n"):
+                err.config(text="Name cannot contain  =  :  [  ]"); return
+            if not a.isdigit() or len(a) < 16:
+                err.config(text="App ID must be a long numeric ID"); return
+            M._cfg_set("profiles", n, a)
+            self._load_profiles()
+            M.log(f"Profile saved  ·  {n}")
+            dlg.destroy()
+        btns = tk.Frame(body, bg=M.BG); btns.pack(fill="x", pady=(S(12), 0))
+        self._wbutton(btns, "Save", _ok, kind="primary").pack(side="right")
+        self._wbutton(btns, "Cancel", dlg.destroy, kind="ghost").pack(side="right", padx=(0, S(6)))
+        dlg.bind("<Return>", lambda e: _ok())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+    def _selected_profile(self):
+        sel = self._prof_lb.curselection()
+        if not sel:
+            return None, None
+        parts = self._prof_lb.get(sel[0]).split("  —  ")
+        if len(parts) < 2:
+            return None, None
+        return parts[0].replace("✓", "").strip(), parts[-1].strip()
+
+    def _del_profile(self):
+        name, _ = self._selected_profile()
+        if not name:
+            return
+        cfg = M._load_config()
+        if cfg.has_option("profiles", name):
+            cfg.remove_option("profiles", name)
+            M._save_config(cfg)
+        self._load_profiles()
+
+    def _switch_profile(self):
+        _, new_id = self._selected_profile()
+        if not new_id:
+            return
+        M.DISCORD_APP_ID = new_id
+        M._cfg_set("preferences", "discord_app_id_active", new_id)
+        try:
+            lines = open(M._ENV_PATH, encoding="utf-8").readlines()
+            with open(M._ENV_PATH, "w", encoding="utf-8") as f:
+                written = False
+                for ln in lines:
+                    if ln.startswith("DISCORD_APP_ID="):
+                        f.write(f"DISCORD_APP_ID={new_id}\n"); written = True
+                    else:
+                        f.write(ln)
+                if not written:
+                    f.write(f"DISCORD_APP_ID={new_id}\n")
+        except Exception:
+            pass
+        self._load_profiles()
+        M.log(f"Switched Discord profile to: {new_id}")
+
+    # ── Desktop shortcut ─────────────────────────────────────────
+    def _do_shortcut(self):
+        _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        app_dir = M._APP_DIR
+        if M._FROZEN:
+            # A release build is already the thing a shortcut should point at.
+            exe_path = sys.executable
+            ico_path = sys.executable
+        else:
+            exe_path = os.path.join(app_dir, "Statusify.exe")
+            ico_path = os.path.join(M._RES_DIR, "statusify.ico")
+            if not os.path.exists(exe_path):
+                self._log("Building Statusify.exe…")
+                try:
+                    subprocess.run(
+                        ["powershell.exe", "-NoProfile", "-NonInteractive",
+                         "-ExecutionPolicy", "Bypass", "-File", "build_launcher.ps1"],
+                        cwd=app_dir, check=True, capture_output=True,
+                        timeout=120, creationflags=_NO_WINDOW)
+                except Exception as e:
+                    self._log(f"Build failed: {e}")
+                    self._set_error(f"Could not build Statusify.exe: {e}")
+                    return
+            if not os.path.exists(exe_path):
+                self._log("Build reported success but Statusify.exe is missing")
+                return
+        desk = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+        lnk = os.path.join(desk, "Statusify.lnk")
+        ps = (f"$s=(New-Object -COM WScript.Shell).CreateShortcut('{lnk}');"
+              f"$s.TargetPath='{exe_path}';$s.WorkingDirectory='{app_dir}';"
+              f"$s.IconLocation='{ico_path}';$s.Save()")
+        try:
+            subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           check=True, capture_output=True, timeout=30, creationflags=_NO_WINDOW)
+            self._log("Shortcut created on Desktop")
+        except Exception as e:
+            self._log(f"Shortcut failed: {e}")
+            self._set_error(f"Could not create shortcut: {e}")
+
+    # ── Stats ────────────────────────────────────────────────────
     def _refresh_stats(self, reschedule=True):
         """Update session stats labels.
 
-        FREEZE BUG (fixed): this method re-armed itself with after(5000, ...)
-        on EVERY call, but it is also called directly — once from
-        _build_settings() and again for every ("stats",) event drained in
-        _poll() (emitted on every track start / pause / resume). Each of those
-        direct calls spawned an ADDITIONAL self-perpetuating 5 s timer chain
-        that was never cancelled, so the number of concurrent chains grew
-        monotonically for the whole session. After a few hours there were
-        thousands of chains firing, each one appending a row to health.csv from
-        the Tk thread — the main loop ended up doing nothing but disk I/O, the
-        window stopped repainting/responding, and the event queue backed up
-        (observed: 8000+ pending events, a 17 GB health.csv), while the asyncio
-        backend thread happily kept the Discord RPC alive. Hence "GUI frozen,
-        RPC still working".
-
-        Fix: cancel any pending timer before arming a new one, so there is at
-        most ONE chain, and let event-driven refreshes pass reschedule=False.
-        """
+        Named timer slot: this is called both by its own 5 s timer and on
+        every ("stats",) event. Raw after() here once spawned a new chain per
+        event, thousands after a few hours (the 1.1.5 freeze). Event-driven
+        callers pass reschedule=False."""
         M._health_snapshot()
         total_secs = int(M._get_listen_time())
         mins, secs = divmod(total_secs, 60)
-        hrs, mins  = divmod(mins, 60)
-        if hrs:
-            tstr = f"{hrs}h {mins}m {secs}s"
-        else:
-            tstr = f"{mins}m {secs}s"
+        hrs, mins = divmod(mins, 60)
+        tstr = f"{hrs}h {mins}m" if hrs else f"{mins}m {secs}s"
         if hasattr(self, "lbl_stats_songs"):
-            self.lbl_stats_songs.config(text=f"This session:  {M._session_songs} songs")
-            self.lbl_stats_time.config(text=f"Listening time:  {tstr}")
+            self.lbl_stats_songs.config(text=str(M._session_songs))
+            self.lbl_stats_time.config(text=tstr)
             self._refresh_long_stats()
         if not reschedule:
             return
-        # Named slot guarantees exactly one live chain no matter how many
-        # callers invoke this method. See _schedule() for the full story.
         self._schedule("stats", 5000, self._refresh_stats)
 
-    def _refresh_long_stats(self):
-        """Last-7-days and all-time totals from the history database."""
+    STATS_EVERY_S = 60        # long stats refresh this often when Settings isn't open
+
+    def _refresh_long_stats(self, sync=False):
+        """Last-7-days and all-time totals from the history database.
+
+        The two queries scan the whole plays table. They used to run on the
+        Tk thread every 5 s and on every play/pause event; with a big history
+        on a slow disk that was a stutter every few seconds. They now run on a
+        worker, at most once a minute unless the Settings page is on screen
+        (or `sync` is set, for tests and the first build)."""
         if not hasattr(self, "lbl_stats_week"):
             return
         st = M._store()
         if not st:
-            self.lbl_stats_week.config(text="History is off — turn on \"Remember history\" for long-term stats")
+            self._stats_data = None
+            self.lbl_stats_week.config(text="History is off. Turn on \"Remember history\" for long-term stats.")
             self.lbl_stats_all.config(text="")
+            self._set_relayout_soon()
             return
-        def _fmt(label, d):
-            h, m = divmod(int(d["listened_ms"] // 60000), 60)
-            txt = f"{label}:  {d['plays']} plays  ·  {h}h {m}m"
-            if d["top_artists"]:
-                txt += "\n    top: " + ", ".join(f"{a} ({n})" for a, n in d["top_artists"])
-            return txt
-        try:
-            week = st.stats(since=datetime.datetime.now() - datetime.timedelta(days=7))
-            alltime = st.stats()
-        except Exception as e:
-            M.log(f"Stats query failed: {e}")
+        import time as _t
+        now = _t.monotonic()
+        visible = self._cur_page == "SETTINGS" and not self._hidden
+        if not sync and not visible and now - getattr(self, "_stats_at", -1e9) < self.STATS_EVERY_S:
             return
-        self.lbl_stats_week.config(text=_fmt("Last 7 days", week))
-        self.lbl_stats_all.config(text=_fmt("All time", alltime))
+        if getattr(self, "_stats_busy", False) and not sync:
+            return
+        self._stats_at = now
 
+        def query():
+            return (st.stats(since=datetime.datetime.now() - datetime.timedelta(days=7), top=5),
+                    st.stats(top=5))
+
+        def apply(res):
+            self._stats_busy = False
+            if res is None:
+                return
+            week, alltime = res
+            def _fmt(label, d):
+                h, m = divmod(int(d["listened_ms"] // 60000), 60)
+                txt = f"{label}  ·  {d['plays']} plays  ·  {h}h {m}m"
+                if d["top_artists"]:
+                    txt += chr(10) + "Top: " + ", ".join(f"{a} ({n})" for a, n in d["top_artists"])
+                return txt
+            self._stats_data = {"week": week, "all": alltime}
+            self.lbl_stats_week._o["text"] = _fmt("Last 7 days", week)
+            self.lbl_stats_all._o["text"] = _fmt("All time", alltime)
+            self._set_relayout_soon()
+
+        if sync:
+            try:
+                apply(query())
+            except Exception as e:
+                M.log(f"Stats query failed: {e}")
+            return
+        self._stats_busy = True
+        fut = M.image_executor.submit(query)
+        def done(f):
+            try:
+                res = f.result()
+            except Exception as e:
+                M.log(f"Stats query failed: {e}")
+                res = None
+            try:
+                self.win.after(0, lambda: apply(res))
+            except Exception:
+                pass
+        fut.add_done_callback(done)
+
+    # ── Theming ──────────────────────────────────────────────────
     def _set_theme(self, key):
-        """Set dark or light theme from the pill-button key."""
+        """Set dark or light theme from the segmented control."""
         M._DARK_MODE = (key == "dark")
         M._cfg_set("preferences", "dark_mode", str(M._DARK_MODE).lower())
         self._repaint_everything()
-        self._highlight_theme_btn()
 
     def _repaint_everything(self):
         """Rebuild the palette (theme + accent + album tint) and push it onto
@@ -844,17 +1301,12 @@ class SettingsPage:
                 self._load_thumb(cv, e["album_art"])
 
     def _highlight_theme_btn(self):
-        """Update the Dark/Light pill visuals to reflect the current theme."""
-        if not hasattr(self, "_theme_btns"):
-            return
-        dark = M._DARK_MODE
-        for key, b in self._theme_btns.items():
-            is_active = (key == "dark") == dark
-            b.config(fg=M.TEXT if is_active else M.MUTED,
-                     bg=M.BG2 if is_active else M.BG3)
+        seg = getattr(self, "_theme_seg", None)
+        if seg is not None:
+            seg.slide(animate=False)
 
     def _pick_accent(self, _event=None):
-        color = tkcolor.askcolor(color=M.ACCENT, title="Choose accent color")[1]
+        color = tkcolor.askcolor(color=M.USER_ACCENT, title="Choose accent colour")[1]
         if color:
             M.USER_ACCENT = color
             M._cfg_set("preferences", "accent_color", color)
@@ -862,10 +1314,8 @@ class SettingsPage:
 
     def _rebuild_all(self):
         """Recolour every widget in-place without destroying state."""
-        # Build an exact before→after mapping from the palette snapshot taken
-        # just before _apply_palette overwrote the globals.  Using the previous
-        # *actual* values avoids any hash collision (e.g. dark BG2 == light TEXT
-        # == "#111111" was previously ambiguous in a merged static dict).
+        # Exact before→after mapping from the palette snapshot taken just
+        # before _apply_palette overwrote the globals.
         _remap = {
             M._PREV_BG:     M.BG,
             M._PREV_BG2:    M.BG2,
@@ -884,34 +1334,16 @@ class SettingsPage:
             M._PREV_WARN:        M.WARN,
         }
         # A derived token can coincide with a base one (ACCENT_FG is often
-        # exactly TEXT's white). Base colours are authoritative — re-assert
-        # them last so a derived key can never shadow them.
+        # exactly TEXT's white). Base colours are authoritative.
         for _old, _new in ((M._PREV_BG, M.BG), (M._PREV_BG2, M.BG2), (M._PREV_BG3, M.BG3),
                            (M._PREV_MUTED, M.MUTED), (M._PREV_TEXT, M.TEXT),
                            (M._PREV_TEXT2, M.TEXT2), (M._PREV_ACCENT, M.ACCENT)):
             _remap[_old] = _new
 
         def _recolour(w):
-            try:
-                cur_bg = w.cget("bg")
-                new_bg = _remap.get(cur_bg)
-                if new_bg:
-                    w.config(bg=new_bg)
-            except tk.TclError:
-                pass
-            try:
-                cur_fg = w.cget("fg")
-                new_fg = _remap.get(cur_fg)
-                if new_fg:
-                    w.config(fg=new_fg)
-            except tk.TclError:
-                pass
-            # Entry/Text focus rings (see _focus_ring). These are ordinary
-            # palette colours living on different option names, so without
-            # this every input kept its old border after a theme switch —
-            # dark BORDER hairlines around white fields in light mode.
-            for opt in ("highlightbackground", "highlightcolor",
-                        "insertbackground"):
+            for opt in ("bg", "fg", "highlightbackground", "highlightcolor",
+                        "insertbackground", "selectbackground", "selectforeground",
+                        "activebackground"):
                 try:
                     new = _remap.get(w.cget(opt))
                     if new:
@@ -923,33 +1355,28 @@ class SettingsPage:
 
         _recolour(self.win)
 
-        # Accent-coloured widgets need explicit update
-        self._paint_nav()
-        for fn in ("_paint_album_tint_btn",):
-            try: getattr(self, fn)()
-            except (AttributeError, tk.TclError): pass
-        try: self._accent_swatch.config(bg=M.ACCENT)
-        except (AttributeError, tk.TclError): pass
+        # The settings canvas draws its own items; recolour its text stand-ins
+        # and redraw it.
+        for name in ("lbl_track_off", "lbl_lyric_size", "lbl_stats_songs", "lbl_stats_time",
+                     "lbl_stats_week", "lbl_stats_all"):
+            slot = getattr(self, name, None)
+            if isinstance(slot, _Text) and slot._o.get("fg") in _remap:
+                slot._o["fg"] = _remap[slot._o["fg"]]
+        try:
+            self._set_render()
+        except (AttributeError, tk.TclError):
+            pass
 
-        # Log widget text tags
+        self._paint_nav()
         try:
             self.log_txt.tag_config("g",  foreground=M.ACCENT)
             self.log_txt.tag_config("m",  foreground=M.MUTED)
+            self.log_txt.tag_config("y",  foreground=M.WARN)
             self.log_txt.tag_config("ts", foreground=M.MUTED)
         except (AttributeError, tk.TclError): pass
 
-        # The lyric label fg might be ACCENT (active lyric) or MUTED — don't touch it.
-        # Update canvas placeholder art to new colours
-        try:
-            if self._img is None:
-                self._default_art()
-        except (AttributeError, tk.TclError): pass
-
-        # Repaint the Now-Playing progress bar so its fill uses the new ACCENT.
-        # Colours live on persistent canvas items now, so they have to be
-        # pushed explicitly — a redraw alone only moves them.
+        # The lyric sheet caches colours in its layers; drop them.
         try:
             self._repaint_progress_colors()
-            self._redraw_progress()
         except Exception:
             pass
