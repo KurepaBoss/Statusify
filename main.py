@@ -483,7 +483,8 @@ _ENV_PATH         = os.path.join(_APP_DIR, ".env")
 
 # ── Persistent config ─────────────────────────────────────────────
 _CONFIG_PATH = os.path.join(_APP_DIR, "statusify.cfg")
-_HIST_FILE   = os.path.join(_APP_DIR, "history.json")
+_HIST_FILE   = os.path.join(_APP_DIR, "history.json")   # legacy; migrated once
+_HIST_DB     = os.path.join(_APP_DIR, "history.db")
 
 def _load_config():
     """Return the cached ConfigParser, reading from disk only once.
@@ -1200,8 +1201,15 @@ class State:
 
 state = State()
 
-# Session history: [{artist, title, album_art, synced, plain, mode, time}]
+# History entries shown in the UI, oldest first:
+# [{id, track_uri, artist, title, album_art, played_at, time, mode, synced, plain}]
+# The durable copy is _HISTORY_STORE (SQLite, statusify_history), written as
+# each play happens — not on quit, which a kill/logoff/update never reached.
 history = []
+_HISTORY_STORE = None
+# The play in progress: its row id, the session-listen clock when it started,
+# and its in-memory entry once lyrics have arrived.
+_current_play = {"id": None, "listen_start": 0.0, "entry": None}
 
 # ── Lyric helpers ─────────────────────────────────────────────────
 # NOTE: every helper below offsets by _track_offset_ms(), NOT the raw global
@@ -1357,6 +1365,7 @@ async def ws_handler(ws):
             if t == "paused":
                 state.is_playing = False; event_queue.put(("paused",))
                 _on_track_pause()
+                _finish_play()
             elif t == "track_change":
                 state.artist    = data.get("artist",""); state.title = data.get("title","")
                 state.album_art = data.get("album_art","")
@@ -1378,6 +1387,20 @@ async def ws_handler(ws):
                     log(f"Now playing  ·  {state.artist} — {state.title}")
                 event_queue.put(("track", state.artist, state.title, state.album_art))
                 _on_track_start()
+                _start_play()
+                # A track heard before has its lyrics on disk: use them now
+                # rather than waiting on the network. The bridge still fetches;
+                # real lyrics from it replace these, a miss does not.
+                cached = _cached_lyrics(state.track_uri)
+                if cached:
+                    c_mode, c_synced, c_plain, _ = cached
+                    state.lyrics_mode = c_mode; state.synced = c_synced; state.plain = c_plain
+                    state.instrumental_gaps = (_calc_instrumental_gaps(c_synced, state.duration_ms)
+                                               if c_mode == "synced" else [])
+                    n = len(c_synced) or len(c_plain)
+                    log(f"Lyrics (cache)  ·  {c_mode}  ·  {n} lines")
+                    event_queue.put(("lyrics", "cache", c_mode, n))
+                    _save_history(c_mode, c_synced, c_plain, "cache")
             elif t == "lyrics":
                 mode   = data.get("mode", data.get("lyrics_mode","none"))
                 synced = data.get("synced",[]); plain = data.get("plain",[])
@@ -1388,13 +1411,17 @@ async def ws_handler(ws):
                 # after a track_change, so lyrics still in flight for the
                 # PREVIOUS track were adopted by the new one. A missing uri
                 # is still accepted for bridges that predate the field.
-                if uri == state.track_uri or (not uri and state.lyrics_mode == "none"):
+                if (mode == "none" and state.lyrics_mode != "none"
+                        and (uri == state.track_uri or not uri)):
+                    # Already showing cached lyrics; a failed fetch keeps them.
+                    log(f"Lyrics ({src})  ·  none  ·  keeping cached lyrics")
+                elif uri == state.track_uri or (not uri and state.lyrics_mode == "none"):
                     state.lyrics_mode = mode; state.synced = synced; state.plain = plain
                     state.instrumental_gaps = _calc_instrumental_gaps(synced, state.duration_ms) if mode == "synced" else []
                     n   = len(synced) or len(plain)
                     log(f"Lyrics ({src})  ·  {mode}  ·  {n} lines")
                     event_queue.put(("lyrics", src, mode, n))
-                    _save_history(mode, synced, plain)
+                    _save_history(mode, synced, plain, src)
             elif t == "position":
                 was = state.is_playing
                 state.position_ms = int(data.get("position_ms",0))
@@ -1423,30 +1450,78 @@ async def ws_handler(ws):
             event_queue.put(("sp", False))
             state.is_playing = False
 
-def _save_history(mode, synced, plain):
-    # Update in place if this track is already in history (lyrics can arrive
-    # in more than one message for the same URI).
-    for entry in history:
-        if entry["track_uri"] == state.track_uri:
-            entry["synced"] = synced; entry["plain"] = plain; entry["mode"] = mode; return
+def _store():
+    """The history store, or None when history is off or failed to open."""
+    return _HISTORY_STORE if SAVE_HISTORY else None
+
+def _finish_play():
+    """Write the listening time of the play in progress."""
+    st = _store()
+    if st and _current_play["id"]:
+        try:
+            st.set_listened(_current_play["id"],
+                            (_get_listen_time() - _current_play["listen_start"]) * 1000)
+        except Exception as e:
+            log(f"Could not save listening time: {e}")
+
+def _start_play():
+    """Record a new play for the track in `state`. Called on track_change."""
+    _finish_play()
+    _current_play["id"] = None
+    _current_play["entry"] = None
+    _current_play["listen_start"] = _get_listen_time()
+    st = _store()
+    if st and state.track_uri:
+        try:
+            _current_play["id"] = st.record_play(state.track_uri, state.artist,
+                                                 state.title, state.album_art)
+        except Exception as e:
+            log(f"Could not record play: {e}")
+
+def _save_history(mode, synced, plain, source=""):
+    """Attach lyrics to the play in progress and show it in the History tab.
+
+    Lyrics can arrive more than once for one play (cache, then bridge), so
+    the entry is updated in place after the first time. A replay of the same
+    song is a new play and gets its own row."""
+    st = _store()
+    if st:
+        try:
+            st.save_lyrics(state.track_uri, mode, synced, plain, source)
+        except Exception as e:
+            log(f"Could not cache lyrics: {e}")
+    entry = _current_play["entry"]
+    if entry is not None and entry["track_uri"] == state.track_uri:
+        entry["synced"] = synced; entry["plain"] = plain; entry["mode"] = mode
+        return
+    now = datetime.datetime.now().replace(microsecond=0)
     entry = {
-        "track_uri": state.track_uri, "artist": state.artist, "title": state.title,
+        "id": _current_play["id"], "track_uri": state.track_uri,
+        "artist": state.artist, "title": state.title,
         "album_art": state.album_art, "mode": mode, "synced": synced, "plain": plain,
-        "time": datetime.datetime.now().strftime("%H:%M"),
+        "played_at": now.isoformat(), "time": now.strftime("%H:%M"),
     }
+    _current_play["entry"] = entry
     history.append(entry)
-    # Actually enforce the cap. The previous version only stopped *notifying
-    # the UI* past MAX_HISTORY_ROWS while still appending forever, so two
-    # things went wrong at once: `history` grew without bound for the whole
-    # session (every entry holds a full lyric sheet, and _persist_history
-    # dumps the lot to disk on quit — hence a 600 KB history.json), and every
-    # track after the 500th silently never appeared in the History tab.
+    # Bounds the in-memory list (each entry holds a lyric sheet). The full
+    # history stays in the database, where search still reaches it.
     while len(history) > MAX_HISTORY_ROWS:
         history.pop(0)
     # The event carries the entry itself rather than its index. Indices shift
     # the moment the front is trimmed, which would repoint every already-
     # rendered row's LYRICS button at the wrong song.
     event_queue.put(("history_add", entry))
+
+def _cached_lyrics(uri):
+    """(mode, synced, plain, source) from the local lyric cache, or None."""
+    st = _HISTORY_STORE
+    if not st:
+        return None
+    try:
+        return st.get_lyrics(uri)
+    except Exception as e:
+        log(f"Lyric cache read failed: {e}")
+        return None
 
 def _lrc_timestamp(ms):
     """Format milliseconds as an LRC [mm:ss.xx] tag."""
@@ -1501,32 +1576,44 @@ def _export_lyrics(entry, fmt="lrc"):
     return path
 
 def _load_history():
-    """Loads history from JSON if SAVE_HISTORY is enabled."""
-    global history
-    if not SAVE_HISTORY or not os.path.exists(_HIST_FILE): return
+    """Open the history database (migrating history.json once) and load the
+    newest entries for the History tab."""
+    global history, _HISTORY_STORE
+    from statusify_history import HistoryStore
     try:
-        with open(_HIST_FILE, "r", encoding="utf-8") as f:
-            history = json.load(f)
-        # Keep only the most recent entries to prevent memory bloat
-        if len(history) > MAX_HISTORY_ROWS:
-            history = history[-MAX_HISTORY_ROWS:]
-        log(f"Loaded {len(history)} history entries from disk")
+        _HISTORY_STORE = HistoryStore(_HIST_DB)
+    except Exception as e:
+        log(f"Could not open history database: {e}")
+        _HISTORY_STORE = None
+        return
+    if os.path.exists(_HIST_FILE):
+        try:
+            n = _HISTORY_STORE.import_json(_HIST_FILE)
+            log(f"Migrated {n} entries from history.json")
+        except Exception as e:
+            log(f"Could not migrate history.json: {e}")
+    if not SAVE_HISTORY:
+        return
+    try:
+        history = _HISTORY_STORE.recent(MAX_HISTORY_ROWS)
+        log(f"Loaded {len(history)} history entries  ·  {_HISTORY_STORE.count()} plays on record")
     except Exception as e:
         log(f"Could not load history: {e}")
 
 def _persist_history():
-    """Saves or deletes history on disk based on SAVE_HISTORY setting."""
+    """On quit: store the current play's listening time, or — with history
+    turned off — wipe what is on record, as the setting promises."""
+    st = _HISTORY_STORE
+    if not st:
+        return
     if SAVE_HISTORY:
-        try:
-            with open(_HIST_FILE, "w", encoding="utf-8") as f:
-                json.dump(history, f, indent=2)
-            log("History persisted to disk")
-        except Exception as e:
-            log(f"Could not save history: {e}")
+        _finish_play()
     else:
-        if os.path.exists(_HIST_FILE):
-            try: os.remove(_HIST_FILE); log("History file deleted (disabled)")
-            except OSError as e: log(f"Could not delete history file: {e}")
+        try:
+            st.clear(); log("History deleted (history disabled)")
+        except Exception as e:
+            log(f"Could not delete history: {e}")
+    st.close()
 
 # ── RPC loop ──────────────────────────────────────────────────────
 async def rpc_loop(rpc):
@@ -1890,6 +1977,10 @@ class App:
         self._root.configure(bg=BG)
         self._root.overrideredirect(True)
         self._root.protocol("WM_DELETE_WINDOW", self._on_close_button)
+        # Tk delivers Windows' WM_QUERYENDSESSION (logoff/shutdown/restart) as
+        # WM_SAVE_YOURSELF. Plays are already committed as they happen; this
+        # saves the current play's listening time and any debounced config.
+        self._root.protocol("WM_SAVE_YOURSELF", self._on_session_end)
         # Set window icon (.ico applied before and after overrideredirect)
         self._apply_icon()
 
@@ -2518,6 +2609,14 @@ class App:
                        fg=ACCENT_FG if _rpc_enabled else MUTED)
         except tk.TclError:
             pass
+
+    def _on_session_end(self):
+        log("Windows session ending  ·  saving state")
+        for fn in (_cfg_flush, _finish_play, self._save_geometry):
+            try:
+                fn()
+            except Exception:
+                pass
 
     def _on_close_button(self):
         """Window close (X). Honours the close_to_tray preference.
@@ -3231,7 +3330,7 @@ class App:
         self._focus_ring(ent_s)
         ent_s.pack(fill="x", ipady=SP_XS)
         self._hist_search_entry = ent_s   # so Ctrl+F can focus it
-        tk.Label(sf, text="🔍  filter by title, artist, or lyrics   ·   Ctrl+F",
+        tk.Label(sf, text="🔍  search all history by title, artist, or lyrics   ·   Ctrl+F",
                  fg=MUTED, bg=BG, font=self._f(FS_MICRO)).pack(anchor="w", pady=(2,0))
         self._hist_search.trace_add("write", lambda *_: self._filter_history())
 
@@ -3354,22 +3453,41 @@ class App:
         log(f"History restored  ·  {len(history)} tracks")
 
     def _filter_history(self):
-        """Show/hide history rows based on search query."""
-        q = self._hist_search.get().lower()
-        for row, e in self._hist_rows:
-            if not q:
-                match = True
-            else:
-                match = (q in e.get("title", "").lower() or q in e.get("artist", "").lower())
-                if not match:
-                    if e.get("plain"):
-                        match = any(q in ln.lower() for ln in e["plain"])
-                    elif e.get("synced"):
-                        match = any(q in ln.get("words", "").lower() for ln in e["synced"])
-            if match:
-                row.pack(fill="x", pady=(0,2))
-            else:
-                row.pack_forget()
+        """Debounced: re-render the list for the current search query."""
+        self._schedule("hist_search", 200, self._run_history_search)
+
+    def _run_history_search(self):
+        """Search the whole database, not just the rows on screen.
+
+        Filtering used to show/hide the rendered rows, and only the newest
+        MAX_RENDERED_ROWS exist as widgets — so anything older than the last
+        60 tracks could never be found."""
+        q = self._hist_search.get().strip()
+        if q and _HISTORY_STORE:
+            try:
+                entries = list(reversed(_HISTORY_STORE.search(q, MAX_RENDERED_ROWS)))
+            except Exception as e:
+                log(f"History search failed: {e}")
+                entries = []
+        elif q:
+            ql = q.lower()
+            entries = [e for e in history if ql in e.get("title", "").lower()
+                       or ql in e.get("artist", "").lower()]
+        else:
+            entries = history[-MAX_RENDERED_ROWS:]
+        for row, _ in list(getattr(self, "_hist_rows", [])):
+            try:
+                row.destroy()
+            except Exception:
+                pass
+        self._hist_rows = []
+        for e in entries:
+            self._add_history_row(e)
+        if not entries:
+            try:
+                self.no_hist.pack(pady=30)
+            except (AttributeError, tk.TclError):
+                pass
 
     def _clear_history(self):
         """Wipe session history, its rendered rows, and the on-disk copy."""
@@ -3387,10 +3505,11 @@ class App:
         except (AttributeError, tk.TclError):
             pass
         try:
-            if os.path.exists(_HIST_FILE):
-                os.remove(_HIST_FILE)
-        except OSError as e:
-            log(f"Could not delete history file: {e}")
+            if _HISTORY_STORE:
+                _HISTORY_STORE.clear()
+            _current_play["entry"] = None
+        except Exception as e:
+            log(f"Could not delete history: {e}")
         log("History cleared")
 
     def _trim_history_rows(self):
@@ -3789,7 +3908,7 @@ class App:
             s for s in _cfg_get("ui", "collapsed_sections", "").split(",") if s)
 
         # ── Section: Session Stats ─────────────────────────────────
-        stats_card = self._collapsible(outer, "SESSION STATS", "stats")
+        stats_card = self._collapsible(outer, "LISTENING STATS", "stats")
         inner_s = tk.Frame(stats_card, bg=BG2); inner_s.pack(fill="x", padx=14, pady=10)
         self.lbl_stats_songs = tk.Label(inner_s, text="Songs played:  0",
                                         fg=TEXT2, bg=BG2, font=self._f(9), anchor="w")
@@ -3797,6 +3916,13 @@ class App:
         self.lbl_stats_time = tk.Label(inner_s, text="Listening time:  0m 0s",
                                        fg=TEXT2, bg=BG2, font=self._f(9), anchor="w")
         self.lbl_stats_time.pack(fill="x", pady=(4,0))
+        # From the history database, so they survive restarts.
+        self.lbl_stats_week = tk.Label(inner_s, text="", fg=TEXT2, bg=BG2,
+                                       font=self._f(9), anchor="w", justify="left")
+        self.lbl_stats_week.pack(fill="x", pady=(10,0))
+        self.lbl_stats_all = tk.Label(inner_s, text="", fg=TEXT2, bg=BG2,
+                                      font=self._f(9), anchor="w", justify="left")
+        self.lbl_stats_all.pack(fill="x", pady=(4,0))
         self._refresh_stats()
 
         # ── Section: Behaviour (tray + blacklist + per-track offset) ─
@@ -4109,7 +4235,7 @@ class App:
                        selectcolor=BG3, command=_toggle_startup).pack(side="right")
 
         row_sh = tk.Frame(inner_sy, bg=BG2); row_sh.pack(fill="x", pady=(6,0))
-        tk.Label(row_sh, text="Remember session history", fg=TEXT2, bg=BG2,
+        tk.Label(row_sh, text="Remember history", fg=TEXT2, bg=BG2,
                  font=self._f(9), anchor="w").pack(side="left")
         self._save_hist_var = tk.BooleanVar(value=SAVE_HISTORY)
         def _toggle_save_hist():
@@ -4391,13 +4517,38 @@ class App:
         else:
             tstr = f"{mins}m {secs}s"
         if hasattr(self, "lbl_stats_songs"):
-            self.lbl_stats_songs.config(text=f"Songs played:  {_session_songs}")
+            self.lbl_stats_songs.config(text=f"This session:  {_session_songs} songs")
             self.lbl_stats_time.config(text=f"Listening time:  {tstr}")
+            self._refresh_long_stats()
         if not reschedule:
             return
         # Named slot guarantees exactly one live chain no matter how many
         # callers invoke this method. See _schedule() for the full story.
         self._schedule("stats", 5000, self._refresh_stats)
+
+    def _refresh_long_stats(self):
+        """Last-7-days and all-time totals from the history database."""
+        if not hasattr(self, "lbl_stats_week"):
+            return
+        st = _store()
+        if not st:
+            self.lbl_stats_week.config(text="History is off — turn on \"Remember history\" for long-term stats")
+            self.lbl_stats_all.config(text="")
+            return
+        def _fmt(label, d):
+            h, m = divmod(int(d["listened_ms"] // 60000), 60)
+            txt = f"{label}:  {d['plays']} plays  ·  {h}h {m}m"
+            if d["top_artists"]:
+                txt += "\n    top: " + ", ".join(f"{a} ({n})" for a, n in d["top_artists"])
+            return txt
+        try:
+            week = st.stats(since=datetime.datetime.now() - datetime.timedelta(days=7))
+            alltime = st.stats()
+        except Exception as e:
+            log(f"Stats query failed: {e}")
+            return
+        self.lbl_stats_week.config(text=_fmt("Last 7 days", week))
+        self.lbl_stats_all.config(text=_fmt("All time", alltime))
 
     def _set_theme(self, key):
         """Set dark or light theme from the pill-button key."""
@@ -4988,7 +5139,10 @@ class App:
                 elif k == "paused":      self.lbl_lyric.config(text="Paused", fg=MUTED)
                 elif k == "rl":
                     w = ev[1]; self._start_rl_countdown(w)
-                elif k == "history_add": self._add_history_row(ev[1])
+                elif k == "history_add":
+                    # While a search is showing, new plays wait for it to clear.
+                    if not (getattr(self, "_hist_search", None) and self._hist_search.get().strip()):
+                        self._add_history_row(ev[1])
                 elif k == "dropped":
                     n = ev[1]
                     self.lbl_dropped.config(

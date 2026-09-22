@@ -8,6 +8,10 @@ statusify.cfg
 
 # Personal listening data and cached media
 history.json
+history.json.migrated
+history.db
+history.db-wal
+history.db-shm
 exports/
 *.jpg
 *.png
