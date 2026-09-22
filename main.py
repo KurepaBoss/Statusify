@@ -487,110 +487,10 @@ _CONFIG_PATH = os.path.join(_APP_DIR, "statusify.cfg")
 _HIST_FILE   = os.path.join(_APP_DIR, "history.json")   # legacy; migrated once
 _HIST_DB     = os.path.join(_APP_DIR, "history.db")
 
-def _load_config():
-    """Return the cached ConfigParser, reading from disk only once.
-
-    The original version re-read and re-parsed statusify.cfg from disk on
-    EVERY _cfg_get call (10 call sites) and rewrote the whole file on every
-    _cfg_set (13 call sites). Building the settings page alone cost a dozen
-    synchronous disk round-trips on the Tk thread. The file is small and this
-    process is its only writer, so one in-memory copy is authoritative."""
-    global _CFG_CACHE
-    with _CFG_LOCK:
-        if _CFG_CACHE is None:
-            cfg = configparser.ConfigParser()
-            try:
-                cfg.read(_CONFIG_PATH)
-            except (OSError, configparser.Error) as e:
-                # A corrupt config must not prevent startup — fall back to
-                # defaults and say so, rather than dying before the GUI exists.
-                log(f"Config unreadable ({e}) — using defaults")
-                cfg = configparser.ConfigParser()
-            _CFG_CACHE = cfg
-        return _CFG_CACHE
-
-_CFG_CACHE = None
-_CFG_LOCK  = threading.RLock()
-
-def _save_config(cfg=None):
-    """Write the cached config to disk atomically."""
-    with _CFG_LOCK:
-        cfg = cfg if cfg is not None else _load_config()
-        tmp = _CONFIG_PATH + ".tmp"
-        try:
-            # Write-then-replace: a crash mid-write can no longer leave a
-            # truncated statusify.cfg behind.
-            with open(tmp, "w", encoding="utf-8") as f:
-                cfg.write(f)
-            os.replace(tmp, _CONFIG_PATH)
-        except (OSError, configparser.Error) as e:
-            # configparser.Error was NOT caught here before. Python 3.13+
-            # raises InvalidWriteError for an option name containing a
-            # delimiter, which the per-track offsets used to produce (see
-            # offset_key). It escaped as an unhandled Tk callback exception
-            # and, because the bad key stayed in the cached ConfigParser, made
-            # every subsequent save fail too — the app quietly stopped
-            # persisting ANY setting. Diagnostics and config writes must never
-            # be able to take the app down.
-            log(f"Could not save config: {type(e).__name__}: {e}")
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
-
-def _cfg_get(section, key, fallback=""):
-    with _CFG_LOCK:
-        return _load_config().get(section, key, fallback=fallback)
-
-def _cfg_set(section, key, value):
-    with _CFG_LOCK:
-        cfg = _load_config()
-        if not cfg.has_section(section):
-            cfg.add_section(section)
-        cfg.set(section, key, str(value))
-        _save_config(cfg)
-
-# ── Debounced config writes ───────────────────────────────────────────
-# _cfg_set rewrites the whole INI atomically on every call. That is correct
-# but wasteful when the UI fires a burst — nudging a per-track offset or the
-# lyric font size hits it once per click, each a full serialise + os.replace on
-# the Tk thread. _cfg_set_soon updates the in-memory ConfigParser immediately
-# (so a subsequent _cfg_get sees the new value at once) and coalesces the disk
-# write to a single flush ~400 ms after the last change in the burst. Any
-# pending flush is forced on quit via _cfg_flush(), so nothing is lost.
-_CFG_FLUSH_TIMER = None
-_CFG_DIRTY       = False
-
-def _cfg_flush():
-    """Write pending debounced changes to disk now. Safe to call anytime."""
-    global _CFG_FLUSH_TIMER, _CFG_DIRTY
-    with _CFG_LOCK:
-        if _CFG_FLUSH_TIMER is not None:
-            try: _CFG_FLUSH_TIMER.cancel()
-            except Exception: pass
-            _CFG_FLUSH_TIMER = None
-        if not _CFG_DIRTY:
-            return
-        _CFG_DIRTY = False
-        _save_config(_load_config())
-
-def _cfg_set_soon(section, key, value, delay=0.4):
-    """Set a value in memory immediately; flush to disk once the burst settles."""
-    global _CFG_FLUSH_TIMER, _CFG_DIRTY
-    with _CFG_LOCK:
-        cfg = _load_config()
-        if not cfg.has_section(section):
-            cfg.add_section(section)
-        cfg.set(section, key, str(value))
-        _CFG_DIRTY = True
-        if _CFG_FLUSH_TIMER is not None:
-            try: _CFG_FLUSH_TIMER.cancel()
-            except Exception: pass
-        t = threading.Timer(delay, _cfg_flush)
-        t.daemon = True
-        _CFG_FLUSH_TIMER = t
-        t.start()
+import statusify_config as _cfg_mod
+_cfg_mod.init(_CONFIG_PATH, log)
+from statusify_config import (_load_config, _save_config, _cfg_get, _cfg_set,
+                              _cfg_flush, _cfg_set_soon, _CFG_LOCK)
 
 # Load persisted settings at startup
 _stored_delay = _cfg_get("preferences", "lyric_delay_ms", "0")
@@ -637,128 +537,9 @@ MAX_HISTORY_ROWS  = 500
 # tree, which is what actually costs time on every layout pass.
 MAX_RENDERED_ROWS = 60
 
-# ── Album art cache ───────────────────────────────────────────────
-# Art was refetched over the network on every single track change with no
-# caching at all, so replaying an album re-downloaded the same JPEG each
-# time. Keyed by (url, size) because the hero image and the history
-# thumbnails want different resolutions of the same source.
-_ART_CACHE      = {}
-_ART_CACHE_LOCK = threading.Lock()
-_ART_CACHE_MAX  = 80
-_ART_DISK_DIR   = os.path.join(_APP_DIR, ".artcache")
-
-_ART_DISK_MAX_FILES = 400   # ~2 PNGs per track, so roughly 200 albums
-
-def _art_disk_path(url, size):
-    import hashlib
-    h = hashlib.sha1(f"{url}@{size}".encode("utf-8")).hexdigest()
-    return os.path.join(_ART_DISK_DIR, f"{h}.png")
-
-def _prune_art_cache(max_files=_ART_DISK_MAX_FILES):
-    """Drop the least-recently-modified PNGs from the on-disk art cache.
-
-    The in-memory cache has had a size cap from the start, but its disk tier
-    only ever grew: every distinct album at every distinct size wrote a PNG
-    that nothing ever removed. Called once at startup, off the Tk thread."""
-    try:
-        entries = []
-        with os.scandir(_ART_DISK_DIR) as it:
-            for de in it:
-                if de.is_file() and de.name.endswith(".png"):
-                    try:
-                        entries.append((de.stat().st_mtime, de.path))
-                    except OSError:
-                        pass
-        if len(entries) <= max_files:
-            return
-        entries.sort()
-        for _, path in entries[: len(entries) - max_files]:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-        log(f"Art cache pruned  ·  {len(entries) - max_files} file(s) removed")
-    except (FileNotFoundError, OSError):
-        pass
-
-def _round_image(img, radius, bg):
-    """Return `img` with rounded corners, composited onto solid colour `bg`.
-
-    Applied at display time rather than inside _fetch_art on purpose: the
-    disk cache holds the raw square artwork, so the corner radius and the
-    surface colour behind it stay free to change (theme switch, different
-    panel) without invalidating a single cached PNG.
-
-    Composites onto an opaque background instead of returning RGBA because
-    Tk's PhotoImage does not alpha-blend against a Canvas — a transparent
-    corner renders as black, which is precisely the artefact this is meant
-    to avoid. The caller passes whatever colour sits behind the art."""
-    if img is None or not PIL_AVAILABLE:
-        return img
-    try:
-        img = img.convert("RGB")
-        w, h = img.size
-        radius = max(0, min(int(radius), min(w, h) // 2))
-        if radius == 0:
-            return img
-        # Build the mask at 4× and downsample: PIL's rounded_rectangle is
-        # hard-edged, and an un-antialiased 10 px corner on a 120 px image is
-        # visibly staircased.
-        scale = 4
-        mask = Image.new("L", (w * scale, h * scale), 0)
-        ImageDraw.Draw(mask).rounded_rectangle(
-            (0, 0, w * scale - 1, h * scale - 1),
-            radius=radius * scale, fill=255)
-        mask = mask.resize((w, h), Image.LANCZOS)
-        out = Image.new("RGB", (w, h), bg)
-        out.paste(img, (0, 0), mask)
-        return out
-    except Exception:
-        return img   # never let decoration break the image path
-
-def _fetch_art(url, size):
-    """Return a PIL image of `url` resized to size×size, or None.
-
-    Three tiers: in-memory dict → on-disk PNG cache → network. Always called
-    from a worker thread, never the Tk loop."""
-    if not PIL_AVAILABLE or not url:
-        return None
-    key = (url, size)
-    with _ART_CACHE_LOCK:
-        hit = _ART_CACHE.get(key)
-    if hit is not None:
-        return hit
-
-    img = None
-    disk = _art_disk_path(url, size)
-    try:
-        if os.path.exists(disk):
-            img = Image.open(disk)
-            img.load()   # force decode now, while we're off the Tk thread
-    except Exception:
-        img = None
-
-    if img is None:
-        try:
-            import urllib.request
-            data = urllib.request.urlopen(url, timeout=4).read()
-            img  = Image.open(BytesIO(data)).convert("RGB").resize((size, size), Image.LANCZOS)
-        except Exception:
-            return None
-        try:
-            os.makedirs(_ART_DISK_DIR, exist_ok=True)
-            img.save(disk, "PNG")
-        except Exception:
-            pass  # disk cache is an optimisation, not a requirement
-
-    with _ART_CACHE_LOCK:
-        if len(_ART_CACHE) >= _ART_CACHE_MAX:
-            # Cheap FIFO eviction — good enough for a cache this small, and
-            # avoids pulling in an LRU dependency.
-            for k in list(_ART_CACHE)[: _ART_CACHE_MAX // 4]:
-                _ART_CACHE.pop(k, None)
-        _ART_CACHE[key] = img
-    return img
+import statusify_art as _art_mod
+_art_mod.init(os.path.join(_APP_DIR, ".artcache"), log)
+from statusify_art import _prune_art_cache, _round_image, _fetch_art
 
 # ── Per-track lyric offset (#13) ──────────────────────────────────
 # LYRIC_DELAY_MS is a single global, but sync drift is a property of the
@@ -961,94 +742,9 @@ def _hotkey_toggle(app_ref):
     # discarded the current track's accumulated listening time. rpc_loop now
     # clears the presence itself on the falling edge of _rpc_enabled.
 
-# ── Startup with Windows ──────────────────────────────────────────
-
-def _startup_lnk_path():
-    """Path to the Statusify shortcut in the user's Startup folder."""
-    startup = os.path.join(os.environ.get("APPDATA", ""),
-                           r"Microsoft\Windows\Start Menu\Programs\Startup",
-                           "Statusify.lnk")
-    return startup
-
-def _get_startup_enabled():
-    return os.path.exists(_startup_lnk_path())
-
-def _cleanup_old_startup():
-    """Remove any leftover registry Run key entries from previous versions."""
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                             r"Software\Microsoft\Windows\CurrentVersion\Run",
-                             0, winreg.KEY_SET_VALUE)
-        try: winreg.DeleteValue(key, "Statusify")
-        except FileNotFoundError: pass
-        winreg.CloseKey(key)
-    except Exception:
-        pass
-
-def _set_startup_enabled(enabled: bool):
-    lnk = _startup_lnk_path()
-    # Always clean up old registry entry regardless of enable/disable
-    _cleanup_old_startup()
-    if not enabled:
-        try: os.remove(lnk)
-        except FileNotFoundError: pass
-        except Exception as e: log(f"Startup remove error: {e}")
-        return
-    try:
-        script_dir = _APP_DIR
-        ico        = os.path.join(_RES_DIR, "statusify.ico")
-        # Use Windows Script Host COM to create a proper .lnk shortcut.
-        # Shortcuts show their Description as the name in Task Manager's
-        # startup tab.
-        statusify_exe = os.path.join(script_dir, "Statusify.exe")
-        main_py       = os.path.join(script_dir, "main.py")
-
-        if _FROZEN:
-            # We ARE the executable. Point the shortcut at ourselves instead of
-            # guessing at a sibling Statusify.exe or a pythonw that the user may
-            # not even have — a frozen build is the one case where the target is
-            # known exactly. The exe carries its own icon, so use it for that too.
-            target = sys.executable
-            args   = ""
-            ico    = sys.executable
-        # Prefer Statusify.exe (compiled launcher — shows correct name+icon in Task Manager)
-        # Fall back to pythonw.exe if not yet built
-        elif os.path.exists(statusify_exe):
-            target = statusify_exe
-            args   = ""
-        else:
-            pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-            if not os.path.exists(pythonw):
-                pythonw = sys.executable.replace("python.exe", "pythonw.exe")
-            target = pythonw
-            args   = f'"{main_py}"'
-
-        # args is "" for the Statusify.exe path. The old template wrapped it
-        # unconditionally, producing Arguments = '""' — a literal empty-string
-        # argument handed to the launcher on every boot.
-        ps = (
-            f'$ws = New-Object -ComObject WScript.Shell; '
-            f'$lnk = $ws.CreateShortcut("{lnk}"); '
-            f'$lnk.TargetPath = "{target}"; '
-            f'$lnk.Arguments = \'{args}\'; '
-            f'$lnk.WorkingDirectory = "{script_dir}"; '
-            f'$lnk.Description = "Statusify"; '
-            f'$lnk.IconLocation = "{ico},0"; '
-            f'$lnk.WindowStyle = 7; '
-            f'$lnk.Save()'
-        )
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = 0  # SW_HIDE
-        subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps],
-            capture_output=True, timeout=10,
-            startupinfo=si,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        log("Startup shortcut created")
-    except Exception as e:
-        log(f"Startup shortcut error: {e}")
+import statusify_startup as _startup_mod
+_startup_mod.init(_APP_DIR, _RES_DIR, _FROZEN, log)
+from statusify_startup import _get_startup_enabled, _set_startup_enabled
 
 executor        = ThreadPoolExecutor(max_workers=1)
 image_executor  = ThreadPoolExecutor(max_workers=2)   # off-thread album-art fetches
@@ -1867,42 +1563,8 @@ async def rpc_loop(rpc):
         display = join_lines(group)
         log(f"RPC ({len(group)}L)  ·  {display[:55]}"); event_queue.put(("line", display))
 
-# ── Colour maths ──────────────────────────────────────────────────
-# Small pure helpers, kept module-level so tests can exercise them without
-# a Tk root. Everything the UI animates (hover fades, accent tinting) needs
-# to interpolate between two hex colours, and the accent is user-chosen so
-# nothing that derives from it can be hardcoded.
-
-def _hex_to_rgb(c):
-    """'#rrggbb' → (r, g, b). Tolerates '#rgb' and a missing '#'."""
-    c = str(c).lstrip("#")
-    if len(c) == 3:
-        c = "".join(ch * 2 for ch in c)
-    return (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
-
-def _rgb_to_hex(rgb):
-    r, g, b = (max(0, min(255, int(round(v)))) for v in rgb)
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-def _blend(c1, c2, t):
-    """Mix c1→c2 by t in 0..1. t=0 is c1, t=1 is c2."""
-    t = max(0.0, min(1.0, float(t)))
-    a, b = _hex_to_rgb(c1), _hex_to_rgb(c2)
-    return _rgb_to_hex(a[i] + (b[i] - a[i]) * t for i in range(3))
-
-def _luminance(c):
-    """Perceived luminance 0..1 (Rec. 601 weights — good enough to pick
-    between black and white foreground on an arbitrary accent)."""
-    r, g, b = _hex_to_rgb(c)
-    return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
-
-def _readable_on(c):
-    """Black or white, whichever stays legible on top of `c`.
-
-    The RPC button used to hardcode fg='#000000' on an ACCENT background.
-    The accent is a colour picker — choose anything dark (navy, maroon) and
-    the button's label went black-on-black."""
-    return "#000000" if _luminance(c) > 0.55 else "#ffffff"
+from statusify_colors import (_hex_to_rgb, _rgb_to_hex, _blend, _luminance,
+                              _readable_on)
 
 # ── GUI colors ────────────────────────────────────────────────────
 def _apply_palette(dark: bool, accent: str):
@@ -2064,7 +1726,6 @@ class App:
         self._scroll_target = 0.0
         self._scroll_active = False
         self._build()
-        self._render_loaded_history()
         self._tray_start()
         self._poll()
         # Drive the Now-Playing progress bar (~4 fps is smooth enough and cheap).
@@ -3438,6 +3099,11 @@ class App:
         self.no_hist.pack(pady=30)
         self._hist_rows = []  # list of (row_widget, entry_dict) for filtering
         self._bind_hist_mw(self.hist_frm)
+        # Render restored history here, once the page exists. It used to be
+        # called from __init__, which since the deferred page build runs
+        # before this page is created — so it drew nothing, and the History
+        # tab only ever showed tracks played in the current session.
+        self._render_loaded_history()
 
     def _smooth_scroll(self, delta_px):
         """Glide the history canvas by delta_px using exponential approach.
