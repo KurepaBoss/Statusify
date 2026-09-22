@@ -4,6 +4,7 @@ typo in UI code surfaces only when the user opens the page."""
 import datetime
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -30,10 +31,17 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "history", st.recent())
     # Global hotkeys would collide with a running Statusify; not under test.
     monkeypatch.setattr(main, "_register_hotkeys", lambda *a, **k: None)
-    try:
-        a = main.App()
-    except tk.TclError as e:
-        pytest.skip(f"no display: {e}")
+    # Creating many Tk roots in one process occasionally fails to source
+    # init.tcl on Windows ("Tcl wasn't installed properly"). Retry that
+    # transient error; anything else must fail, never silently skip.
+    for attempt in range(3):
+        try:
+            a = main.App()
+            break
+        except tk.TclError as e:
+            if "installed properly" not in str(e) or attempt == 2:
+                raise
+            time.sleep(0.2)
     yield a
     for fn in (a._cancel_all_timers, a._tray_stop):
         try:
@@ -86,3 +94,25 @@ def test_new_play_event_adds_a_row(app):
     app._poll()
     _pump(app)
     assert len(app._hist_rows) == before + 1
+
+
+def test_tab_switch_raises_without_relayout(app):
+    """Pages are stacked and raised; switching must not re-pack them (that
+    re-laid-out the whole tree and cost ~60 ms per click)."""
+    app._build_deferred_pages()
+    for name in ("HISTORY", "SETTINGS", "NOW PLAYING", "HISTORY"):
+        app._show(name)
+        _pump(app, 3)
+        assert app._cur_page == name
+    assert {p.winfo_manager() for p in app._pages.values()} == {"place"}
+
+
+def test_native_frame_and_theme_round_trip(app):
+    """The window keeps its OS frame, and a theme switch re-tints the title
+    bar and scrollbars without raising."""
+    assert not app._root.overrideredirect()
+    app._build_deferred_pages()
+    app._set_theme("light"); _pump(app, 5)
+    app._set_theme("dark"); _pump(app, 5)
+    st = main.ttk.Style(app._root)
+    assert st.lookup(app.SCROLLBAR_STYLE, "troughcolor") == main.BG

@@ -99,12 +99,8 @@ class MiniTrayMixin:
     def _tray_start(self):
         """Create the tray icon, if pystray is available.
 
-        Statusify uses overrideredirect(True), which strips the OS window
-        frame AND the taskbar button — hence the hand-rolled Win32 in
-        _fix_taskbar/_ensure_taskbar that re-applies WS_EX_APPWINDOW on every
-        focus change. A tray icon is the idiomatic home for a background
-        presence app and gives a reliable way back to the window that doesn't
-        depend on any of that."""
+        A tray icon is the idiomatic home for a background presence app:
+        closing to it keeps RPC running without a taskbar button."""
         self._tray = None
         if not M.TRAY_AVAILABLE:
             M.log("Tray unavailable (pystray/Pillow not installed) — window-only mode")
@@ -152,7 +148,6 @@ class MiniTrayMixin:
     def _tray_show(self):
         try:
             self._root.deiconify()
-            self._ensure_taskbar()
             self._root.lift()
             self._root.focus_force()
             self._hidden = False

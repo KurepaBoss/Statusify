@@ -64,7 +64,7 @@ class SettingsPage:
         p = tk.Frame(self._container, bg=M.BG); self._pages["SETTINGS"] = p
 
         container = tk.Frame(p, bg=M.BG); container.pack(fill="both", expand=True, padx=14, pady=(10,14))
-        self._set_vsb = tk.Scrollbar(container, bg=M.BG3, troughcolor=M.BG, relief="flat", width=5, bd=0)
+        self._set_vsb = self._scrollbar(container)
         self.set_cv = tk.Canvas(container, bg=M.BG, highlightthickness=0, yscrollcommand=self._set_vsb.set)
         self.set_cv.pack(side="left", fill="both", expand=True)
         self._set_vsb.config(command=self.set_cv.yview)
@@ -103,7 +103,7 @@ class SettingsPage:
             s for s in M._cfg_get("ui", "collapsed_sections", "").split(",") if s)
 
         # ── Section: Session Stats ─────────────────────────────────
-        stats_card = self._collapsible(outer, "LISTENING STATS", "stats")
+        stats_card = self._collapsible(outer, "Listening stats", "stats")
         inner_s = tk.Frame(stats_card, bg=M.BG2); inner_s.pack(fill="x", padx=14, pady=10)
         self.lbl_stats_songs = tk.Label(inner_s, text="Songs played:  0",
                                         fg=M.TEXT2, bg=M.BG2, font=self._f(9), anchor="w")
@@ -121,7 +121,7 @@ class SettingsPage:
         self._refresh_stats()
 
         # ── Section: Behaviour (tray + blacklist + per-track offset) ─
-        beh_card = self._collapsible(outer, "BEHAVIOUR", "behaviour")
+        beh_card = self._collapsible(outer, "Behaviour", "behaviour")
         inner_b  = tk.Frame(beh_card, bg=M.BG2); inner_b.pack(fill="x", padx=14, pady=10)
 
         # Close-to-tray toggle (#12)
@@ -135,7 +135,7 @@ class SettingsPage:
 
         def _paint_ct():
             on = M.CLOSE_TO_TRAY
-            self._ct_btn.config(text="ON" if on else "OFF",
+            self._ct_btn.config(text="On" if on else "Off",
                                 bg=M.ACCENT if on else M.BG3,
                                 fg=M.ACCENT_FG if on else M.MUTED)
         def _toggle_ct(_e=None):
@@ -167,7 +167,7 @@ class SettingsPage:
 
         # side="right" stacks right-to-left, so iterate in reverse to get
         # "RESET  −250  value  +250" reading order on screen.
-        b_clr = tk.Label(row_to, text="RESET", fg=M.MUTED, bg=M.BG3,
+        b_clr = tk.Label(row_to, text="Reset", fg=M.MUTED, bg=M.BG3,
                          font=self._f(M.FS_MICRO, True), cursor="hand2",
                          padx=M.SP_SM, pady=M.SP_XS)
         b_clr.pack(side="right", padx=(M.SP_XS, 0))
@@ -193,7 +193,7 @@ class SettingsPage:
                  font=self._f(M.FS_BODY), anchor="w").pack(side="left", fill="x", expand=True)
 
         def _paint_top_set():
-            self._top_set_btn.config(text="ON" if M.ALWAYS_ON_TOP else "OFF",
+            self._top_set_btn.config(text="On" if M.ALWAYS_ON_TOP else "Off",
                                      bg=M.ACCENT if M.ALWAYS_ON_TOP else M.BG3,
                                      fg=M.ACCENT_FG if M.ALWAYS_ON_TOP else M.MUTED)
         self._top_set_btn.bind("<Button-1>",
@@ -210,7 +210,7 @@ class SettingsPage:
                  font=self._f(M.FS_BODY), anchor="w").pack(side="left", fill="x", expand=True)
 
         def _paint_sm():
-            sm_btn.config(text="ON" if M.START_MINIMIZED else "OFF",
+            sm_btn.config(text="On" if M.START_MINIMIZED else "Off",
                           bg=M.ACCENT if M.START_MINIMIZED else M.BG3,
                           fg=M.ACCENT_FG if M.START_MINIMIZED else M.MUTED)
         def _toggle_sm(_e=None):
@@ -250,7 +250,7 @@ class SettingsPage:
 
         # Discord diagnostics
         row_dx = tk.Frame(inner_b, bg=M.BG2); row_dx.pack(fill="x", pady=(M.SP_XS, M.SP_XS + 2))
-        for lbl, cmd in (("RECONNECT", self._reconnect_rpc), ("TEST", self._test_presence)):
+        for lbl, cmd in (("Reconnect", self._reconnect_rpc), ("Test", self._test_presence)):
             b = tk.Label(row_dx, text=lbl, fg=M.TEXT2, bg=M.BG3, font=self._f(M.FS_MICRO, True),
                          cursor="hand2", padx=M.SP_MD, pady=M.SP_XS)
             b.pack(side="right", padx=(M.SP_SM, 0))
@@ -291,7 +291,7 @@ class SettingsPage:
                  font=self._f(7)).pack(anchor="e", pady=(3,0))
 
         # ── Section: Appearance ────────────────────────────────────
-        appear_card = self._collapsible(outer, "APPEARANCE", "appearance")
+        appear_card = self._collapsible(outer, "Appearance", "appearance")
         inner_a = tk.Frame(appear_card, bg=M.BG2); inner_a.pack(fill="x", padx=14, pady=10)
 
         # Dark/Light toggle — custom pill buttons (no ugly Tk radio circles)
@@ -345,7 +345,7 @@ class SettingsPage:
 
         def _paint_anim():
             on = M.ANIMATIONS_ENABLED
-            self._anim_btn.config(text="ON" if on else "OFF",
+            self._anim_btn.config(text="On" if on else "Off",
                                   bg=M.ACCENT if on else M.BG3,
                                   fg=M.ACCENT_FG if on else M.MUTED)
         def _toggle_anim(_e=None):
@@ -359,7 +359,7 @@ class SettingsPage:
         _paint_anim()
 
         # ── Section: Hotkeys ───────────────────────────────────────
-        hotkey_card = self._collapsible(outer, "GLOBAL HOTKEYS", "hotkeys")
+        hotkey_card = self._collapsible(outer, "Global hotkeys", "hotkeys")
         inner_h = tk.Frame(hotkey_card, bg=M.BG2); inner_h.pack(fill="x", padx=14, pady=10)
 
         if not M.KEYBOARD_AVAILABLE:
@@ -411,7 +411,7 @@ class SettingsPage:
                      fg=M.MUTED, bg=M.BG2, font=self._f(7)).pack(anchor="e", pady=(4,0))
 
         # ── Section: Startup ───────────────────────────────────────
-        sys_card = self._collapsible(outer, "SYSTEM", "system")
+        sys_card = self._collapsible(outer, "System", "system")
         inner_sy = tk.Frame(sys_card, bg=M.BG2); inner_sy.pack(fill="x", padx=14, pady=10)
 
         row_su = tk.Frame(inner_sy, bg=M.BG2); row_su.pack(fill="x")
@@ -438,14 +438,14 @@ class SettingsPage:
         row_wp = tk.Frame(inner_sy, bg=M.BG2); row_wp.pack(fill="x", pady=(6,0))
         tk.Label(row_wp, text="Reset window position", fg=M.TEXT2, bg=M.BG2,
                  font=self._f(9), anchor="w").pack(side="left")
-        rst_pos = tk.Label(row_wp, text="CENTER", fg=M.MUTED, bg=M.BG2,
+        rst_pos = tk.Label(row_wp, text="Center", fg=M.MUTED, bg=M.BG2,
                            font=self._f(7,True), cursor="hand2")
         rst_pos.pack(side="right")
         rst_pos.bind("<Button-1>", lambda e: self._center(force=True))
         self._hoverable(rst_pos, fg=lambda: M.MUTED, hover_fg=lambda: M.ACCENT)
 
         # ── Section: Discord RPC Behaviour ────────────────────────
-        rpc_card = self._collapsible(outer, "DISCORD RPC BEHAVIOUR", "rpc")
+        rpc_card = self._collapsible(outer, "Discord RPC behaviour", "rpc")
         inner_rpc = tk.Frame(rpc_card, bg=M.BG2); inner_rpc.pack(fill="x", padx=14, pady=10)
 
         # Feature 7 — paused state toggle
@@ -514,7 +514,7 @@ class SettingsPage:
         tk.Label(row_it2, text="auto", fg=M.MUTED, bg=M.BG2,
                  font=self._f(7)).pack(side="left")
         # ── Section: Discord Profiles ──────────────────────────────
-        prof_card = self._collapsible(outer, "DISCORD PROFILES", "profiles")
+        prof_card = self._collapsible(outer, "Discord profiles", "profiles")
         inner_pr = tk.Frame(prof_card, bg=M.BG2); inner_pr.pack(fill="x", padx=14, pady=10)
 
         tk.Label(inner_pr, text="Save multiple App IDs and switch between them.",
@@ -595,7 +595,7 @@ class SettingsPage:
             # which is not even the SAVE label's auto-generated name — the
             # lookup raised KeyError every time the dialog opened and the
             # button was simply dead. Only the Return key ever worked.
-            save_btn = tk.Label(dlg, text="SAVE", fg=M.ACCENT_FG, bg=M.ACCENT,
+            save_btn = tk.Label(dlg, text="Save", fg=M.ACCENT_FG, bg=M.ACCENT,
                                 font=self._f(M.FS_MICRO, True), cursor="hand2",
                                 padx=M.SP_MD, pady=M.SP_XS + 1)
             save_btn.pack(pady=(8,0))
@@ -640,9 +640,9 @@ class SettingsPage:
             _load_profiles()
             M.log(f"Switched Discord profile to: {new_id}")
 
-        _mk_btn(btn_row, "ADD",    _add_profile)
-        _mk_btn(btn_row, "DELETE", _del_profile)
-        _mk_btn(btn_row, "SWITCH", _switch_profile)
+        _mk_btn(btn_row, "Add",    _add_profile)
+        _mk_btn(btn_row, "Delete", _del_profile)
+        _mk_btn(btn_row, "Switch", _switch_profile)
 
         # Desktop shortcut. This used to open a SECOND settings card, also
         # headed "SYSTEM" — two identically-titled sections on one page, with
@@ -699,7 +699,7 @@ class SettingsPage:
 
         row_sc = tk.Frame(inner_sy, bg=M.BG2); row_sc.pack(fill="x", pady=(6,0))
         tk.Label(row_sc, text="Desktop Access", fg=M.TEXT2, bg=M.BG2, font=self._f(9), anchor="w").pack(side="left")
-        btn_sc = tk.Label(row_sc, text="CREATE SHORTCUT", fg=M.ACCENT_FG, bg=M.ACCENT, 
+        btn_sc = tk.Label(row_sc, text="Create shortcut", fg=M.ACCENT_FG, bg=M.ACCENT, 
                           font=self._f(7,True), cursor="hand2", padx=10, pady=4)
         btn_sc.pack(side="right")
         btn_sc.bind("<Button-1>", lambda e: _do_shortcut())
@@ -775,6 +775,8 @@ class SettingsPage:
         dark = (key == "dark")
         M._apply_palette(dark, M.ACCENT)
         M._cfg_set("preferences", "dark_mode", str(dark).lower())
+        self._apply_titlebar_theme()
+        self._style_scrollbars()
         self._rebuild_all()
         # Re-highlight the active theme pill + active tab
         self._highlight_theme_btn()

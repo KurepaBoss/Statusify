@@ -19,11 +19,11 @@ class HistoryPage:
 
         head = tk.Frame(p, bg=M.BG); head.pack(fill="x", padx=M.SP_LG, pady=(M.SP_MD, M.SP_SM))
         # Not "SESSION HISTORY" — it is restored from disk and spans sessions.
-        tk.Label(head, text="LISTENING HISTORY", fg=M.MUTED, bg=M.BG,
+        tk.Label(head, text="Listening history", fg=M.MUTED, bg=M.BG,
                  font=self._f(M.FS_SMALL, True)).pack(side="left")
         # There was no way to clear history at all — it just accumulated,
         # persisted to disk, and reloaded on every launch.
-        clr = tk.Label(head, text="CLEAR", fg=M.MUTED, bg=M.BG,
+        clr = tk.Label(head, text="Clear", fg=M.MUTED, bg=M.BG,
                        font=self._f(M.FS_MICRO, True), cursor="hand2")
         clr.pack(side="right")
         clr.bind("<Button-1>", lambda e: self._clear_history())
@@ -43,7 +43,7 @@ class HistoryPage:
         self._hist_search.trace_add("write", lambda *_: self._filter_history())
 
         outer = tk.Frame(p, bg=M.BG); outer.pack(fill="both", expand=True, padx=14, pady=(0,14))
-        self._hist_vsb = tk.Scrollbar(outer, bg=M.BG3, troughcolor=M.BG, relief="flat", width=5, bd=0)
+        self._hist_vsb = self._scrollbar(outer)
         self.hist_cv = tk.Canvas(outer, bg=M.BG, highlightthickness=0, yscrollcommand=self._hist_vsb.set)
         self.hist_cv.pack(side="left", fill="both", expand=True)
         self._hist_vsb.config(command=self.hist_cv.yview)
@@ -283,7 +283,7 @@ class HistoryPage:
                  font=self._f(7), anchor="w").pack(fill="x", pady=(0,10), padx=(0,6))
 
         if n > 0:
-            btn = tk.Label(row, text="LYRICS ›", fg=M.MUTED, bg=M.BG2,
+            btn = tk.Label(row, text="Lyrics ›", fg=M.MUTED, bg=M.BG2,
                            font=self._f(7,True), cursor="hand2", padx=M.SP_MD)
             btn.pack(side="right", padx=(0, M.SP_MD))
             self._hoverable(btn, fg=lambda: M.MUTED, hover_fg=lambda: M.ACCENT)
@@ -381,8 +381,7 @@ class HistoryPage:
         # Lyrics content
         frm = tk.Frame(panel, bg=M.BG)
         frm.pack(fill="both", expand=True, padx=14, pady=10)
-        vsb = tk.Scrollbar(frm, command=lambda *a: txt.yview(*a),
-                           bg=M.BG2, troughcolor=M.BG, relief="flat", width=5, bd=0)
+        vsb = self._scrollbar(frm, command=lambda *a: txt.yview(*a))
         vsb.pack(side="right", fill="y")
         txt = tk.Text(frm, bg=M.BG, fg=M.TEXT2, font=self._f(10), relief="flat",
                       wrap="word", padx=10, pady=8, yscrollcommand=vsb.set)
@@ -457,9 +456,9 @@ class HistoryPage:
         if has_synced:
             _mkbtn(foot, "EXPORT .LRC", lambda: self._do_export(e, "lrc"), accent=True)
         _mkbtn(foot, "EXPORT .TXT", lambda: self._do_export(e, "txt"))
-        _mkbtn(foot, "COPY ALL",    lambda: self._copy_all_lyrics(e))
+        _mkbtn(foot, "Copy all",    lambda: self._copy_all_lyrics(e))
         if e.get("track_uri"):
-            _mkbtn(foot, "OPEN IN SPOTIFY", lambda: self._open_in_spotify(e))
+            _mkbtn(foot, "Open in Spotify", lambda: self._open_in_spotify(e))
 
         self._highlight_active_lyric()
 

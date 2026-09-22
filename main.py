@@ -7,6 +7,7 @@ import socket as _socket
 import subprocess
 import tkinter as tk
 import tkinter.font as tkfont
+from tkinter import ttk
 from concurrent.futures import ThreadPoolExecutor
 import ctypes, ctypes.wintypes
 import sys
@@ -1559,7 +1560,7 @@ async def rpc_loop(rpc):
         display = join_lines(group)
         log(f"RPC ({len(group)}L)  ·  {display[:55]}"); event_queue.put(("line", display))
 
-from statusify_colors import _blend, _readable_on
+from statusify_colors import _hex_to_rgb, _blend, _readable_on
 
 # ── GUI colors ────────────────────────────────────────────────────
 def _apply_palette(dark: bool, accent: str):
@@ -1639,6 +1640,7 @@ _apply_palette(_DARK_MODE, ACCENT)
 # Hero album-art size — single source of truth shared by the Now-Playing
 # canvas, the placeholder art (_default_art) and the live art loader (_set_art).
 HERO_ART_PX = 120
+TAB_ANIM_MS = 120   # tab label fade + underline slide
 # Corner radii. Album art was the one large square in a UI made entirely of
 # squares, so it read as an unstyled <img> dropped into the layout.
 HERO_ART_RADIUS = 10
@@ -1682,15 +1684,21 @@ from statusify_ui_settings import SettingsPage
 
 class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
     """
-    Single Tk() window with overrideredirect(True) to remove the OS titlebar.
-    After the window is mapped we use ctypes to set WS_EX_APPWINDOW on the
-    HWND, which forces Windows to show it in the taskbar regardless of the
-    overrideredirect flag.
+    Single Tk() window in a native Windows frame.
+
+    It used to strip the frame (overrideredirect) and draw its own title bar,
+    which cost everything Windows gives a real program: Snap Layouts, the
+    drop shadow, Aero Snap and shake, native minimise/restore animations,
+    resizing from any edge, and a dependable taskbar button — each of which
+    was then partly re-faked with Win32 hacks and hand-placed resize grips.
+    The frame is now the OS's own, tinted to the theme through DWM
+    (_apply_titlebar_theme).
     """
-    # Windows extended style constants
-    GWL_EXSTYLE      = -20
-    WS_EX_APPWINDOW  = 0x00040000
-    WS_EX_TOOLWINDOW = 0x00000080
+    # DWM window attributes (dwmapi.h)
+    DWMWA_USE_IMMERSIVE_DARK_MODE        = 20   # Windows 10 20H1+ / 11
+    DWMWA_USE_IMMERSIVE_DARK_MODE_LEGACY = 19   # Windows 10 1809–1909
+    DWMWA_CAPTION_COLOR                  = 35   # Windows 11 only
+    DWMWA_TEXT_COLOR                     = 36   # Windows 11 only
 
     def __init__(self):
         self._root = tk.Tk()
@@ -1705,13 +1713,11 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
         self._root.resizable(True, True)
         self._root.minsize(460, 580)
         self._root.configure(bg=BG)
-        self._root.overrideredirect(True)
         self._root.protocol("WM_DELETE_WINDOW", self._on_close_button)
         # Tk delivers Windows' WM_QUERYENDSESSION (logoff/shutdown/restart) as
         # WM_SAVE_YOURSELF. Plays are already committed as they happen; this
         # saves the current play's listening time and any debounced config.
         self._root.protocol("WM_SAVE_YOURSELF", self._on_session_end)
-        # Set window icon (.ico applied before and after overrideredirect)
         self._apply_icon()
 
         # Alias so the rest of the code can reference self.win uniformly
@@ -1736,18 +1742,18 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
         # Smooth-scroll chase state for the History list (see _smooth_scroll).
         self._scroll_target = 0.0
         self._scroll_active = False
+        self._style_scrollbars()
         self._build()
         self._tray_start()
         self._poll()
         # Drive the Now-Playing progress bar (~4 fps is smooth enough and cheap).
         self._schedule("progress", 250, self._tick_progress)
 
-        # Apply taskbar fix after the event loop starts (needs HWND to exist)
-        self._schedule("taskbarfix", 100, self._fix_taskbar)
         self._schedule("hotkeys", 200, lambda: _register_hotkeys(self))
-        self._add_resize_handles()
-        # Re-show in taskbar whenever the window is focused back (handles tab-out)
-        self._root.bind("<FocusIn>", lambda e: self._schedule("focusin", 50, self._on_focus_in))
+        # The frame HWND exists once the window is mapped; theme it then (and
+        # again on every map, since Windows can reset it on restore).
+        self._root.bind("<Map>", lambda e: e.widget is self._root and self._apply_titlebar_theme(), add="+")
+        self._root.after_idle(self._apply_titlebar_theme)
         self._bind_shortcuts()
         self._apply_topmost()
         # Persist geometry as the window settles, not on every drag pixel.
@@ -1811,91 +1817,6 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
         self._alive = False
         for key in list(self._timers):
             self._cancel(key)
-
-    def _on_focus_in(self):
-        """Called when main window regains focus — reapply taskbar style."""
-        self._ensure_taskbar()
-
-    def _ensure_taskbar(self):
-        """Reapply WS_EX_APPWINDOW silently — no withdraw/deiconify flicker."""
-        try:
-            user32  = ctypes.windll.user32
-            hwnd_tk = self._root.winfo_id()
-            hwnd    = user32.GetParent(hwnd_tk) or hwnd_tk
-            style   = user32.GetWindowLongW(hwnd, self.GWL_EXSTYLE)
-            style   = (style & ~self.WS_EX_TOOLWINDOW) | self.WS_EX_APPWINDOW
-            user32.SetWindowLongW(hwnd, self.GWL_EXSTYLE, style)
-            # SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_FRAMECHANGED
-            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0001|0x0002|0x0004|0x0020)
-        except Exception:
-            pass
-
-    def _fix_taskbar(self):
-        """
-        Find the real top-level HWND via FindWindowW (title match),
-        set WS_EX_APPWINDOW, send WM_SETICON on every ancestor HWND,
-        then walk up the parent chain to catch the wrapper window too.
-        """
-        try:
-            global _ICON_PATH
-            if _ICON_PATH is None:
-                _ICON_PATH = _write_icon()
-
-            user32 = ctypes.windll.user32
-
-            LR_LOADFROMFILE = 0x00000010
-            IMAGE_ICON      = 1
-            WM_SETICON      = 0x0080
-            ICON_SMALL      = 0
-            ICON_BIG        = 1
-
-            hicon_big = user32.LoadImageW(
-                None, _ICON_PATH, IMAGE_ICON, 256, 256, LR_LOADFROMFILE)
-            hicon_small = user32.LoadImageW(
-                None, _ICON_PATH, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
-
-            # Collect every HWND that could own the taskbar button:
-            # the tk widget id, its parent, and the FindWindowW result by title
-            hwnd_tk     = self._root.winfo_id()
-            hwnd_parent = user32.GetParent(hwnd_tk)
-            hwnd_title  = user32.FindWindowW(None, "Statusify")
-
-            candidates = {h for h in (hwnd_tk, hwnd_parent, hwnd_title) if h}
-
-            # Also walk the ancestor chain from each candidate
-            for hwnd in list(candidates):
-                h = hwnd
-                for _ in range(6):
-                    p = user32.GetParent(h)
-                    if p: candidates.add(p); h = p
-                    else: break
-
-            for hwnd in candidates:
-                # Apply WS_EX_APPWINDOW style
-                style = user32.GetWindowLongW(hwnd, self.GWL_EXSTYLE)
-                style = (style & ~self.WS_EX_TOOLWINDOW) | self.WS_EX_APPWINDOW
-                user32.SetWindowLongW(hwnd, self.GWL_EXSTYLE, style)
-                # Send icon messages
-                if hicon_big:
-                    user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG,   hicon_big)
-                if hicon_small:
-                    user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
-
-            # Refresh so the shell picks up the new icon.
-            # Save Toplevel children first — withdraw() hides them and
-            # deiconify() won't restore them automatically.
-            popups = [w for w in self._root.winfo_children()
-                      if isinstance(w, tk.Toplevel) and w.winfo_viewable()]
-            self._root.withdraw()
-            def _restore(popups=popups):
-                self._root.deiconify()
-                for p in popups:
-                    try: p.deiconify()
-                    except Exception: pass
-            self._root.after(10, _restore)
-            self._root.after(100, self._apply_icon)
-        except Exception as e:
-            log(f"Taskbar fix skipped: {e}")
 
     def _apply_icon(self):
         """Apply the embedded .ico as the window and taskbar icon."""
@@ -2153,7 +2074,7 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
         if btn is None:
             return
         try:
-            btn.config(text="RPC ON" if _rpc_enabled else "RPC OFF",
+            btn.config(text="RPC on" if _rpc_enabled else "RPC off",
                        bg=ACCENT if _rpc_enabled else BG3,
                        fg=ACCENT_FG if _rpc_enabled else MUTED)
         except tk.TclError:
@@ -2229,109 +2150,64 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
         _teardown_and_exit()
 
     def _minimize(self):
-        # Minimize at Win32 level so overrideredirect(True) is never touched.
+        self._root.iconify()
+
+    SCROLLBAR_STYLE = "Statusify.Vertical.TScrollbar"
+
+    def _style_scrollbars(self):
+        """Theme the ttk scrollbar style from the current palette.
+
+        Tk's classic Scrollbar is drawn by Windows and ignores bg/trough
+        colours, so on the dark theme every list had a bright white bar down
+        its side. The 'clam' ttk theme honours colours; its layout is cut down
+        to trough + thumb (no arrow buttons), like a modern overlay bar.
+        Called again on theme change."""
         try:
-            user32  = ctypes.windll.user32
-            SW_MINIMIZE = 6
-            hwnd = user32.GetParent(self._root.winfo_id()) or self._root.winfo_id()
-            user32.ShowWindow(hwnd, SW_MINIMIZE)
+            st = ttk.Style(self._root)
+            if st.theme_use() != "clam":
+                st.theme_use("clam")
+            st.layout(self.SCROLLBAR_STYLE, [
+                ("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+                    ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
+            st.configure(self.SCROLLBAR_STYLE, troughcolor=BG, background=BG4,
+                         bordercolor=BG, lightcolor=BG4, darkcolor=BG4,
+                         arrowsize=8, gripcount=0, relief="flat", borderwidth=0)
+            st.map(self.SCROLLBAR_STYLE,
+                   background=[("pressed", MUTED), ("active", MUTED)],
+                   lightcolor=[("pressed", MUTED), ("active", MUTED)],
+                   darkcolor=[("pressed", MUTED), ("active", MUTED)])
+        except tk.TclError as e:
+            log(f"Scrollbar styling skipped: {e}")
+
+    def _scrollbar(self, parent, **kw):
+        return ttk.Scrollbar(parent, orient="vertical", style=self.SCROLLBAR_STYLE, **kw)
+
+    def _apply_titlebar_theme(self):
+        """Tint the native title bar to match the current theme.
+
+        Dark mode (Windows 10 20H1+ and 11) switches the caption to Windows'
+        dark style; on Windows 11 the caption and its text also take the
+        app's exact background and text colours, so the frame and the
+        content read as one surface. Older Windows ignore the attributes."""
+        try:
+            dwm  = ctypes.windll.dwmapi
+            hwnd = int(self._root.wm_frame(), 16)
+
+            def _set(attr, value):
+                v = ctypes.c_int(value)
+                return dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), ctypes.sizeof(v))
+
+            dark = 1 if _DARK_MODE else 0
+            if _set(self.DWMWA_USE_IMMERSIVE_DARK_MODE, dark) != 0:
+                _set(self.DWMWA_USE_IMMERSIVE_DARK_MODE_LEGACY, dark)
+
+            def _colorref(hex_c):
+                r, g, b = _hex_to_rgb(hex_c)
+                return r | (g << 8) | (b << 16)
+            _set(self.DWMWA_CAPTION_COLOR, _colorref(BG))
+            _set(self.DWMWA_TEXT_COLOR, _colorref(TEXT2))
         except Exception as e:
-            log(f"Minimize failed: {e}")
-            self._root.iconify()
-
-    def _add_resize_handles(self):
-        """Add resize grips to all edges/corners (overrideredirect removes OS ones)."""
-        W = self._root
-        sz = 6
-
-        EDGE_MAP = {
-            "se": ("bottom_right_corner", dict(relx=1.0, rely=1.0, anchor="se", width=sz*2, height=sz*2)),
-            "sw": ("bottom_left_corner",  dict(relx=0.0, rely=1.0, anchor="sw", width=sz*2, height=sz*2)),
-            "ne": ("top_right_corner",    dict(relx=1.0, rely=0.0, anchor="ne", width=sz*2, height=sz*2)),
-            "nw": ("top_left_corner",     dict(relx=0.0, rely=0.0, anchor="nw", width=sz*2, height=sz*2)),
-            "e":  ("right_side",          dict(relx=1.0, rely=0.0, anchor="ne", width=sz,    relheight=1.0)),
-            "w":  ("left_side",           dict(relx=0.0, rely=0.0, anchor="nw", width=sz,    relheight=1.0)),
-            "s":  ("bottom_side",         dict(relx=0.0, rely=1.0, anchor="sw", relwidth=1.0, height=sz)),
-            "n":  ("top_side",            dict(relx=0.0, rely=0.0, anchor="nw", relwidth=1.0, height=sz)),
-        }
-
-        def _make_outline(x, y, w, h):
-            """Create a dotted-border overlay showing the target resize dimensions."""
-            ov = tk.Toplevel(W)
-            ov.overrideredirect(True)
-            ov.attributes("-topmost", True)
-            ov.attributes("-transparentcolor", "#010101")
-            ov.configure(bg="#010101")
-            ov.geometry(f"{w}x{h}+{x}+{y}")
-            # Draw dotted border using a Canvas
-            cv = tk.Canvas(ov, bg="#010101", highlightthickness=0,
-                           width=w, height=h)
-            cv.pack(fill="both", expand=True)
-            dash = (4, 4)
-            cv.create_rectangle(2, 2, w-2, h-2,
-                                 outline=ACCENT, width=2, dash=dash, tags="border")
-            cv.create_text(w//2, h//2, text=f"{w} × {h}",
-                           fill=ACCENT, font=("Segoe UI", 9), tags="label")
-            return ov, cv
-
-        def _start(e, edge):
-            W._re  = edge
-            W._rx  = e.x_root
-            W._ry  = e.y_root
-            W._rx0 = W.winfo_x()
-            W._ry0 = W.winfo_y()
-            W._rw  = W.winfo_width()
-            W._rh  = W.winfo_height()
-            W._resize_pending = None
-            ov, cv = _make_outline(W._rx0, W._ry0, W._rw, W._rh)
-            W._resize_ov = ov
-            W._resize_cv = cv
-
-        def _drag(e):
-            edge = getattr(W, "_re", None)
-            if not edge: return
-            dx = e.x_root - W._rx
-            dy = e.y_root - W._ry
-            x, y, w, h = W._rx0, W._ry0, W._rw, W._rh
-            if "e" in edge: w = max(420, w + dx)
-            if "s" in edge: h = max(520, h + dy)
-            if "w" in edge:
-                nw = max(420, w - dx); x = W._rx0 + (W._rw - nw); w = nw
-            if "n" in edge:
-                nh = max(520, h - dy); y = W._ry0 + (W._rh - nh); h = nh
-            W._resize_pending = (x, y, w, h)
-            # Update outline — move/resize existing items, no delete/recreate
-            try:
-                ov = W._resize_ov
-                cv = W._resize_cv
-                ov.geometry(f"{w}x{h}+{x}+{y}")
-                cv.config(width=w, height=h)
-                cv.coords("border", 2, 2, w-2, h-2)
-                cv.itemconfig("label", text=f"{w} × {h}")
-                cv.coords("label", w//2, h//2)
-            except Exception:
-                pass
-
-        def _stop(e):
-            W._re = None
-            try:
-                W._resize_ov.destroy()
-                del W._resize_ov, W._resize_cv
-            except Exception:
-                pass
-            pending = getattr(W, "_resize_pending", None)
-            if pending:
-                x, y, w, h = pending
-                W.geometry(f"{w}x{h}+{x}+{y}")
-                W._resize_pending = None
-
-        for edge, (cursor, kw) in EDGE_MAP.items():
-            f = tk.Frame(W, bg=BG, cursor=cursor)
-            f.place(**kw)
-            f.bind("<ButtonPress-1>",   lambda e, ed=edge: _start(e, ed))
-            f.bind("<B1-Motion>",       _drag)
-            f.bind("<ButtonRelease-1>", _stop)
-            f.lift()
+            log(f"Title bar theming skipped: {e}")
 
     def mainloop(self):
         self._root.mainloop()
@@ -2562,39 +2438,11 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
 
     def _build(self):
         W = self.win
-        # ── Custom title bar ──────────────────────────────────────
-        bar = tk.Frame(W, bg=BG, height=42); bar.pack(fill="x"); bar.pack_propagate(False)
-        bar.bind("<ButtonPress-1>",
-            lambda e: (setattr(self,"_ox",e.x_root-W.winfo_x()), setattr(self,"_oy",e.y_root-W.winfo_y())))
-        bar.bind("<B1-Motion>",
-            lambda e: W.geometry(f"+{e.x_root-self._ox}+{e.y_root-self._oy}"))
-
-        # Logo in titlebar — replaces the ♪ text symbol
-        try:
-            from io import BytesIO
-            _logo_img = Image.open(BytesIO(base64.b64decode(_ICON_B64))).resize((20,20), Image.LANCZOS)
-            self._logo_photo = ImageTk.PhotoImage(_logo_img)
-            tk.Label(bar, image=self._logo_photo, bg=BG, bd=0).pack(side="left", padx=(14,6))
-        except Exception:
-            tk.Label(bar, text="♪", fg=ACCENT, bg=BG, font=self._f(11)).pack(side="left", padx=(14,5))
-
-        tk.Label(bar, text="STATUSIFY", fg=TEXT2, bg=BG, font=self._f(8,True)).pack(side="left")
-
-        # hov is a callable, not a colour: the palette globals get rebound on
-        # every theme change, so a value captured here would freeze.
-        for txt, cmd, hov in [("✕", self._on_close_button, lambda: DANGER),
-                              ("—", self._minimize,        lambda: TEXT)]:
-            b = tk.Label(bar, text=txt, fg=MUTED, bg=BG, font=self._f(10),
-                         cursor="hand2", padx=SP_MD, pady=SP_XS + 2)
-            b.pack(side="right")
-            b.bind("<Button-1>", lambda e, c=cmd: c())
-            self._hoverable(b, fg=lambda: MUTED, hover_fg=hov, duration_ms=90)
-
         # ── Tab bar ───────────────────────────────────────────────
         tabs = tk.Frame(W, bg=BG2, height=36); tabs.pack(fill="x"); tabs.pack_propagate(False)
         self._tab_btns = {}
         for name in ("NOW PLAYING", "HISTORY", "SETTINGS"):
-            b = tk.Label(tabs, text=name, fg=MUTED, bg=BG2,
+            b = tk.Label(tabs, text=name.capitalize(), fg=MUTED, bg=BG2,
                          font=self._f(FS_SMALL, True), cursor="hand2",
                          padx=SP_LG, pady=SP_SM + 2)
             b.pack(side="left")
@@ -2649,18 +2497,24 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
         if self._cur_page == "SETTINGS" and hasattr(self, "set_cv"):
             try: self._set_scroll_pos = self.set_cv.yview()[0]
             except Exception: pass
-        if self._cur_page: self._pages[self._cur_page].pack_forget()
-        self._pages[name].pack(fill="both", expand=True)
+        # Pages are stacked in one spot and raised, never re-packed. Packing a
+        # page made Tk lay out its whole widget tree again, so every tab click
+        # cost ~60 ms (several frames) — the app felt a beat behind the mouse.
+        page = self._pages[name]
+        if not page.winfo_manager():
+            page.place(x=0, y=0, relwidth=1, relheight=1)
+        page.tkraise()
         self._cur_page = name
         # Restore where the user last was on the Settings page.
         if name == "SETTINGS" and hasattr(self, "set_cv"):
             pos = getattr(self, "_set_scroll_pos", 0.0)
             self._root.after_idle(lambda: self._safe_yview(self.set_cv, pos))
-        # Cross-fade the labels over the same 220 ms the underline takes to
+        # Cross-fade the labels over the same time the underline takes to
         # travel, so the colour change reads as one movement with the slide
-        # rather than as a separate flash.
+        # rather than as a separate flash. Kept short: a tab switch should
+        # feel instant, and 220 ms read as lag.
         for n, b in self._tab_btns.items():
-            self._fade_colors(f"tabfg:{n}", b, 220, fg=ACCENT if n == name else MUTED)
+            self._fade_colors(f"tabfg:{n}", b, TAB_ANIM_MS, fg=ACCENT if n == name else MUTED)
         self._move_tab_line()
 
     @staticmethod
@@ -2711,7 +2565,7 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
                         y=y,
                         width=int(round(cur_w + (target_w - cur_w) * t)),
                     )
-                self._animate("tabline", 220, _apply)
+                self._animate("tabline", TAB_ANIM_MS, _apply)
             self._tab_line.lift()
         except tk.TclError:
             pass
@@ -2930,7 +2784,7 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
         cf = tk.Frame(dlg, bg=BG2)
         cf.pack(fill="both", expand=True, padx=20, pady=16)
 
-        scrollbar = tk.Scrollbar(cf, bg=BG3, troughcolor=BG2, relief="flat", width=12, bd=0)
+        scrollbar = self._scrollbar(cf)
         scrollbar.pack(side="right", fill="y")
         txt = tk.Text(cf, bg=BG2, fg=TEXT2, font=self._f(8), relief="flat",
                       wrap="word", yscrollcommand=scrollbar.set, padx=10, pady=10)
@@ -2942,7 +2796,7 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
 
         bf = tk.Frame(dlg, bg=BG)
         bf.pack(fill="x", pady=(0, 20))
-        btn_no = tk.Label(bf, text="LATER", fg=MUTED, bg=BG, font=self._f(8, True), cursor="hand2")
+        btn_no = tk.Label(bf, text="Later", fg=MUTED, bg=BG, font=self._f(8, True), cursor="hand2")
         btn_no.pack(side="left", padx=30)
         btn_no.bind("<Button-1>", lambda e: dlg.destroy())
 
@@ -2951,12 +2805,12 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
         # exes and source checkouts can't be updated that way, so they keep
         # the browser link.
         auto = bool(setup) and _maint.is_installed(_APP_DIR, _FROZEN)
-        btn_yes = tk.Label(bf, text="INSTALL UPDATE" if auto else "DOWNLOAD",
+        btn_yes = tk.Label(bf, text="Install update" if auto else "DOWNLOAD",
                            fg=ACCENT_FG, bg=ACCENT, font=self._f(8, True), cursor="hand2", padx=16, pady=6)
         btn_yes.pack(side="right", padx=30)
 
         def _install():
-            btn_yes.config(text="DOWNLOADING…", cursor="watch"); btn_yes.unbind("<Button-1>")
+            btn_yes.config(text="Downloading…", cursor="watch"); btn_yes.unbind("<Button-1>")
             dest = os.path.join(tempfile.gettempdir(), "statusify-update")
             def work():
                 try:
@@ -3121,7 +2975,7 @@ def _run_setup_wizard():
             pass
         dlg.destroy()
 
-    btn = tk.Label(dlg, text="SAVE & CONTINUE", fg="#0a0a0a", bg="#1db954",
+    btn = tk.Label(dlg, text="Save & continue", fg="#0a0a0a", bg="#1db954",
                    font=("Segoe UI", 9, "bold"), cursor="hand2",
                    padx=16, pady=6)
     btn.pack(pady=(8, 0))

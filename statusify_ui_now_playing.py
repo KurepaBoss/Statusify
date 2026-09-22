@@ -65,7 +65,7 @@ class NowPlayingPage:
         self._redraw_progress()
 
         lbox = tk.Frame(p, bg=M.BG3); lbox.pack(fill="x", padx=M.SP_LG, pady=(M.SP_SM, M.SP_XS))
-        tk.Label(lbox, text="NOW ON DISCORD", fg=M.MUTED, bg=M.BG3,
+        tk.Label(lbox, text="Now on Discord", fg=M.MUTED, bg=M.BG3,
                  font=self._f(M.FS_MICRO, True)).pack(anchor="w", padx=M.SP_LG,
                                                     pady=(M.SP_MD, 0))
         self.lbl_lyric = tk.Label(lbox, text="—", fg=M.MUTED, bg=M.BG3,
@@ -81,9 +81,9 @@ class NowPlayingPage:
         # Header row: label + RESET
         delay_header = tk.Frame(delay_outer, bg=M.BG2)
         delay_header.pack(fill="x", padx=12, pady=(8,4))
-        tk.Label(delay_header, text="LYRIC DELAY", fg=M.MUTED, bg=M.BG2,
+        tk.Label(delay_header, text="Lyric delay", fg=M.MUTED, bg=M.BG2,
                  font=self._f(7,True)).pack(side="left")
-        rst = tk.Label(delay_header, text="RESET", fg=M.MUTED, bg=M.BG2,
+        rst = tk.Label(delay_header, text="Reset", fg=M.MUTED, bg=M.BG2,
                        font=self._f(7), cursor="hand2")
         rst.pack(side="right")
         rst.bind("<Button-1>", lambda e: _reset_delay())
@@ -166,7 +166,7 @@ class NowPlayingPage:
             btn.bind("<Leave>", lambda e: self._fade_colors(
                 key, btn, 110, fg=rest_fg(), bg=rest_bg()))
 
-        self._rpc_btn = _act("RPC ON", self._toggle_rpc_btn, accent=True)
+        self._rpc_btn = _act("RPC on", self._toggle_rpc_btn, accent=True)
         _stateful_hover(
             self._rpc_btn,
             rest_fg=lambda: M.ACCENT_FG if M._rpc_enabled else M.MUTED,
@@ -178,8 +178,8 @@ class NowPlayingPage:
                             else M.ACCENT_SOFT),
         )
         self._paint_rpc_btn()
-        _act("MINI", self._toggle_mini)
-        self._top_btn = _act("ON TOP", self._toggle_topmost)
+        _act("Mini", self._toggle_mini)
+        self._top_btn = _act("On top", self._toggle_topmost)
         _stateful_hover(
             self._top_btn,
             rest_fg=lambda: M.ACCENT if M.ALWAYS_ON_TOP else M.MUTED,
@@ -188,7 +188,7 @@ class NowPlayingPage:
             hov_bg=lambda: M.ACCENT_SOFT,
         )
         self._paint_topmost_btn()
-        _act("COPY", self._copy_current_lyric)
+        _act("Copy", self._copy_current_lyric)
 
         sb = tk.Frame(p, bg=M.BG); sb.pack(fill="x", padx=M.SP_LG, pady=(M.SP_SM, M.SP_XS))
         self.dot_sp = tk.Label(sb, text="●", fg=M.MUTED, bg=M.BG, font=self._f(M.FS_MICRO)); self.dot_sp.pack(side="left")
@@ -210,7 +210,7 @@ class NowPlayingPage:
         self.lbl_dropped.pack(side="right")
 
         tk.Frame(p, bg=M.BORDER, height=1).pack(fill="x", padx=14, pady=(2,6))
-        tk.Label(p, text="LOG", fg=M.MUTED, bg=M.BG, font=self._f(7,True)).pack(anchor="w", padx=14)
+        tk.Label(p, text="Log", fg=M.MUTED, bg=M.BG, font=self._f(7,True)).pack(anchor="w", padx=14)
         lf = tk.Frame(p, bg=M.BG2); lf.pack(fill="both", expand=True, padx=14, pady=(3,14))
         self.log_txt = tk.Text(lf, bg=M.BG2, fg=M.TEXT2, font=tkfont.Font(family="Consolas", size=8),
                                relief="flat", state="disabled", wrap="word", padx=8, pady=6)
