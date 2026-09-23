@@ -1,9 +1,9 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/KurepaBoss/Statusify/main/statusify_icon_preview.png" width="128" />
-  <h1>Statusify v2.0.1</h1>
+  <h1>Statusify v2.1.0</h1>
   <p><strong>The ultimate Discord Rich Presence & Spotify Lyrics bridge.</strong></p>
 
-  ![Statusify v2.0.1](https://img.shields.io/badge/Statusify-v2.0.1-brightgreen?style=for-the-badge)
+  ![Statusify v2.1.0](https://img.shields.io/badge/Statusify-v2.1.0-brightgreen?style=for-the-badge)
   ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge)
   ![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078d6?style=for-the-badge)
   ![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
@@ -22,31 +22,31 @@ Lyrics come straight from Spicetify over a local WebSocket — no API keys, no p
 
 ---
 
-## 🆕 What's New in v2.0.1
+## 🆕 What's New in v2.1.0
 
-Statusify 2.0 is a new app on the outside. If you're coming from 1.x, everything since v1.4.0 is below.
+**Karaoke lyrics.** When the lyrics have word timing (most Spicy Lyrics tracks do), each word lights up as it's sung, with the word being sung filling from left to right. Instrumental breaks show three breathing dots that fill up over the gap instead of a blank line.
 
-**A lyric sheet that moves with the music.** The Lyrics page is rebuilt from scratch. The background is the album cover's own colours drifting slowly like thick water, heavily blurred, and it flows into the next cover's colours when the track changes. When a new line starts, the sheet glides up: the new line sharpens and brightens, and lines further away soften and dim. Colours are kept dark (or light) enough that the words stay readable on any cover. Japanese, Chinese, Korean and Thai lyrics are drawn with the right fonts.
+**A desktop lyrics overlay.** A transparent strip that shows the current line (and optionally the next one) on top of anything, including borderless games. Clicks pass straight through it. Unlock it to drag it or scroll to resize, then lock it again. Turn it on with the *Overlay* button, the tray menu, `Ctrl+Alt+O`, or *Settings → Lyrics*.
 
-**Control Spotify from Statusify.** Previous, play/pause and next buttons sit under the progress bar. The bar is a seek bar: hover it to see the time under the pointer, then click or drag. Scroll the lyrics with the mouse wheel to read ahead or back, hover a line to highlight it, and click it to jump there. The sheet drifts back to the line being sung a few seconds after you stop. Keyboard: `Space` play/pause, `←`/`→` seek 5 s, `Ctrl+←`/`Ctrl+→` previous/next.
+**A new Stats tab.** Your recently played songs with covers and times, a GitHub-style heatmap of plays per day, your top songs, the listening overview that used to live in Settings, and a monthly *Wrapped* card (top song, top artist, listening time, busiest hour, longest streak) that you can save or copy as an image.
 
-**A redesigned Settings page.** Grouped cards, one clear row per setting with a short explanation, proper switches and buttons, and scrolling that no longer tears or leaves rows behind. The Listening section now shows big, readable numbers for this session, the last 7 days and all time, plus your top five artists for each.
+**More control over Spotify.** Shuffle, repeat and like buttons, and volume on the mouse wheel over the play button or speaker icon (click the speaker to mute). *Up Next* shows your queue; click a song to jump to it. Shortcuts: `Ctrl+↑/↓` volume, `Ctrl+S` shuffle, `Ctrl+R` repeat, `Ctrl+L` like.
 
-**Faster on slower PCs.** The lyric page measures how long it takes to draw and eases off on its own (fewer frames, then a still background) when a PC is struggling. You can also pick *Auto*, *Smooth* or *Fast* under *Appearance → Performance*. Unchanged frames are skipped, lyric lines are drawn only when they come on screen, lines land exactly on time even at a low frame rate, and the stats queries moved off the UI thread. Pausing no longer makes Statusify rewrite its database twice a second.
+**Lyrics that are right, and ready.** The next song's lyrics load while the current one plays, so the sheet is never empty at a track change. If a song has the wrong lyrics, *⋯ → Wrong lyrics? Search…* lets you pick the right version from LRCLIB, and your choice is kept for that song.
 
-**History that actually persists.** History used to be written only when you clicked Quit, so logging off, a crash or an update threw the session away. It now lives in a small SQLite database (`history.db`) and every play is saved the moment it starts. Your old `history.json` is imported automatically. The History tab shows restored history again, and search covers everything you've played: title, artist and lyrics.
+**Romanised and translated lines.** Under each lyric line, optionally show a romanisation (Japanese, Chinese, Korean, Cyrillic, Greek and more) and/or a translation into your language. Results are cached, so replays work offline. *Settings → Lyrics → Under each line.*
 
-**Lyrics more often, and faster.** Lyrics for a track you've heard before load instantly from a local cache. When Spicy Lyrics and Spotify both come up empty, Statusify tries [LRCLIB](https://lrclib.net) and accepts a result only if it matches the track's length.
+**Share a line.** Right-click any lyric line to copy it or turn it into a 1080×1350 image with the song's colours and cover.
 
-**Your friends see the song, not "Spotify".** The member list reads *Listening to &lt;song&gt;*, the title and album art link to the track, and the progress bar is millisecond-accurate. Each can be switched off in Settings.
+**Fullscreen.** `F11` fills the screen with big lyrics; the controls fade away until you move the mouse.
 
-**A real Windows window.** The native frame is back, with Snap Layouts, the drop shadow and resizing from any edge. Its title bar takes the album's colour.
+**A better mini player.** A rounded pill with the cover, the lyric and play controls. It snaps to screen corners and edges and fades when you're not using it. The tray icon's tooltip shows the song and the current line; middle-click it to play or pause.
 
-**Updating from 1.x:** the Spotify bridge gained the playback commands, so it has to be re-applied once. The installer does this for you. If you run from source, click the *Lyrics bridge out of date* message under the status dots after updating.
+**Smaller things.** Pick the lyric font and size. The background can pulse gently with the beat when beat data is available. A sleep timer pauses Spotify after 15, 30 or 60 minutes or at the end of the song. The delay stepper now saves timing per song (shift-click for the global delay). Discord shows the album on hover and a *Listen on Spotify* button. If a Spotify update breaks the bridge, Statusify notices and offers a one-click repair. Animations now run at a true 60 fps on *Smooth* (they were capped near 32 by Windows' timer).
 
-**2.0.1 fix: Settings could flip a setting you didn't touch.** In 2.0.0, after the Settings page re-laid itself out (for example when the listening stats finished loading), clicking an ordinary row could toggle a switch that had been in that spot before. Click targets are now unique to the current layout. If a setting changed by itself in 2.0.0 (*Start minimised to the tray* is the likely one), set it back once and it will stay.
+**Updating:** the Spotify bridge changed, so it has to be re-applied once. The installer does this for you; if you run from source, click the *Lyrics bridge out of date* message after updating.
 
-Notes for earlier versions are on the [Releases page](https://github.com/KurepaBoss/Statusify/releases).
+Notes for v2.0 and earlier are on the [Releases page](https://github.com/KurepaBoss/Statusify/releases).
 
 ---
 
@@ -62,17 +62,18 @@ Notes for earlier versions are on the [Releases page](https://github.com/KurepaB
 - ⏱️ **Lyric timing offset** — a global delay slider, plus a per-track offset that is remembered for songs whose lyrics are permanently early or late.
 
 **The app itself**
-- 🌊 **A living lyric sheet** — album colours flowing behind the words, lines that glide, sharpen and fade.
-- ⏯️ **Playback controls** — previous, play/pause, next, a seek bar, and click-a-lyric-line to jump there.
+- 🌊 **A living lyric sheet** — album colours flowing behind the words, lines that glide, sharpen and fade, word-by-word karaoke highlighting, and optional romanised or translated lines.
+- 🪟 **Desktop overlay** — the current lyric floating over any app or game, click-through.
+- ⏯️ **Playback controls** — previous, play/pause, next, shuffle, repeat, like, volume, a seek bar, an Up Next queue, and click-a-lyric-line to jump there.
 - 🚀 **Zero-config startup** — a setup wizard on first run and self-installing dependencies.
 - 📂 **Listening history** — every play saved as it happens, with its date; search everything you've played by song, artist, or even lyric content, and export any track's lyrics as a timestamped `.lrc` or plain `.txt`.
 - 🎭 **Multi-profile support** — manage multiple Discord Application IDs and switch between them instantly.
-- 🪟 **Mini mode** — collapse to a compact, always-visible bar.
+- 💊 **Mini player** — a compact pill with cover, lyric and controls that snaps to screen edges.
 - 🔔 **System tray** — close-to-tray, so Statusify keeps running out of the way.
 - 🎨 **Themes** — smooth dark and light modes with custom accent colours.
 - ⌨️ **Global hotkeys** for toggling RPC, skipping the current track, and skipping instrumentals.
 - 🚫 **Blacklist** — case-insensitive terms matched against artist and title, so anything you'd rather not broadcast never reaches Discord.
-- 📊 **Listening stats** — this session, the last 7 days and all time: plays, listening time and top artists.
+- 📊 **Stats tab** — recently played, a plays-per-day heatmap, top songs and artists, and a monthly Wrapped card you can save as an image.
 - ⚙️ **Start with Windows**, optionally minimised.
 - 🔄 **Update checker** — reads the repo's releases in the background and shows you the changelog for anything newer.
 - 🖥️ **Retina-ready UI** — native High-DPI support for crystal-clear text on any Windows scaling mode.
@@ -148,7 +149,7 @@ Your preferences live in `statusify.cfg`, written next to `main.py` — or next 
 | Setting | Notes |
 | --- | --- |
 | **Theme** | Dark / light, plus a custom accent colour. |
-| **Hotkeys** | Defaults: `Ctrl+Alt+S` toggle RPC, `Ctrl+Alt+N` skip track, `Ctrl+Alt+I` skip instrumental. |
+| **Hotkeys** | Defaults: `Ctrl+Alt+S` toggle RPC, `Ctrl+Alt+N` skip track, `Ctrl+Alt+I` skip instrumental, `Ctrl+Alt+O` desktop overlay. |
 | **Lyric delay** | Global offset in ms, with a per-track override for stubborn songs. |
 | **Behaviour** | Close-to-tray, always-on-top, start minimised. |
 | **Startup** | Launch Statusify with Windows. |
@@ -161,7 +162,8 @@ Your preferences live in `statusify.cfg`, written next to `main.py` — or next 
 | --- | --- |
 | `statusify.cfg` | Your preferences and window geometry. |
 | `.env` | Your Discord Application ID. |
-| `history.db` | Listening history and the lyrics cache (SQLite). A legacy `history.json` is imported once and renamed `history.json.migrated`. |
+| `history.db` | Listening history, the lyrics cache and lyrics you picked by hand (SQLite). A legacy `history.json` is imported once and renamed `history.json.migrated`. |
+| `translations.db` | Cached romanisations and translations of lyric lines. |
 | `statusify.log` | Timestamped diagnostic log; rotates to `.old` past 512 KB. |
 | `.artcache/` | Cached album art, keyed by URL hash. |
 | `exports/` | Lyrics you export as `.lrc` / `.txt`. |

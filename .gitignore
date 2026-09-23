@@ -12,6 +12,9 @@ history.json.migrated
 history.db
 history.db-wal
 history.db-shm
+translations.db
+translations.db-wal
+translations.db-shm
 exports/
 *.jpg
 *.png
