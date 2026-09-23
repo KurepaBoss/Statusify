@@ -38,6 +38,9 @@ STATUS_DISPLAY_NAME    = 0
 STATUS_DISPLAY_DETAILS = 2
 status_display_type = STATUS_DISPLAY_DETAILS
 link_track = True       # title/art link to the track on open.spotify.com
+listen_button = True    # a "Listen on Spotify" button under the presence
+album_fn = lambda: ""   # returns the current track's album name
+LISTEN_LABEL = "Listen on Spotify"   # Discord caps button labels at 32 chars
 
 
 def configure(log_fn, emit_fn, recv_executor, send_executor, max_state=None,
@@ -167,16 +170,27 @@ class DiscordRPC:
         # Listening presence in SEPARATE slots, so tagging this as Listening lets
         # it coexist with a running game instead of fighting it for the single
         # "Playing" slot — exactly how Spotify stays visible while you game.
-        # large_text is the smaller secondary line Discord renders under the
-        # details/state — showing the full "title — artist" there just repeated
-        # the top line, so use it for the creator only.
+        # large_text is the hover text on the cover art: the album, as on
+        # Spotify's own presence. Discord rejects the whole activity if a
+        # text field is shorter than 2 characters, so a one-letter album
+        # falls back to the artist.
+        try:
+            album = (album_fn() or "").strip()
+        except Exception:
+            album = ""
+        hover = next((t for t in (album, artist, label) if t and len(t.strip()) >= 2), label)
         act = {"type": 2, "details": label,
                "status_display_type": status_display_type,
-               "assets": {"large_image": art or "spotify", "large_text": (artist or label)[:128]}}
-        url = track_url(uri_fn()) if link_track else None
+               "assets": {"large_image": art or "spotify", "large_text": hover[:128]}}
+        page = track_url(uri_fn())
+        url = page if link_track else None
         if url:
             act["details_url"] = url
             act["assets"]["large_url"] = url
+        # Buttons ride in the same SET_ACTIVITY payload, so they cost nothing
+        # against the rate budget. Discord shows them to other people only.
+        if listen_button and page:
+            act["buttons"] = [{"label": LISTEN_LABEL[:32], "url": page}]
         f = [l for l in lines if l]
         act["state"] = join_lines(f)[:MAX_STATE] if f else "— "
         # Add elapsed/remaining timer — this is part of the activity payload,

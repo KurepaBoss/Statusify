@@ -510,7 +510,8 @@
             // empty. The retry now loops over the lyric fetch alone.
             console.log("[LyricsBridge] Sending track_change:", title, "—", artist);
             send({ type: "track_change", artist, title, track_uri: trackUri,
-                   album_art: albumArt, duration_ms: durMs });
+                   album_art: albumArt, duration_ms: durMs,
+                   album: item.metadata?.album_title || "" });
 
             let found = null;
             for (let attempt = 0; attempt < LYRIC_ATTEMPTS; attempt++) {
