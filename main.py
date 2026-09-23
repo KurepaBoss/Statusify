@@ -1052,6 +1052,12 @@ _rpc_mod.status_display_type = (
     if _cfg_get("preferences", "status_shows_song", "true").lower() == "true"
     else _rpc_mod.STATUS_DISPLAY_NAME)
 _rpc_mod.link_track = _cfg_get("preferences", "link_track", "true").lower() == "true"
+_rpc_mod.listen_button = _cfg_get("preferences", "listen_button", "true").lower() == "true"
+_rpc_mod.album_fn = lambda: getattr(state, "album", "")
+
+# Lyric romanisation / translation (sublines under each lyric line).
+import statusify_translate as _translate_mod
+_translate_mod.M = sys.modules[__name__]
 
 # ── WebSocket ─────────────────────────────────────────────────────
 def _apply_lyrics(mode, synced, plain, src):
@@ -1063,6 +1069,10 @@ def _apply_lyrics(mode, synced, plain, src):
     log(f"Lyrics ({src})  ·  {mode}  ·  {n} lines")
     event_queue.put(("lyrics", src, mode, n))
     _save_history(mode, synced, plain, src)
+    try:
+        _translate_mod.on_lyrics(state.track_uri, mode, synced, plain)
+    except Exception as e:
+        log(f"Lyric translation request failed: {e}")
 
 # ── LRCLIB fallback ───────────────────────────────────────────────
 # Third source, tried only after the bridge reports no lyrics from Spicy or
@@ -1173,6 +1183,8 @@ async def ws_handler(ws):
             elif t == "track_change":
                 state.artist    = data.get("artist",""); state.title = data.get("title","")
                 state.album_art = data.get("album_art","")
+                state.album     = data.get("album","") or ""
+                state.translation = {}
                 state.duration_ms = int(data.get("duration_ms",0))
                 state.track_uri = data.get("track_uri","")
                 state.lyrics_mode = "none"; state.synced = []; state.plain = []
@@ -2907,6 +2919,11 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
             else: webbrowser.open(url); dlg.destroy()
         btn_yes.bind("<Button-1>", lambda e: _yes())
 
+
+# Sleep timer: App._sleep_timer_set / _remaining / _label.
+import statusify_sleep as _sleep_mod
+_sleep_mod.M = sys.modules[__name__]
+_sleep_mod.install(App)
 
 # ── Backend ───────────────────────────────────────────────────────
 def run_backend(loop):

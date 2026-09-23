@@ -840,7 +840,7 @@ class SettingsPage:
             {"title": "Search LRCLIB as a fallback",
              "desc": "Used only when Spicy Lyrics and Spotify have nothing for a track.",
              "ctl": self._switch_ctl(lambda: M.LRCLIB_ENABLED, _toggle_lrclib)},
-        ])]
+        ] + self._translate_rows())]
 
         # ── Appearance ─────────────────────────────────────────────
         self._theme_seg = _Segmented(self, [("Dark", "dark"), ("Light", "light")],
@@ -877,6 +877,9 @@ class SettingsPage:
              "ctl": _Segmented(self, [("Auto", "auto"), ("Smooth", "high"), ("Fast", "low")],
                                lambda: M.RENDER_QUALITY, _set_quality)},
         ])]
+
+        # ── Playback ───────────────────────────────────────────────
+        spec += [("section", "Playback"), ("card", self._sleep_rows())]
 
         # ── Window ─────────────────────────────────────────────────
         def _toggle_ct():
@@ -920,6 +923,9 @@ class SettingsPage:
         def _toggle_link():
             rpc.link_track = not rpc.link_track
             M._cfg_set("preferences", "link_track", str(rpc.link_track).lower())
+        def _toggle_listen_btn():
+            rpc.listen_button = not rpc.listen_button
+            M._cfg_set("preferences", "listen_button", str(rpc.listen_button).lower())
 
         self._instr_var = tk.StringVar(value=M.INSTRUMENTAL_TEXT)
         ent_it = self._entry(self._instr_var, 20)
@@ -958,6 +964,9 @@ class SettingsPage:
                                      _toggle_status_song)},
             {"title": "Link the song to Spotify", "desc": "Clicking the title opens the track.",
              "ctl": self._switch_ctl(lambda: rpc.link_track, _toggle_link)},
+            {"title": "Show 'Listen on Spotify' button",
+             "desc": "Friends can open the track from your profile. Discord hides it from you.",
+             "ctl": self._switch_ctl(lambda: rpc.listen_button, _toggle_listen_btn)},
             {"title": "Instrumental text", "desc": "Shown on Discord between sung lines.",
              "ctl": _Widget(ent_it, height=S(28))},
             {"title": "App profiles", "desc": "Save several Discord App IDs and switch between them."},
@@ -1054,6 +1063,66 @@ class SettingsPage:
         self._refresh_stats()
         self._refresh_long_stats(sync=True)
         self._set_render()
+
+    # ── Lyric sublines and sleep timer rows ──────────────────────
+    def _full_seg(self, seg):
+        """A segmented control on its own full-width line under a row."""
+        def draw(cv, x0, x1, y):
+            seg.draw(cv, x0, y)
+            return seg.size()[1] + self._ss(12)
+        return {"kind": "extra", "draw": draw, "nodiv": True}
+
+    def _translate_rows(self):
+        import statusify_translate as tr
+        self._subline_seg = _Segmented(self, list(tr.SUBLINE_MODES),
+                                       tr.subline_mode, tr.set_subline_mode)
+        self.lbl_translate_to = _Text(self, "")
+        codes = [c for c, _ in tr.LANGUAGES]
+
+        def _paint():
+            code = tr.translate_to()
+            name = tr.language_name(code)
+            if code == "auto":
+                name = f"Auto ({tr.language_name(tr.system_lang())})"
+            self.lbl_translate_to.config(text=name, fg=M.TEXT2)
+
+        def _step(d):
+            cur = tr.translate_to()
+            i = codes.index(cur) if cur in codes else 0
+            tr.set_translate_to(codes[(i + d) % len(codes)])
+            _paint()
+        _paint()
+        return [
+            {"title": "Under each line",
+             "desc": "Romanised text for non-Latin scripts, a translation, or both. "
+                     "Translations come from Google Translate and are kept for replays."},
+            self._full_seg(self._subline_seg),
+            {"title": "Translate to",
+             "ctl": _Buttons(self, ("btn", "‹", lambda: _step(-1), "secondary"),
+                             ("value", self.lbl_translate_to, 120),
+                             ("btn", "›", lambda: _step(1), "secondary"))},
+        ]
+
+    def _sleep_rows(self):
+        self.lbl_sleep = _Text(self, "Off")
+
+        def _choose(v):
+            self._sleep_timer_set(None if v == "off" else ("eos" if v == "eos" else int(v)))
+        self._sleep_seg = _Segmented(
+            self, [("Off", "off"), ("15m", "15"), ("30m", "30"), ("1h", "60"), ("Song", "eos")],
+            lambda: self._sleep_timer.value() if getattr(self, "_sleep_timer", None) else "off",
+            _choose)
+        try:
+            self._sleep_timer_changed()
+        except Exception:
+            pass
+        return [
+            {"title": "Sleep timer",
+             "desc": "Pause Spotify after a while, or when this song ends (Song). "
+                     "Forgotten when Statusify closes.",
+             "ctl": _Buttons(self, ("value", self.lbl_sleep, 72))},
+            self._full_seg(self._sleep_seg),
+        ]
 
     # ── Profiles ─────────────────────────────────────────────────
     def _load_profiles(self):
