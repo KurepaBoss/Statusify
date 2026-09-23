@@ -21,6 +21,12 @@
     // below, not here. See: https://github.com/Spikerko/spicy-lyrics/releases
     const SPICY_VERSION = "6.1.1";
 
+    // Version of THIS bridge. Statusify compares the shipped file with the
+    // copy injected into Spotify byte-for-byte, so any edit (this bump
+    // included) makes it offer `spicetify apply`. 2.1: word/syllable timing,
+    // queue + next-track lyric prefetch, player state, volume/skip-to, beats.
+    const BRIDGE_VERSION = "2.1.0";
+
     let ws             = null;
     let reconnectTimer = null;
     let lastTrackUri   = "";   // tracks what we last sent a track_change for
@@ -39,6 +45,8 @@
             console.log("[LyricsBridge] Connected.");
             clearTimeout(reconnectTimer);
             lastTrackUri = "";
+            send({ type: "hello", version: BRIDGE_VERSION });
+            sendPlayerState(true);
             // Retry loop in case Player.data isn't populated immediately.
             for (let attempt = 0; attempt < 8; attempt++) {
                 if (ws?.readyState !== WebSocket.OPEN) break;
@@ -71,6 +79,7 @@
                     // and lyrics twice. sendTrackAndLyrics' finally{} already
                     // guarantees the set can't wedge.
                     lastTrackUri = "";
+                    sendPlayerState(true);
                     const item = Spicetify.Player.data?.item;
                     if (item?.uri) {
                         lastTrackUri = item.uri;
@@ -90,8 +99,37 @@
                     else if (msg.action === "prev") P.back();
                     else if (msg.action === "pause") P.pause();
                     else if (msg.action === "play") P.play();
+                    else if (msg.action === "shuffle") callPlayer("toggleShuffle");
+                    else if (msg.action === "repeat") callPlayer("toggleRepeat");
+                    else if (msg.action === "like") callPlayer("toggleHeart");
                     else P.togglePlay();
                     setTimeout(reportState, 150);
+                    // Heart/shuffle/repeat settle asynchronously; report the
+                    // real values once they have, correcting the app's
+                    // optimistic guess if the command didn't take.
+                    setTimeout(() => sendPlayerState(true), 400);
+                } else if (msg.type === "volume") {
+                    const v = Number(msg.value);
+                    if (Number.isFinite(v)) callPlayer("setVolume", Math.min(1, Math.max(0, v)));
+                    setTimeout(() => sendPlayerState(true), 250);
+                } else if (msg.type === "skip_to") {
+                    // Jump to a queued track while keeping the play context.
+                    // PlayerAPI.skipTo({uri, uid}) is what Spotify's own queue
+                    // view uses; playUri is the context-losing last resort.
+                    if (msg.uri) {
+                        let done = false;
+                        const api = Spicetify.Platform?.PlayerAPI;
+                        if (typeof api?.skipTo === "function") {
+                            try {
+                                await api.skipTo({ uri: msg.uri, uid: msg.uid || undefined });
+                                done = true;
+                            } catch (e) { console.warn("[LyricsBridge] skipTo failed:", e?.message); }
+                        }
+                        if (!done && typeof Spicetify.Player.playUri === "function") {
+                            try { await Spicetify.Player.playUri(msg.uri); } catch (e) {}
+                        }
+                        setTimeout(reportState, 300);
+                    }
                 } else if (msg.type === "seek") {
                     // Seek bar and clickable lyric lines in Statusify.
                     const ms = Math.max(0, parseInt(msg.position_ms || 0));
@@ -234,6 +272,42 @@
         return result;
     }
 
+    // Seconds (Spicy's unit) → integer ms; 0 when missing or not a number.
+    function secToMs(s) {
+        const n = Number(s);
+        return Number.isFinite(n) && n > 0 ? Math.round(n * 1000) : 0;
+    }
+
+    // Spicy "Syllable" entries → [[startMs, endMs, text], ...] whose texts
+    // concatenate to exactly `lineText` (a trailing space ends a word).
+    // Word boundaries come from IsPartOfWord (false = last syllable of its
+    // word) or a trailing space in Text; if that doesn't reproduce the line,
+    // try "every syllable is a word" (older payloads). No match → null, and
+    // the line simply ships without `syl`.
+    function buildSyllables(syls, lineText) {
+        if (!Array.isArray(syls) || !syls.length) return null;
+        const strategies = [
+            (s, raw) => /\s$/.test(raw) || s.IsPartOfWord === false || s.isPartOfWord === false,
+            (s, raw) => !(s.IsPartOfWord === true || s.isPartOfWord === true),
+        ];
+        for (const endsWord of strategies) {
+            const out = [];
+            let ok = true;
+            for (let i = 0; i < syls.length; i++) {
+                const s   = syls[i] || {};
+                const raw = String(s.Text ?? "");
+                let t = raw.trim();
+                if (!t) { ok = false; break; }
+                if (i < syls.length - 1 && endsWord(s, raw)) t += " ";
+                const st = secToMs(s.StartTime);
+                const en = Math.max(st, secToMs(s.EndTime));
+                out.push([st, en, t]);
+            }
+            if (ok && out.map(p => p[2]).join("") === lineText) return out;
+        }
+        return null;
+    }
+
     // Parse a DECODED Spicy lyrics object ({ Type, Content, ... }) into the
     // { mode, synced, plain } shape the RPC loop consumes.
     function parseSpicyLyrics(result) {
@@ -286,7 +360,16 @@
 
                 if (!text || text === "♪") continue;
                 const startMs = Math.round((lead.StartTime || lead.Syllables[0]?.StartTime || 0) * 1000);
-                synced.push({ startMs, words: text });
+                const line = { startMs, words: text };
+                const lastSyl = lead.Syllables[lead.Syllables.length - 1];
+                const endMs = secToMs(lead.EndTime ?? lastSyl?.EndTime);
+                if (endMs > startMs) line.endMs = endMs;
+                // Word/syllable timing, kept only when it reproduces the line
+                // text exactly — a half-matching karaoke track is worse than
+                // plain line sync.
+                const syl = buildSyllables(lead.Syllables, text);
+                if (syl) line.syl = syl;
+                synced.push(line);
             }
         } else if (type === "Line") {
             for (const entry of content) {
@@ -294,7 +377,10 @@
                 const text = (entry.Text || "").trim();
                 if (!text || text === "♪") continue;
                 const startMs = Math.round((entry.StartTime || 0) * 1000);
-                synced.push({ startMs, words: text });
+                const line = { startMs, words: text };
+                const endMs = secToMs(entry.EndTime);
+                if (endMs > startMs) line.endMs = endMs;
+                synced.push(line);
             }
         }
 
@@ -303,14 +389,18 @@
         return { mode: "synced", synced, plain: [] };
     }
 
-    async function fetchSpicyLyrics(trackUri) {
+    async function fetchSpicyLyrics(trackUri, quiet = false) {
+        // quiet: a background prefetch — no log lines, and it must not
+        // overwrite lastSpicyError, which belongs to the playing track.
+        const note = (m) => { if (!quiet) lastSpicyError = m; };
+        const dbg  = (m) => { if (!quiet) send({ type: "lyrics_debug", message: m }); };
         const trackId = trackUri.split(":").pop();
         const token   = getSpotifyToken();
-        lastSpicyError = "";
+        note("");
         if (!token) {
-            lastSpicyError = "no Spotify auth token yet";
+            note("no Spotify auth token yet");
             console.warn("[LyricsBridge] No Spotify token.");
-            send({ type: "lyrics_debug", message: "Spicy skipped — no Spotify auth token yet" });
+            dbg("Spicy skipped — no Spotify auth token yet");
             return null;
         }
         try {
@@ -328,13 +418,13 @@
                 })
             });
             if (resp.status !== 200) {
-                lastSpicyError = `HTTP ${resp.status}`;
+                note(`HTTP ${resp.status}`);
                 // 400/403/426 here almost always means SPICY_VERSION is stale.
                 const hint = (resp.status === 400 || resp.status === 403 || resp.status === 426)
                     ? ` — SPICY_VERSION ${SPICY_VERSION} may be outdated`
                     : "";
                 console.warn("[LyricsBridge] Spicy API returned status:", resp.status);
-                send({ type: "lyrics_debug", message: `Spicy API HTTP ${resp.status}${hint}` });
+                dbg(`Spicy API HTTP ${resp.status}${hint}`);
                 return null;
             }
             const data = await resp.json();
@@ -357,16 +447,15 @@
             const inner = qres?.httpStatus;
             const err   = qres?.error || qres?.data?.error;
             if (!qres || err || (inner && inner !== 200)) {
-                lastSpicyError = err
+                note(err
                     ? `${inner || "error"}: ${err}`
-                    : (inner ? `inner ${inner}` : "no lyrics query in response");
+                    : (inner ? `inner ${inner}` : "no lyrics query in response"));
                 // 401/403 here is an auth problem, NOT a missing-lyrics one.
                 const hint = (inner === 401 || inner === 403)
                     ? " — auth rejected, not a missing-lyrics problem"
                     : "";
                 console.warn("[LyricsBridge] Spicy query failed:", trackId, inner, err);
-                send({ type: "lyrics_debug",
-                       message: `Spicy ${inner || "error"} for ${trackId}: ${err || lastSpicyError}${hint}` });
+                dbg(`Spicy ${inner || "error"} for ${trackId}: ${err || lastSpicyError}${hint}`);
                 return null;
             }
 
@@ -375,9 +464,9 @@
             try {
                 lyricsObj = slUnpack(qres.data);
             } catch (e) {
-                lastSpicyError = `decode failed: ${e.message}`;
+                note(`decode failed: ${e.message}`);
                 console.warn("[LyricsBridge] SLObjPack decode failed:", trackId, e.message);
-                send({ type: "lyrics_debug", message: `Spicy decode failed for ${trackId}: ${e.message}` });
+                dbg(`Spicy decode failed for ${trackId}: ${e.message}`);
                 return null;
             }
 
@@ -386,15 +475,14 @@
                 // Genuinely nothing to parse — this really is a catalogue miss.
                 console.warn("[LyricsBridge] Spicy returned no content:", trackId,
                     "type:", lyricsObj?.Type);
-                lastSpicyError = "no lyrics in Spicy catalogue";
-                send({ type: "lyrics_debug",
-                       message: `Spicy: no lyrics for ${trackId} (type: ${lyricsObj?.Type || "none"})` });
+                note("no lyrics in Spicy catalogue");
+                dbg(`Spicy: no lyrics for ${trackId} (type: ${lyricsObj?.Type || "none"})`);
             }
             return result;
         } catch(e) {
-            lastSpicyError = e.message || "network error";
+            note(e.message || "network error");
             console.warn("[LyricsBridge] Spicy fetch failed:", e.message);
-            send({ type: "lyrics_debug", message: `Spicy fetch error: ${e.message}` });
+            dbg(`Spicy fetch error: ${e.message}`);
             return null;
         }
     }
@@ -407,7 +495,7 @@
     // out early if the user moves on to another track.
     const RESOLVER_WAIT_MS  = 30000;
     const RESOLVER_POLL_MS  = 1500;
-    async function cosmosGetWhenReady(url, trackUri) {
+    async function cosmosGetWhenReady(url, trackUri, quiet = false) {
         const deadline = Date.now() + RESOLVER_WAIT_MS;
         let noted = false;
         for (;;) {
@@ -417,33 +505,43 @@
                 if (!/Resolver not found/i.test(e?.message || "") || Date.now() >= deadline) throw e;
                 if (!noted) {
                     noted = true;
-                    send({ type: "lyrics_debug", message: "Spotify is still starting up — waiting to fetch its lyrics" });
+                    if (!quiet)
+                        send({ type: "lyrics_debug", message: "Spotify is still starting up — waiting to fetch its lyrics" });
                 }
                 await new Promise(r => setTimeout(r, RESOLVER_POLL_MS));
-                if (Spicetify.Player.data?.item?.uri !== trackUri) return null;
+                // A prefetch (quiet) is for a track that isn't playing yet;
+                // just give up rather than wait on a cold router.
+                if (quiet || Spicetify.Player.data?.item?.uri !== trackUri) return null;
             }
         }
     }
 
-    async function fetchSpotifyLyrics(trackUri) {
+    async function fetchSpotifyLyrics(trackUri, quiet = false) {
         const trackId = trackUri.split(":").pop();
+        const dbg = (m) => { if (!quiet) send({ type: "lyrics_debug", message: m }); };
         try {
             const res      = await cosmosGetWhenReady(
                 `https://spclient.wg.spotify.com/color-lyrics/v2/track/${trackId}?format=json&market=from_token`,
-                trackUri
+                trackUri, quiet
             );
             if (res === null) return null;   // track changed while we waited
             const lines    = res?.lyrics?.lines;
             const syncType = res?.lyrics?.syncType;
             if (!lines?.length) {
-                send({ type: "lyrics_debug", message: `Spotify: no lyrics for ${trackId} (syncType: ${syncType || "none"})` });
+                dbg(`Spotify: no lyrics for ${trackId} (syncType: ${syncType || "none"})`);
                 return null;
             }
             if (syncType === "LINE_SYNCED") {
                 return {
                     mode:   "synced",
                     synced: lines
-                        .map(l => ({ startMs: parseInt(l.startTimeMs||0), words: (l.words||"").trim() }))
+                        .map(l => {
+                            const line = { startMs: parseInt(l.startTimeMs||0), words: (l.words||"").trim() };
+                            // endTimeMs is usually "0" (unknown) on LINE_SYNCED.
+                            const end = parseInt(l.endTimeMs||0);
+                            if (end > line.startMs) line.endMs = end;
+                            return line;
+                        })
                         .filter(l => l.words && l.words !== "♪"),
                     plain: []
                 };
@@ -455,7 +553,7 @@
                 };
             }
         } catch(e) {
-            send({ type: "lyrics_debug", message: `Spotify lyrics error: ${e.message}` });
+            dbg(`Spotify lyrics error: ${e.message}`);
             return null;
         }
     }
@@ -470,18 +568,19 @@
     const LYRIC_RETRY_MS  = 3000;
 
     // One pass over both lyric sources. Returns { lyrics, source } or null.
-    async function fetchLyricsOnce(trackUri) {
+    async function fetchLyricsOnce(trackUri, quiet = false) {
         // Try Spicy first; fall back to Spotify's own color-lyrics API if Spicy
         // returns nothing (song not in their catalogue, network error, etc.).
-        let lyrics = await fetchSpicyLyrics(trackUri);
+        let lyrics = await fetchSpicyLyrics(trackUri, quiet);
         if (lyrics) return { lyrics, source: "Spicy" };
 
         // Never downgrade silently. Falling back to Spotify used to be
         // invisible, so a permanently broken Spicy path looked like normal
         // operation for months.
-        send({ type: "lyrics_debug",
-               message: `Spicy unavailable (${lastSpicyError || "unknown"}) — falling back to Spotify` });
-        lyrics = await fetchSpotifyLyrics(trackUri);
+        if (!quiet)
+            send({ type: "lyrics_debug",
+                   message: `Spicy unavailable (${lastSpicyError || "unknown"}) — falling back to Spotify` });
+        lyrics = await fetchSpotifyLyrics(trackUri, quiet);
         return lyrics ? { lyrics, source: "Spotify (Spicy fallback)" } : null;
     }
 
@@ -511,6 +610,8 @@
             console.log("[LyricsBridge] Sending track_change:", title, "—", artist);
             send({ type: "track_change", artist, title, track_uri: trackUri,
                    album_art: albumArt, duration_ms: durMs });
+            sendQueue(true);
+            sendPlayerState(false);   // liked differs per track
 
             let found = null;
             for (let attempt = 0; attempt < LYRIC_ATTEMPTS; attempt++) {
@@ -543,6 +644,12 @@
             send({ type: "lyrics", track_uri: trackUri,
                    source: found ? found.source : "none",
                    ...(found ? found.lyrics : { mode: "none", synced: [], plain: [] }) });
+
+            // Low-priority extras, only once this track's lyrics are out.
+            if (Spicetify.Player.data?.item?.uri === trackUri) {
+                schedulePrefetch();
+                fetchBeats(trackUri);
+            }
         } finally {
             // finally, so a throw anywhere above can't leave the URI wedged in
             // the set — which would block every future fetch for that track.
@@ -565,7 +672,152 @@
 
     let wasPlaying = true;
 
+    // ── Player state (volume / shuffle / repeat / liked) ─────────
+    // Spicetify.Player getters are synchronous and cheap, so they are polled
+    // from tick() and only sent when something changed.
+    function callPlayer(name, ...args) {
+        try {
+            const P = Spicetify.Player;
+            return typeof P?.[name] === "function" ? P[name](...args) : undefined;
+        } catch (e) { return undefined; }
+    }
+
+    function readPlayerState() {
+        let volume = Number(callPlayer("getVolume"));
+        if (!Number.isFinite(volume)) volume = 1;
+        volume = Math.round(Math.min(1, Math.max(0, volume)) * 1000) / 1000;
+        let repeat = parseInt(callPlayer("getRepeat"));
+        if (!(repeat >= 0 && repeat <= 2)) repeat = 0;
+        return { type: "player_state", volume,
+                 shuffle: !!callPlayer("getShuffle"), repeat,
+                 liked: !!callPlayer("getHeart") };
+    }
+
+    let lastPlayerStateSig = "";
+    function sendPlayerState(force) {
+        const st  = readPlayerState();
+        const sig = JSON.stringify(st);
+        if (!force && sig === lastPlayerStateSig) return;
+        lastPlayerStateSig = sig;
+        send(st);
+    }
+
+    // ── Queue ────────────────────────────────────────────────────
+    // Spicetify exposes the upcoming tracks in (at least) three shapes,
+    // depending on the Spotify version:
+    //   Player.data.nextItems      — ProvidedTrack {uri, uid, metadata}
+    //   Spicetify.Queue.nextTracks — {contextTrack: {uri, uid, metadata}}
+    //   Platform.PlayerAPI internal queue state — {nextUp, queued}
+    // Read whichever is there and normalise. Only synchronous reads: tick()
+    // must stay cheap.
+    const QUEUE_MAX = 10;
+
+    function queueTrack(t) {
+        const ct  = t?.contextTrack || t;
+        const uri = ct?.uri || "";
+        if (!uri.startsWith("spotify:") || uri.includes(":delimiter") || uri.startsWith("spotify:ad:"))
+            return null;
+        const md = ct.metadata || t.metadata || {};
+        if (md.hidden === "true") return null;
+        const artists = ct.artists || t.artists;
+        const images  = ct.album?.images || ct.images || [];
+        return {
+            uri, uid: ct.uid || t.uid || "",
+            title:  md.title || ct.name || "",
+            artist: md.artist_name || (Array.isArray(artists) ? artists.map(a => a?.name).filter(Boolean).join(", ") : ""),
+            album_art: getAlbumArt({ metadata: md, album: { images } }),
+            duration_ms: parseInt(md.duration || ct.duration_ms || ct.duration?.milliseconds || 0) || 0,
+        };
+    }
+
+    function readQueue() {
+        const sources = [
+            () => Spicetify.Player.data?.nextItems,
+            () => Spicetify.Queue?.nextTracks,
+            () => {
+                const q = Spicetify.Platform?.PlayerAPI?._queue?._queueState;
+                return q ? [...(q.queued || []), ...(q.nextUp || [])] : null;
+            },
+        ];
+        for (const src of sources) {
+            let raw = null;
+            try { raw = src(); } catch (e) {}
+            if (!Array.isArray(raw) || !raw.length) continue;
+            const out = [];
+            for (const t of raw) {
+                const q = queueTrack(t);
+                if (q) out.push(q);
+                if (out.length >= QUEUE_MAX) break;
+            }
+            return out;
+        }
+        return [];
+    }
+
+    let lastQueueSig = "";
+    function sendQueue(force) {
+        const tracks = readQueue();
+        const sig = tracks.map(t => t.uri + "|" + t.uid).join(",");
+        if (!force && sig === lastQueueSig) return;
+        const nextChanged = (tracks[0]?.uri || "") !== lastQueueSig.split("|")[0];
+        lastQueueSig = sig;
+        send({ type: "queue", tracks });
+        // The user queued/reordered something mid-song: prefetch the new next.
+        if (nextChanged && !force) schedulePrefetch();
+    }
+
+    // ── Next-track lyric prefetch ────────────────────────────────
+    // After the current track's lyrics are out, quietly fetch the next queued
+    // track's so Statusify can show them the instant it starts. One attempt
+    // per URI; failures say nothing (the normal fetch runs anyway).
+    const PREFETCH_DELAY_MS = 4000;
+    const prefetchTried = new Set();
+    let prefetchTimer = null;
+
+    function schedulePrefetch() {
+        clearTimeout(prefetchTimer);
+        prefetchTimer = setTimeout(() => { prefetchNext().catch(() => {}); }, PREFETCH_DELAY_MS);
+    }
+
+    async function prefetchNext() {
+        // Never compete with a real fetch for the playing track.
+        if (fetchingUris.size) return;
+        const cur  = Spicetify.Player.data?.item?.uri;
+        const uri  = readQueue()[0]?.uri || "";
+        if (!uri.startsWith("spotify:track:") || uri === cur || prefetchTried.has(uri)) return;
+        prefetchTried.add(uri);
+        if (prefetchTried.size > 200) prefetchTried.delete(prefetchTried.values().next().value);
+        const found = await fetchLyricsOnce(uri, true);
+        if (!found) return;
+        send({ type: "lyrics_prefetch", track_uri: uri, source: found.source, ...found.lyrics });
+    }
+
+    // ── Beats ────────────────────────────────────────────────────
+    // Spicetify.getAudioData() wraps Spotify's audio-analysis endpoint, which
+    // is deprecated and usually fails. Try once per track, silently.
+    const beatsTried = new Set();
+    async function fetchBeats(trackUri) {
+        if (typeof Spicetify.getAudioData !== "function" || beatsTried.has(trackUri)) return;
+        beatsTried.add(trackUri);
+        if (beatsTried.size > 200) beatsTried.delete(beatsTried.values().next().value);
+        try {
+            const d = await Spicetify.getAudioData(trackUri);
+            const beats = (Array.isArray(d?.beats) ? d.beats : [])
+                .map(b => Math.round(Number(b?.start) * 1000))
+                .filter(Number.isFinite);
+            if (!beats.length) return;
+            send({ type: "beats", track_uri: trackUri, tempo: Number(d?.track?.tempo) || 0, beats });
+        } catch (e) { /* expected: the endpoint is deprecated */ }
+    }
+
+    let tickCount = 0;
+
     async function tick() {
+        // Queue and player state change without events we can rely on;
+        // polling them every ~2 s is a handful of sync getter calls.
+        if (++tickCount % 4 === 0) {
+            try { sendQueue(false); sendPlayerState(false); } catch (e) {}
+        }
         const data = Spicetify.Player.data;
         if (!data?.item) return;
 
