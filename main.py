@@ -693,6 +693,8 @@ def _register_hotkeys(app_ref):
             "skip":       (skip_combo,       lambda: _hotkey_skip(app_ref)),
             "toggle":     (toggle_combo,     lambda: _hotkey_toggle(app_ref)),
             "skip_instr": (skip_instr_combo, _hotkey_skip_instrumental),
+            "overlay":    (statusify_ui_overlay.hotkey_combo(),
+                           lambda: event_queue.put(("overlay_toggle",))),
         })
         _hotkey_registered = True
         log(f"Hotkeys registered  ·  skip={skip_combo or 'none'}  toggle={toggle_combo or 'none'}  skip_instr={skip_instr_combo or 'none'}")
@@ -1838,14 +1840,17 @@ import statusify_ui_mini
 import statusify_ui_now_playing
 import statusify_ui_history
 import statusify_ui_settings
-for _ui_mod in (statusify_ui_mini, statusify_ui_now_playing, statusify_ui_history, statusify_ui_settings):
+import statusify_ui_overlay
+for _ui_mod in (statusify_ui_mini, statusify_ui_now_playing, statusify_ui_history, statusify_ui_settings,
+                statusify_ui_overlay):
     _ui_mod.M = sys.modules[__name__]
 from statusify_ui_mini import MiniTrayMixin
 from statusify_ui_now_playing import NowPlayingPage
 from statusify_ui_history import HistoryPage
 from statusify_ui_settings import SettingsPage
+from statusify_ui_overlay import OverlayMixin
 
-class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
+class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage, OverlayMixin):
     """
     Single Tk() window in a native Windows frame.
 
@@ -1913,6 +1918,7 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
         self._schedule("progress", 250, self._tick_progress)
 
         self._schedule("hotkeys", 200, lambda: _register_hotkeys(self))
+        self._schedule("overlay_init", 700, self._overlay_init)   # desktop lyrics overlay
         # The frame HWND exists once the window is mapped; theme it then (and
         # again on every map, since Windows can reset it on restore).
         self._root.bind("<Map>", lambda e: e.widget is self._root and self._apply_titlebar_theme(), add="+")
@@ -2986,6 +2992,8 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
                     status  = "enabled" if enabled else "disabled"
                     log(f"Hotkey: RPC {status}")
                     self.dot_dc.config(fg=ACCENT if enabled else MUTED)
+                elif k == "overlay_toggle":
+                    self._toggle_overlay()
                 elif k == "update_available":
                     _, tag, url, changelog, setup = ev
                     self._show_update_dialog(tag, url, changelog, setup)

@@ -840,6 +840,7 @@ class SettingsPage:
             {"title": "Search LRCLIB as a fallback",
              "desc": "Used only when Spicy Lyrics and Spotify have nothing for a track.",
              "ctl": self._switch_ctl(lambda: M.LRCLIB_ENABLED, _toggle_lrclib)},
+            *self._overlay_settings_rows(T),     # Desktop overlay (statusify_ui_overlay)
         ] + self._translate_rows())]
 
         # ── Appearance ─────────────────────────────────────────────
@@ -999,6 +1000,7 @@ class SettingsPage:
                 e.bind("<Return>", lambda ev: _save_hotkeys())
                 e.bind("<FocusOut>", lambda ev: _save_hotkeys())
                 hk_rows.append({"title": title, "ctl": _Widget(e, height=S(28))})
+            hk_rows.append(self._overlay_hotkey_row(_Widget, S(28)))
         spec += [("section", "Global hotkeys",
                   "Work while other apps have focus. Saved when you press Enter or click away."),
                  ("card", hk_rows)]
