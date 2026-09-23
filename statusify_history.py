@@ -63,6 +63,26 @@ def display_time(played_at, now=None):
     return t.strftime("%Y-%m-%d · %H:%M")
 
 
+def longest_streak(days):
+    """Longest run of consecutive calendar days in `days` ("YYYY-MM-DD"
+    strings or dates, any order, duplicates allowed)."""
+    ds = set()
+    for d in days:
+        try:
+            ds.add(d if isinstance(d, datetime.date) else datetime.date.fromisoformat(str(d)[:10]))
+        except ValueError:
+            pass
+    best = 0
+    for d in ds:
+        if d - datetime.timedelta(days=1) in ds:
+            continue            # not the start of a run
+        n = 1
+        while d + datetime.timedelta(days=n) in ds:
+            n += 1
+        best = max(best, n)
+    return best
+
+
 class HistoryStore:
     """Thread-safe: the asyncio backend writes, the Tk thread reads."""
 
@@ -192,6 +212,98 @@ class HistoryStore:
     def count(self):
         with self._lock:
             return self._db.execute("SELECT COUNT(*) FROM plays").fetchone()[0]
+
+    # ── Stats page queries ────────────────────────────────────────
+    # played_at is local ISO-8601 text, so string comparison is time order and
+    # substr(played_at, 1, 10) is the local date: every range below is an
+    # index range scan on plays_played_at, never a full-table date parse.
+
+    def recent_plays(self, limit=30, offset=0):
+        """Newest plays first, without lyrics: [{id, track_uri, artist, title,
+        album_art, played_at, listened_ms}]."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, track_uri, artist, title, album_art, played_at, listened_ms"
+                " FROM plays ORDER BY id DESC LIMIT ? OFFSET ?",
+                (int(limit), int(offset))).fetchall()
+        return [dict(r) for r in rows]
+
+    def plays_per_day(self, since_date):
+        """{"YYYY-MM-DD": plays} for every day on or after `since_date`
+        (a date) that has at least one play."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT substr(played_at, 1, 10) d, COUNT(*) FROM plays"
+                " WHERE played_at >= ? GROUP BY d",
+                (since_date.isoformat(),)).fetchall()
+        return {r[0]: r[1] for r in rows}
+
+    def top_tracks(self, since=None, limit=10):
+        """Most played songs as [{title, artist, album_art, plays, listened_ms}],
+        for plays at or after `since` (a datetime) or for all time. A song is
+        its title and artist, case-insensitively: the same song reached from
+        an album and from a playlist has two URIs but is one song."""
+        where, args = "", ()
+        if since is not None:
+            where, args = " AND played_at >= ?", (since.replace(microsecond=0).isoformat(),)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT title, artist, MAX(album_art) art, COUNT(*) c,"
+                "       COALESCE(SUM(listened_ms), 0) ms"
+                f" FROM plays WHERE title != ''{where}"
+                " GROUP BY lower(title), lower(artist)"
+                " ORDER BY c DESC, ms DESC, title LIMIT ?", args + (int(limit),)).fetchall()
+        return [{"title": r[0], "artist": r[1], "album_art": r[2] or "",
+                 "plays": r[3], "listened_ms": r[4]} for r in rows]
+
+    def first_played(self):
+        """played_at of the oldest play, or None."""
+        with self._lock:
+            row = self._db.execute("SELECT MIN(played_at) FROM plays").fetchone()
+        return row[0] if row else None
+
+    def month_summary(self, year, month):
+        """Everything the monthly Wrapped card shows, for one calendar month:
+        {"year", "month", "plays", "listened_ms", "artists" (distinct),
+         "top_song": {title, artist, album_art, plays} | None,
+         "top_artist": (name, plays) | None,
+         "busiest_hour": (hour, plays) | None,
+         "longest_streak": consecutive days with a play (within the month),
+         "active_days"}."""
+        start = datetime.date(year, month, 1)
+        end = datetime.date(year + (month == 12), month % 12 + 1, 1)
+        rng = (start.isoformat(), end.isoformat())
+        with self._lock:
+            n, ms, artists = self._db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(listened_ms), 0),"
+                "       COUNT(DISTINCT lower(NULLIF(artist, '')))"
+                " FROM plays WHERE played_at >= ? AND played_at < ?", rng).fetchone()
+            song = self._db.execute(
+                "SELECT title, artist, MAX(album_art), COUNT(*) c FROM plays"
+                " WHERE played_at >= ? AND played_at < ? AND title != ''"
+                " GROUP BY lower(title), lower(artist)"
+                " ORDER BY c DESC, SUM(listened_ms) DESC, title LIMIT 1", rng).fetchone()
+            art = self._db.execute(
+                "SELECT artist, COUNT(*) c FROM plays"
+                " WHERE played_at >= ? AND played_at < ? AND artist != ''"
+                " GROUP BY lower(artist) ORDER BY c DESC, artist LIMIT 1", rng).fetchone()
+            hour = self._db.execute(
+                "SELECT CAST(substr(played_at, 12, 2) AS INTEGER) h, COUNT(*) c FROM plays"
+                " WHERE played_at >= ? AND played_at < ?"
+                " GROUP BY h ORDER BY c DESC, h LIMIT 1", rng).fetchone()
+            days = [r[0] for r in self._db.execute(
+                "SELECT DISTINCT substr(played_at, 1, 10) d FROM plays"
+                " WHERE played_at >= ? AND played_at < ? ORDER BY d", rng)]
+        return {
+            "year": year, "month": month, "plays": n, "listened_ms": ms,
+            "artists": artists,
+            "top_song": ({"title": song[0], "artist": song[1], "album_art": song[2] or "",
+                          "plays": song[3]} if song else None),
+            "top_artist": (art[0], art[1]) if art else None,
+            "busiest_hour": (hour[0], hour[1]) if hour and n else None,
+            "longest_streak": longest_streak(days),
+            "active_days": len(days),
+        }
 
     @staticmethod
     def _entry(r):
