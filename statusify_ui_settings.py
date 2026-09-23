@@ -827,12 +827,9 @@ class SettingsPage:
             M._cfg_set("preferences", "lrclib_fallback", str(M.LRCLIB_ENABLED).lower())
 
         spec += [("section", "Lyrics"), ("card", [
-            {"title": "Text size", "desc": "Size of the lines on the Lyrics page.",
-             "ctl": _Buttons(self, ("btn", "A−", lambda: _nudge_lf(-1), "secondary"),
-                             ("value", self.lbl_lyric_size, 64),
-                             ("btn", "A+", lambda: _nudge_lf(1), "secondary"))},
             {"title": "Offset for this track",
-             "desc": "Shifts the timing of the song that's playing. The global delay is on the Lyrics page.",
+             "desc": "Shifts the timing of the song that's playing, like the Lyrics page's delay "
+                     "stepper. Shift-click that stepper to change the global delay instead.",
              "ctl": _Buttons(self, ("btn", "−250", lambda: _nudge_track_offset(-250), "secondary"),
                              ("value", self.lbl_track_off, 64),
                              ("btn", "+250", lambda: _nudge_track_offset(250), "secondary"),
@@ -876,7 +873,7 @@ class SettingsPage:
                      "Fast keeps the background still.",
              "ctl": _Segmented(self, [("Auto", "auto"), ("Smooth", "high"), ("Fast", "low")],
                                lambda: M.RENDER_QUALITY, _set_quality)},
-        ])]
+        ] + self._np_appearance_rows(_Buttons, _Segmented, T))]
 
         # ── Window ─────────────────────────────────────────────────
         def _toggle_ct():
