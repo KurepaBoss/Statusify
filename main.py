@@ -2056,8 +2056,8 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, StatsPage, SettingsPage, O
     def _save_geometry(self):
         """Persist the current window geometry (called on quit / hide)."""
         try:
-            if getattr(self, "_hidden", False):
-                return  # a withdrawn window reports a useless geometry
+            if getattr(self, "_hidden", False) or getattr(self, "_np_fs", None):
+                return  # withdrawn or fullscreen: not a geometry to restore
             geo = self._root.geometry()          # "WxH+X+Y"
             if "x" in geo and "+" in geo:
                 _cfg_set("window", "geometry", geo)
@@ -2097,7 +2097,8 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, StatsPage, SettingsPage, O
         combos without stealing keys from other apps."""
         W = self._root
         binds = {
-            "<Escape>":           lambda e: self._close_lyrics_panel(),
+            "<Escape>":           lambda e: self._np_fullscreen_exit() or self._close_lyrics_panel(),
+            "<F11>":              lambda e: self._np_fullscreen_toggle(),
             "<Control-f>":        lambda e: self._focus_history_search(),
             "<Control-Key-1>":    lambda e: self._show("NOW PLAYING"),
             "<Control-Key-2>":    lambda e: self._show("HISTORY"),

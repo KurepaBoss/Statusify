@@ -22,6 +22,7 @@ import time
 import tkinter as tk
 
 import statusify_fluid as fluid
+import statusify_np_fx as fx
 from statusify_textrender import TextRenderer
 
 try:
@@ -79,7 +80,7 @@ def _clamp(v, lo=0.0, hi=1.0):
     return lo if v < lo else hi if v > hi else v
 
 
-class NowPlayingPage:
+class NowPlayingPage(fx.NpFxMixin):
 
     SHEET_LYRIC_PT = 20      # lyric lines, before the user's size boost
     LINE_MOVE_S = 0.72       # how long a line change glides
@@ -98,6 +99,8 @@ class NowPlayingPage:
         self._np_photo = None
         self._np_size = (0, 0)
         self._np_text = TextRenderer()
+        fx.M = M
+        self._np_fx_init()
         self._fluid = fluid.FluidField()
         self._np_palette = []
         try:
@@ -157,6 +160,7 @@ class NowPlayingPage:
         cv.bind("<B1-Motion>", self._np_on_drag)
         cv.bind("<ButtonRelease-1>", self._np_on_release)
         cv.bind("<MouseWheel>", self._np_on_wheel)
+        cv.bind("<Button-3>", self._np_on_right)
 
         self._paint_rpc_btn()
         self._paint_topmost_btn()
@@ -272,6 +276,8 @@ class NowPlayingPage:
         self._np_render()
 
     def _np_on_motion(self, e):
+        if self._np_fs and (e.x, e.y) != self._np_mouse:
+            self._np_fs_motion(e.x, e.y)
         self._np_mouse = (e.x, e.y)
         self._np_set_hover(self._np_hit(e.x, e.y))
         if self._np_hover == "seek":
@@ -291,11 +297,13 @@ class NowPlayingPage:
         if key and key.startswith("line:"):
             self._np_seek_line(int(key[5:]))
             return
+        glob = bool(getattr(e, "state", 0) & 0x0001)      # Shift: the global delay
         act = {
             "rpc": self._toggle_rpc_btn,
-            "dec": lambda: self._np_nudge_delay(-100),
-            "inc": lambda: self._np_nudge_delay(100),
-            "mini": self._toggle_mini,
+            "dec": lambda: self._np_nudge_delay(-100, glob),
+            "inc": lambda: self._np_nudge_delay(100, glob),
+            "mini": lambda: (self._np_fullscreen_exit(), self._toggle_mini()),
+            "fs": self._np_fullscreen_toggle,
             "top": self._toggle_topmost,
             "copy": self._copy_current_lyric,
             "prev": lambda: self._np_transport("prev"),
@@ -353,8 +361,9 @@ class NowPlayingPage:
         """Jump to lyric line i of the sheet (0 is the intro before line 1)."""
         if not self._np_synced():
             return
-        st = M.state
-        start = 0 if i <= 0 else st.synced[min(i, len(st.synced)) - 1]["startMs"]
+        plan, _ = self._np_plan()
+        row = plan[max(0, min(i, len(plan) - 1))]
+        start = 0 if row["kind"] == "intro" else row["t0"]
         ly = self._ly
         if ly is not None:
             # Glide from where the reader is looking, not from the old line.
@@ -388,10 +397,47 @@ class NowPlayingPage:
 
     def _np_on_double(self, e):
         if self._np_hit(e.x, e.y) == "delay":
-            M.LYRIC_DELAY_MS = 0
-            self._update_delay_label()
+            if self._np_offset_is_song():
+                self._np_reset_song_offset()
+            else:
+                M.LYRIC_DELAY_MS = 0
+                self._update_delay_label()
 
-    def _np_nudge_delay(self, d):
+    def _np_on_right(self, e):
+        """Right-click on the delay stepper: this song follows the global
+        delay again."""
+        if self._np_hit(e.x, e.y) in ("delay", "dec", "inc", "delay_lbl"):
+            self._np_reset_song_offset()
+
+    def _np_offset_is_song(self):
+        """True when the song playing has its own saved offset."""
+        uri = getattr(M.state, "track_uri", "")
+        return bool(uri) and M._cfg_get("offsets", M.offset_key(uri), "") != ""
+
+    def _np_reset_song_offset(self):
+        uri = getattr(M.state, "track_uri", "")
+        if not uri or not self._np_offset_is_song():
+            return
+        M._set_track_offset_ms(uri, None)
+        self._np_offset_changed("Lyric offset for this song cleared; using the global delay")
+
+    def _np_offset_changed(self, msg):
+        self._refresh_track_offset()
+        self._update_sheet(force=True)
+        self._np_invalidate(header=False)
+        self._np_render()
+        M.log(msg)
+
+    def _np_nudge_delay(self, d, glob=False):
+        """The footer stepper. While a song plays it adjusts that song's own
+        offset (saved per track, starting from whatever applies now);
+        Shift-click, or no track, adjusts the global delay."""
+        uri = getattr(M.state, "track_uri", "")
+        if uri and not glob:
+            v = max(-5000, min(5000, M._track_offset_ms(uri) + d))
+            M._set_track_offset_ms(uri, v)
+            self._np_offset_changed(f"Lyric offset for this song set to {v / 1000:+.1f}s")
+            return
         M.LYRIC_DELAY_MS = max(-5000, min(5000, M.LYRIC_DELAY_MS + d))
         self._update_delay_label()
 
@@ -412,11 +458,13 @@ class NowPlayingPage:
         """Placeholder shown until artwork arrives (or when there is none)."""
         self._hero_src = None
         self._img = None
+        self._np_cover_changed()
         self._np_invalidate(footer=False)
 
     def _show_hero_image(self, img):
         self._img = img
         self._hero_src = img
+        self._np_cover_changed()
         self._np_invalidate(footer=False)
 
     def _set_art(self, url):
@@ -520,7 +568,8 @@ class NowPlayingPage:
                 idx = i
             else:
                 break
-        key = (idx, bool(st.is_playing))
+        plan, t0s = self._np_plan()
+        key = (idx, bool(st.is_playing), fx.plan_index(t0s, pos))
         if key == self._sheet_idx and not force:
             return
         self._sheet_idx = key
@@ -535,19 +584,21 @@ class NowPlayingPage:
         """(key, texts, current index) for whatever the sheet should show."""
         if self._np_synced():
             st = M.state
-            texts = ["• • •"] + [(e.get("words") or "").strip() or "• • •" for e in st.synced]
-            idx = (self._sheet_idx[0] if self._sheet_idx else -1) + 1
-            return ("synced", id(st.synced), len(st.synced)), texts, idx
+            plan, _ = self._np_plan()
+            texts = [(st.synced[r["k"]].get("words") or "").strip() if r["kind"] == "line" else "• • •"
+                     for r in plan]
+            idx = self._sheet_idx[2] if self._sheet_idx else 0
+            return ("synced", id(st.synced), len(st.synced), id(plan)), texts, min(idx, len(plan) - 1)
         texts = [t if t and t not in ("—", "♪") else "• • •" for t in self._np_static] or ["• • •"]
         return ("static", tuple(texts)), texts, len(texts) - 1
 
     def _np_lyric_px(self):
-        return self._px(max(12, self.SHEET_LYRIC_PT + M.LYRIC_FONT_BOOST))
+        return int(self._px(max(12, self.SHEET_LYRIC_PT + M.LYRIC_FONT_BOOST)) * self._np_fs_scale())
 
     def _np_lyric_model(self, W):
         key, texts, idx = self._np_lyric_source()
         px = self._np_lyric_px()
-        full_key = (key, W, px)
+        full_key = (key, W, px, fx.lyric_font(), self._np_lyric_pad(W))
         ly = self._ly
         now = time.monotonic()
         if ly is None or ly["key"] != full_key:
@@ -584,8 +635,8 @@ class NowPlayingPage:
         lazily, the first time a line comes on screen (_np_item_mask). A
         127-line song used to render all 127 on each track change, a visible
         hitch on a slow CPU."""
-        TR = self._np_text
-        pad = self._S(28)
+        TR = self._np_lyric_text
+        pad = self._np_lyric_pad(W)
         maxw = max(120, W - 2 * pad)
         lh = int(TR.line_height("bold", px) * 1.02)
         gap = int(px * 0.62)
@@ -595,8 +646,12 @@ class NowPlayingPage:
             lines = TR.wrap(t, "bold", px, maxw)
             h = lh * len(lines)
             w = int(max(TR.measure(ln, "bold", px) for ln in lines)) if lines else 0
+            dots = t == "• • •"
+            if dots:
+                w = int(3 * px * 0.40 + 2 * px * 0.28)
             items.append({"text": t, "lines": lines, "mask": None, "blur": {}, "h": h,
-                          "w": w, "y": y, "m": margin, "lh": lh, "maxw": maxw, "px": px})
+                          "w": w, "y": y, "m": margin, "lh": lh, "maxw": maxw, "px": px,
+                          "dots": dots})
             y += h + gap
         return items
 
@@ -606,7 +661,7 @@ class NowPlayingPage:
             mask = Image.new("L", (it["maxw"] + 2 * m, it["h"] + 2 * m), 0)
             d = ImageDraw.Draw(mask)
             for k, ln in enumerate(it["lines"]):
-                self._np_text.draw(d, (m, m + k * it["lh"]), ln, "bold", it["px"], 255)
+                self._np_lyric_text.draw(d, (m, m + k * it["lh"]), ln, "bold", it["px"], 255)
             it["mask"] = mask
         return it["mask"]
 
@@ -655,11 +710,12 @@ class NowPlayingPage:
         W = frame.size[0]
         ly = self._np_lyric_model(W)
         items = ly["items"]
-        pad = self._S(28)
-        anchor = top + int((bottom - top) * 0.30)
-        fade = self._S(56)
+        pad = self._np_lyric_pad(W)
+        anchor = top + int((bottom - top) * (0.36 if self._np_fs else 0.30))
+        fade = self._S(96 if self._np_fs else 56)
         synced = self._np_synced()
         playing = self._np_playing() or not synced
+        t_ms = self._np_sheet_pos() if synced else 0
         born = _clamp((now - ly["born"]) / 0.45) if M.ANIMATIONS_ENABLED else 1.0
         born_e = _ease_out(born)
         rise = int((1 - born_e) * self._S(14))
@@ -680,6 +736,12 @@ class NowPlayingPage:
             self._ly_user = self._ly_user_target
         # 0 → following the song; 1 → browsing (every line sharp and readable)
         browse = _clamp(abs(self._ly_user) / self._S(40))
+
+        if synced and self._np_kara_busy(ly, t_ms) and self._np_playing():
+            busy = True        # a line being sung word by word
+        # Breathing dots move slowly: they keep the clock going at half rate
+        # (see _tick_progress) unless something else is moving too.
+        self._np_soft_busy = synced and self._np_dots_busy(ly, t_ms)
 
         rects = []
         for i, it in enumerate(items):
@@ -720,7 +782,15 @@ class NowPlayingPage:
             if hot:
                 self._np_pill_on(frame, (pad - self._S(10), y - self._S(6),
                                          pad + it["w"] + self._S(10), y + it["h"] + self._S(6)), 0.09)
-            mask = self._np_line_mask(ly, i, blur, alpha)
+            if it.get("dots"):
+                self._np_draw_dots(frame, ly, i, pad, y, alpha, now, t_ms, self._np_playing())
+                continue
+            mask = None
+            if synced and i == ly["fto"]:
+                # Word-by-word highlight (when the line has syllable timing).
+                mask = self._np_kara_mask(ly, i, blur, alpha, _clamp(1.0 - ad), t_ms)
+            if mask is None:
+                mask = self._np_line_mask(ly, i, blur, alpha)
             x0, y0 = pad - it["m"], y - it["m"]
             # Clip to the lyric band.
             cut_t = max(0, top - y0)
@@ -775,16 +845,8 @@ class NowPlayingPage:
         d = ImageDraw.Draw(layer)
         hits = []
 
-        # Artwork, rounded, with its corners over the water itself.
-        mask = self._np_rounded_mask((A, A), S(8))
-        if self._img is not None:
-            art = self._img.convert("RGB").resize((A, A), Image.LANCZOS).convert("RGBA")
-            art.putalpha(mask)
-            layer.alpha_composite(art, (pad, top))
-        else:
-            self._np_pill(layer, (pad, top, pad + A, top + A), 0.10)
-            TR.draw(d, (pad + A // 2 - self._px(9) // 2, top + A // 2 - self._px(9) * 0.7),
-                    "♫", "regular", self._px(12), self._np_rgba(0.45))
+        # Artwork: drawn on every frame by _np_draw_cover, so a new cover
+        # can crossfade in on its own clock; the layer leaves its place empty.
 
         # Discord pill, right-aligned.
         on = self._rpc_btn.on
@@ -805,6 +867,18 @@ class NowPlayingPage:
         TR.draw(d, (dx + dot + S(7), py1 + (ph - TR.line_height("semibold", fpx)) // 2),
                 label, "semibold", fpx, self._np_rgba(0.95 if on else 0.6))
         hits.append((px1, py1, px2, py1 + ph, "rpc"))
+
+        # Fullscreen, a round icon button left of the pill.
+        fb = ph
+        fx1 = px1 - S(8) - fb
+        if self._np_hover == "fs":
+            self._np_pill(layer, (fx1, py1, fx1 + fb, py1 + ph), 0.16)
+        gs = S(14)
+        layer.alpha_composite(self._np_icon("unfull" if self._np_fs else "full", gs,
+                                            self._np_rgba(0.95 if self._np_hover == "fs" else 0.62)),
+                              (fx1 + (fb - gs) // 2, py1 + (ph - gs) // 2))
+        hits.append((fx1, py1, fx1 + fb, py1 + ph, "fs"))
+        px1 = fx1
 
         # Title, artist, lyric source.
         tx = pad + A + S(14)
@@ -830,7 +904,7 @@ class NowPlayingPage:
         pk, pt = self._np_pressed
         pressed = pk if time.monotonic() - pt < 0.16 else None
         return (W, self._fmt_time(pos), self._fmt_time(dur) if dur else "--:--",
-                M.LYRIC_DELAY_MS, M.ALWAYS_ON_TOP, self.dot_sp.on, self.dot_dc.on,
+                M._track_offset_ms(), self._np_offset_is_song(), M.ALWAYS_ON_TOP, self.dot_sp.on, self.dot_dc.on,
                 self.lbl_rl.cget("text"), self.lbl_dropped.cget("text"),
                 self.lbl_err.cget("text"), bool(self.lbl_err._binds),
                 self._np_hover if not str(self._np_hover).startswith("line:") else None,
@@ -846,7 +920,20 @@ class NowPlayingPage:
         n = size * sc
         m = Image.new("L", (n, n), 0)
         d = ImageDraw.Draw(m)
-        if kind == "play":
+        if kind in ("full", "unfull"):
+            w = max(4, int(n * 0.11))
+            a, b = (n * 0.12, n * 0.42) if kind == "full" else (n * 0.08, n * 0.36)
+            for cx, cy, sx, sy in ((0, 0, 1, 1), (n, 0, -1, 1), (0, n, 1, -1), (n, n, -1, -1)):
+                if kind == "full":
+                    x0, y0 = cx + sx * a, cy + sy * a
+                    arms = [(x0, y0, x0 + sx * (b - a), y0), (x0, y0, x0, y0 + sy * (b - a))]
+                else:                             # pointing inwards: corner at the arm ends
+                    x0, y0 = cx + sx * b, cy + sy * b
+                    arms = [(x0, y0, x0 - sx * (b - a), y0), (x0, y0, x0, y0 - sy * (b - a))]
+                for x1_, y1_, x2_, y2_ in arms:
+                    d.line((x1_, y1_, x2_, y2_), fill=255, width=w)
+                d.ellipse((x0 - w / 2, y0 - w / 2, x0 + w / 2, y0 + w / 2), fill=255)
+        elif kind == "play":
             d.polygon([(n * 0.28, n * 0.18), (n * 0.28, n * 0.82), (n * 0.84, n * 0.5)], fill=255)
         elif kind == "pause":
             d.rounded_rectangle((n * 0.24, n * 0.18, n * 0.42, n * 0.82), radius=n * 0.04, fill=255)
@@ -926,8 +1013,15 @@ class NowPlayingPage:
         # Delay stepper: "Delay", then a chip with minus, value, plus.
         x = pad
         cy = ctl_y + ctl_h // 2
-        TR.draw(d, (x, cy - lh_s // 2), "Delay", "regular", spx, self._np_rgba(0.55))
-        x += int(TR.measure("Delay", "regular", spx)) + S(10)
+        # "This song" (accent) when the value is saved for the track playing;
+        # "Delay" when it's the global delay every song follows.
+        song = self._np_offset_is_song()
+        lab = "This song" if song else "Delay"
+        lab_w = int(TR.measure(lab, "semibold" if song else "regular", spx))
+        TR.draw(d, (x, cy - lh_s // 2), lab, "semibold" if song else "regular", spx,
+                (self._np_accent() + (255,)) if song else self._np_rgba(0.55))
+        hits.append((x, ctl_y, x + lab_w, ctl_y + ctl_h, "delay_lbl"))
+        x += lab_w + S(10)
         seg = S(32)
         val_w = S(60)
         chip_w = seg * 2 + val_w
@@ -941,10 +1035,11 @@ class NowPlayingPage:
             TR.draw(d, (x1 + (x2 - x1 - gw) / 2, cy - TR.line_height("semibold", gpx) / 2 - S(1)),
                     glyph, "semibold", gpx, self._np_rgba(0.9 if hov == key else 0.7))
             hits.append((x1, ctl_y, x2, ctl_y + ctl_h, key))
-        sv = M.LYRIC_DELAY_MS / 1000
+        off = M._track_offset_ms()
+        sv = off / 1000
         vtxt = f"{'+' if sv > 0 else ''}{sv:.1f}s"
         vw = TR.measure(vtxt, "semibold", spx)
-        vcol = (self._np_accent() + (255,)) if M.LYRIC_DELAY_MS else self._np_rgba(0.95)
+        vcol = (self._np_accent() + (255,)) if off else self._np_rgba(0.95)
         TR.draw(d, (x + seg + (val_w - vw) / 2, cy - lh_s / 2), vtxt, "semibold", spx, vcol)
         hits.append((x + seg, ctl_y, x + seg + val_w, ctl_y + ctl_h, "delay"))
 
@@ -1056,7 +1151,8 @@ class NowPlayingPage:
         return (W, H, cache[2] if fluid_fresh else now, bar_px, self._fmt_time(pos),
                 self._np_hover, self._np_drag, self._np_mouse if self._np_hover == "seek" else None,
                 id(self._np_hdr), id(self._np_ftr), self._sheet_idx, self._np_playing(),
-                round(self._ly_user), self._ly_user_target, M._DARK_MODE)
+                round(self._ly_user), self._ly_user_target, M._DARK_MODE,
+                self._np_fx_sig(now, tier))
 
     def _np_render(self, force=True):
         """Compose and show one frame. Returns True while something glides.
@@ -1086,38 +1182,29 @@ class NowPlayingPage:
         # The moving background is also reused between refreshes: it drifts
         # a few pixels a second under a heavy blur, so ~12 updates a second
         # look the same as 60, and a lyric glide doesn't pay for it each frame.
+        fs = bool(self._np_fs)
         cache = self._np_fluid_cache
-        ckey = ((W, H), bg, self._fluid._to, M._DARK_MODE, still)
+        ckey = ((W, H), bg, self._fluid._to, M._DARK_MODE, still, fs)
         max_age = 1e9 if still else (0.08, 0.15, 1e9)[tier]
         if (cache and cache[0] == ckey and now - cache[2] < max_age
                 and not (still and self._fluid.crossfading())):
             frame = cache[1].copy()
         else:
-            frame = self._fluid.render((W, H), now, bg, self._S(18), self._S(26),
+            # Fullscreen has no window chrome to melt into: no edge fades.
+            frame = self._fluid.render((W, H), now, bg, 0 if fs else self._S(18),
+                                       0 if fs else self._S(26),
                                        motion_t=40.0 if still else None, dither=tier == 0)
             self._np_fluid_cache = (ckey, frame.copy(), now)
         busy = self._fluid.crossfading()
+        # A beat swells the water for a moment (Smooth tier, beat data only).
+        _beat, lift = self._np_beat_level(tier)
+        if lift:
+            frame = self._np_beat_apply(frame, lift)
+            busy = True
 
-        # Header, crossfading on a track change.
         if self._np_hdr is None:
             self._np_hdr = self._np_build_header(W)
         hdr, hhits = self._np_hdr
-        prev = self._np_hdr_prev
-        t = _clamp((now - self._np_hdr_t0) / self.HEADER_FADE_S) if anim else 1.0
-        if prev is not None and t < 1.0 and prev.size == hdr.size:
-            e = _ease_out(t)
-            a = hdr.getchannel("A").point([int(v * e) for v in range(256)])
-            b = prev.getchannel("A").point([int(v * (1 - e)) for v in range(256)])
-            p2 = prev.copy(); p2.putalpha(b)
-            frame.paste(p2, (0, -int(e * self._S(6))), p2)
-            h2 = hdr.copy(); h2.putalpha(a)
-            frame.paste(h2, (0, int((1 - e) * self._S(6))), h2)
-            busy = True
-        else:
-            self._np_hdr_prev = None
-            frame.paste(hdr, (0, 0), hdr)
-
-        # Footer.
         dur = getattr(M.state, "duration_ms", 0) or 0
         pos = self._estimate_pos_ms()
         fkey = self._np_footer_key(W, pos, dur)
@@ -1126,15 +1213,55 @@ class NowPlayingPage:
             self._np_ftr_key = fkey
         ftr, fhits, bar_y = self._np_ftr
         fy = H - ftr.size[1]
-        frame.paste(ftr, (0, fy), ftr)
-        frac = _clamp(pos / dur) if dur > 0 else 0.0
-        self._np_progress(frame, fy + bar_y, frac)
 
-        # Lyrics between the two.
-        busy = self._np_draw_lyrics(frame, hdr.size[1] + self._S(4), fy - self._S(4), now) or busy
+        def chrome():
+            """Header (crossfading on a track change), cover, footer, seek bar."""
+            nonlocal busy
+            prev = self._np_hdr_prev
+            t = _clamp((now - self._np_hdr_t0) / self.HEADER_FADE_S) if anim else 1.0
+            if prev is not None and t < 1.0 and prev.size == hdr.size:
+                e = _ease_out(t)
+                a = hdr.getchannel("A").point([int(v * e) for v in range(256)])
+                b = prev.getchannel("A").point([int(v * (1 - e)) for v in range(256)])
+                p2 = prev.copy(); p2.putalpha(b)
+                frame.paste(p2, (0, -int(e * self._S(6))), p2)
+                h2 = hdr.copy(); h2.putalpha(a)
+                frame.paste(h2, (0, int((1 - e) * self._S(6))), h2)
+                busy = True
+            else:
+                self._np_hdr_prev = None
+                frame.paste(hdr, (0, 0), hdr)
+            self._np_draw_cover(frame, now)
+            if self._np_cover_busy(now):
+                busy = True
+            frame.paste(ftr, (0, fy), ftr)
+            frac = _clamp(pos / dur) if dur > 0 else 0.0
+            self._np_progress(frame, fy + bar_y, frac)
 
-        self._np_hits = (list(hhits) + [(x1, y1 + fy, x2, y2 + fy, k) for x1, y1, x2, y2, k in fhits]
-                         + getattr(self, "_ly_rects", []))
+        if not fs:
+            chrome()
+            # Lyrics between the two.
+            busy = self._np_draw_lyrics(frame, hdr.size[1] + self._S(4), fy - self._S(4), now) or busy
+            self._np_hits = (list(hhits) + [(x1, y1 + fy, x2, y2 + fy, k) for x1, y1, x2, y2, k in fhits]
+                             + getattr(self, "_ly_rects", []))
+        else:
+            # Fullscreen: the lyrics get the whole screen; the controls float
+            # over them on a soft scrim and fade out while the pointer rests.
+            busy = self._np_draw_lyrics(frame, self._S(24), H - self._S(24), now) or busy
+            level = self._np_chrome_level(now)
+            if level != self._np_chrome_target(now):
+                busy = True
+            if level > 0.01:
+                extra = self._S(48)
+                boxes = [(0, 0, W, min(H, hdr.size[1] + extra)), (0, max(0, fy - extra), W, H)]
+                before = [frame.crop(b) for b in boxes] if level < 0.99 else None
+                self._np_scrim(frame, boxes[0][3], H - boxes[1][1], 1.0)
+                chrome()
+                if before:
+                    for b, old in zip(boxes, before):
+                        frame.paste(Image.blend(old, frame.crop(b), level), b[:2])
+            self._np_hits = ((list(hhits) + [(x1, y1 + fy, x2, y2 + fy, k) for x1, y1, x2, y2, k in fhits]
+                              if level >= 0.5 else []) + getattr(self, "_ly_rects", []))
 
         try:
             if self._np_photo is None or (self._np_photo.width(), self._np_photo.height()) != (W, H):
@@ -1144,6 +1271,9 @@ class NowPlayingPage:
                 self._np_photo.paste(frame)
         except tk.TclError:
             return False
+        soft = getattr(self, "_np_soft_busy", False) and not busy
+        busy = busy or soft
+        self._np_soft_busy = soft
         self._np_want_frame = False
         self._np_last_busy = busy
         self._np_last_sig = self._np_frame_sig(W, H, now, tier, still)
@@ -1202,6 +1332,8 @@ class NowPlayingPage:
                 busy = self._np_render(force=False)
                 if busy:
                     interval = (self.FRAME_MS_BUSY, 33, 33)[tier]
+                    if getattr(self, "_np_soft_busy", False):
+                        interval = (33, 50, 66)[tier]      # only the dots breathing
                     animating = True
                 elif self._np_hover == "seek" or self._np_drag is not None:
                     interval = self.FRAME_MS_BUSY
@@ -1211,7 +1343,8 @@ class NowPlayingPage:
                     animating = tier < 2 and M.ANIMATIONS_ENABLED
                 # Wake exactly when the next lyric line starts, so a low frame
                 # rate never makes a line late.
-                interval = min(interval, self._np_ms_to_next_line())
+                interval = min(interval, self._np_ms_to_next_line(),
+                               self._np_ms_to_next_event(tier), self._np_ms_to_next_beat(tier))
         except Exception as e:
             M.log(f"Lyric sheet frame failed: {e}")
             interval = 1000
