@@ -1,4 +1,4 @@
-"""The Settings page, listening stats and theming.
+"""The Settings page and theming.
 
 Layout: a page title, then grouped cards. Every row is the same shape: a
 title with an optional one-line explanation on the left, one control on the
@@ -18,7 +18,6 @@ Names that belong to main are reached through M, the live main module:
 palette colours and settings are rebound at runtime, so they must be read
 from main on every use, never copied.
 """
-import datetime
 import os
 import subprocess
 import sys
@@ -708,89 +707,6 @@ class SettingsPage:
         T = lambda text="", fg=None: _Text(self, text, fg)
         spec = [("title", "Settings", "Changes save as you make them.")]
 
-        # ── Listening ──────────────────────────────────────────────
-        self.lbl_stats_songs = T("0", M.TEXT)
-        self.lbl_stats_time = T("0m 0s", M.TEXT)
-        self.lbl_stats_week = T("", M.TEXT2)
-        self.lbl_stats_all = T("", M.TEXT2)
-
-        def _stats(cv, x0, x1, y):
-            """2x2 grid of big numbers, then top artists for both periods as
-            ranked lists with a bar each."""
-            col_w = (x1 - x0) // 2
-            big, cap = self._f(M.FS_HERO + 3, True), self._f(M.FS_SMALL)
-            data = getattr(self, "_stats_data", None)
-
-            def tile(x, yy, value, caption, slot=None):
-                v = cv.create_text(x, yy, anchor="nw", text=value, fill=M.TEXT, font=big)
-                if slot is not None:
-                    slot.item = v
-                c = cv.create_text(x, cv.bbox(v)[3], anchor="nw", text=caption, fill=M.MUTED,
-                                   font=cap, width=col_w - S(12))
-                return cv.bbox(c)[3]
-
-            def hm(ms):
-                h, m = divmod(int(ms // 60000), 60)
-                return f"{h}h {m}m" if h else f"{m}m"
-
-            yy = y + S(14)
-            b1 = tile(x0, yy, self.lbl_stats_songs.cget("text"), "songs this session",
-                      self.lbl_stats_songs)
-            b2 = tile(x0 + col_w, yy, self.lbl_stats_time.cget("text"), "listened this session",
-                      self.lbl_stats_time)
-            yy = max(b1, b2) + S(14)
-            if not data:
-                cv.create_line(x0, yy, x1 + S(16), yy, fill=M.BORDER)
-                self.lbl_stats_week.item = cv.create_text(
-                    x0, yy + S(12), anchor="nw", text=self.lbl_stats_week.cget("text"),
-                    fill=M.TEXT2, font=self._f(M.FS_BODY), width=x1 - x0)
-                self.lbl_stats_all.item = None
-                return cv.bbox(self.lbl_stats_week.item)[3] + S(16) - y
-            wk, al = data["week"], data["all"]
-            cv.create_line(x0, yy, x1 + S(16), yy, fill=M.BORDER)
-            yy += S(14)
-            b1 = tile(x0, yy, f"{wk['plays']:,}", f"plays in the last 7 days · {hm(wk['listened_ms'])}")
-            b2 = tile(x0 + col_w, yy, f"{al['plays']:,}", f"plays all time · {hm(al['listened_ms'])}")
-            self.lbl_stats_week.item = self.lbl_stats_all.item = None
-            yy = max(b1, b2) + S(14)
-
-            if not (wk["top_artists"] or al["top_artists"]):
-                return yy - y
-            cv.create_line(x0, yy, x1 + S(16), yy, fill=M.BORDER)
-            yy += S(14)
-            body = self._f(M.FS_BODY)
-            small_b = self._f(M.FS_SMALL, True)
-            bottom = yy
-            for k, (title, d) in enumerate((("Top artists · 7 days", wk), ("Top artists · all time", al))):
-                x = x0 + k * col_w
-                w = col_w - S(18)
-                t = cv.create_text(x, yy, anchor="nw", text=title, fill=M.MUTED, font=small_b)
-                ry = cv.bbox(t)[3] + S(8)
-                tops = d["top_artists"]
-                if not tops:
-                    cv.create_text(x, ry, anchor="nw", text="Nothing yet", fill=M.MUTED, font=body)
-                    bottom = max(bottom, ry + S(20))
-                    continue
-                most = max(n for _, n in tops) or 1
-                for rank, (name, n) in enumerate(tops, 1):
-                    cnt = f"{n}"
-                    cw = small_b.measure(cnt)
-                    label = f"{rank}. {name}"
-                    room = w - cw - S(10)
-                    while label and body.measure(label) > room:
-                        label = label[:-2] + "…" if len(label) > 2 else ""
-                    cv.create_text(x, ry, anchor="nw", text=label,
-                                   fill=M.TEXT if rank == 1 else M.TEXT2, font=body)
-                    cv.create_text(x + w, ry, anchor="ne", text=cnt, fill=M.MUTED, font=small_b)
-                    by = ry + body.metrics("linespace") + S(3)
-                    cv.create_rectangle(x, by, x + w, by + S(3), fill=M.BG3, outline="")
-                    cv.create_rectangle(x, by, x + max(S(3), int(w * n / most)), by + S(3),
-                                        fill=M.ACCENT, outline="")
-                    ry = by + S(10)
-                bottom = max(bottom, ry)
-            return bottom + S(6) - y
-        spec += [("section", "Listening"), ("card", [{"kind": "extra", "draw": _stats}])]
-
         # ── Lyrics ─────────────────────────────────────────────────
         self.lbl_lyric_size = T()
         def _paint_lf():
@@ -1062,8 +978,7 @@ class SettingsPage:
         spec += [("section", "Diagnostics"), ("card", log_card)]
 
         self._set_spec = spec
-        self._refresh_stats()
-        self._refresh_long_stats(sync=True)
+        self._refresh_stats()          # arms the 5 s session-stats timer (Stats page)
         self._set_render()
 
     # ── Lyric sublines and sleep timer rows ──────────────────────
@@ -1259,95 +1174,6 @@ class SettingsPage:
             self._log(f"Shortcut failed: {e}")
             self._set_error(f"Could not create shortcut: {e}")
 
-    # ── Stats ────────────────────────────────────────────────────
-    def _refresh_stats(self, reschedule=True):
-        """Update session stats labels.
-
-        Named timer slot: this is called both by its own 5 s timer and on
-        every ("stats",) event. Raw after() here once spawned a new chain per
-        event, thousands after a few hours (the 1.1.5 freeze). Event-driven
-        callers pass reschedule=False."""
-        M._health_snapshot()
-        total_secs = int(M._get_listen_time())
-        mins, secs = divmod(total_secs, 60)
-        hrs, mins = divmod(mins, 60)
-        tstr = f"{hrs}h {mins}m" if hrs else f"{mins}m {secs}s"
-        if hasattr(self, "lbl_stats_songs"):
-            self.lbl_stats_songs.config(text=str(M._session_songs))
-            self.lbl_stats_time.config(text=tstr)
-            self._refresh_long_stats()
-        if not reschedule:
-            return
-        self._schedule("stats", 5000, self._refresh_stats)
-
-    STATS_EVERY_S = 60        # long stats refresh this often when Settings isn't open
-
-    def _refresh_long_stats(self, sync=False):
-        """Last-7-days and all-time totals from the history database.
-
-        The two queries scan the whole plays table. They used to run on the
-        Tk thread every 5 s and on every play/pause event; with a big history
-        on a slow disk that was a stutter every few seconds. They now run on a
-        worker, at most once a minute unless the Settings page is on screen
-        (or `sync` is set, for tests and the first build)."""
-        if not hasattr(self, "lbl_stats_week"):
-            return
-        st = M._store()
-        if not st:
-            self._stats_data = None
-            self.lbl_stats_week.config(text="History is off. Turn on \"Remember history\" for long-term stats.")
-            self.lbl_stats_all.config(text="")
-            self._set_relayout_soon()
-            return
-        import time as _t
-        now = _t.monotonic()
-        visible = self._cur_page == "SETTINGS" and not self._hidden
-        if not sync and not visible and now - getattr(self, "_stats_at", -1e9) < self.STATS_EVERY_S:
-            return
-        if getattr(self, "_stats_busy", False) and not sync:
-            return
-        self._stats_at = now
-
-        def query():
-            return (st.stats(since=datetime.datetime.now() - datetime.timedelta(days=7), top=5),
-                    st.stats(top=5))
-
-        def apply(res):
-            self._stats_busy = False
-            if res is None:
-                return
-            week, alltime = res
-            def _fmt(label, d):
-                h, m = divmod(int(d["listened_ms"] // 60000), 60)
-                txt = f"{label}  ·  {d['plays']} plays  ·  {h}h {m}m"
-                if d["top_artists"]:
-                    txt += chr(10) + "Top: " + ", ".join(f"{a} ({n})" for a, n in d["top_artists"])
-                return txt
-            self._stats_data = {"week": week, "all": alltime}
-            self.lbl_stats_week._o["text"] = _fmt("Last 7 days", week)
-            self.lbl_stats_all._o["text"] = _fmt("All time", alltime)
-            self._set_relayout_soon()
-
-        if sync:
-            try:
-                apply(query())
-            except Exception as e:
-                M.log(f"Stats query failed: {e}")
-            return
-        self._stats_busy = True
-        fut = M.image_executor.submit(query)
-        def done(f):
-            try:
-                res = f.result()
-            except Exception as e:
-                M.log(f"Stats query failed: {e}")
-                res = None
-            try:
-                self.win.after(0, lambda: apply(res))
-            except Exception:
-                pass
-        fut.add_done_callback(done)
-
     # ── Theming ──────────────────────────────────────────────────
     def _set_theme(self, key):
         """Set dark or light theme from the segmented control."""
@@ -1443,13 +1269,16 @@ class SettingsPage:
 
         # The settings canvas draws its own items; recolour its text stand-ins
         # and redraw it.
-        for name in ("lbl_track_off", "lbl_lyric_size", "lbl_stats_songs", "lbl_stats_time",
-                     "lbl_stats_week", "lbl_stats_all"):
+        for name in ("lbl_track_off", "lbl_lyric_size"):
             slot = getattr(self, name, None)
             if isinstance(slot, _Text) and slot._o.get("fg") in _remap:
                 slot._o["fg"] = _remap[slot._o["fg"]]
         try:
             self._set_render()
+        except (AttributeError, tk.TclError):
+            pass
+        try:
+            self._stats_render()
         except (AttributeError, tk.TclError):
             pass
 

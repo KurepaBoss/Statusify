@@ -1841,16 +1841,18 @@ import statusify_ui_now_playing
 import statusify_ui_history
 import statusify_ui_settings
 import statusify_ui_overlay
+import statusify_ui_stats
 for _ui_mod in (statusify_ui_mini, statusify_ui_now_playing, statusify_ui_history, statusify_ui_settings,
-                statusify_ui_overlay):
+                statusify_ui_overlay, statusify_ui_stats):
     _ui_mod.M = sys.modules[__name__]
 from statusify_ui_mini import MiniTrayMixin
 from statusify_ui_now_playing import NowPlayingPage
 from statusify_ui_history import HistoryPage
 from statusify_ui_settings import SettingsPage
 from statusify_ui_overlay import OverlayMixin
+from statusify_ui_stats import StatsPage
 
-class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage, OverlayMixin):
+class App(MiniTrayMixin, NowPlayingPage, HistoryPage, StatsPage, SettingsPage, OverlayMixin):
     """
     Single Tk() window in a native Windows frame.
 
@@ -2100,6 +2102,7 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage, OverlayMixin
             "<Control-Key-1>":    lambda e: self._show("NOW PLAYING"),
             "<Control-Key-2>":    lambda e: self._show("HISTORY"),
             "<Control-Key-3>":    lambda e: self._show("SETTINGS"),
+            "<Control-Key-4>":    lambda e: self._show("STATS"),
             "<Control-c>":        lambda e: self._copy_current_lyric(),
             "<Control-m>":        lambda e: self._toggle_mini(),
             "<Control-t>":        lambda e: self._toggle_topmost(),
@@ -2688,7 +2691,7 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage, OverlayMixin
         self._nav = nav
         self._tab_btns = {}
         for name, label in (("NOW PLAYING", "Lyrics"), ("HISTORY", "History"),
-                            ("SETTINGS", "Settings")):
+                            ("STATS", "Stats"), ("SETTINGS", "Settings")):
             b = tk.Label(nav, text=label, fg=MUTED, bg=BG2,
                          font=self._f(FS_SMALL, True), cursor="hand2",
                          padx=SP_LG, pady=SP_XS + 1)
@@ -2714,6 +2717,8 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage, OverlayMixin
         """Build the non-default pages once the window is up (see __init__)."""
         if "HISTORY" not in self._pages:
             self._build_history()
+        if "STATS" not in self._pages:
+            self._build_stats()
         if "SETTINGS" not in self._pages:
             self._build_settings()
 
@@ -2725,6 +2730,7 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage, OverlayMixin
         # first switch if the idle builder hasn't run yet.
         if name not in self._pages:
             builder = {"HISTORY": getattr(self, "_build_history", None),
+                       "STATS": getattr(self, "_build_stats", None),
                        "SETTINGS": getattr(self, "_build_settings", None)}.get(name)
             if builder:
                 builder()
@@ -2742,8 +2748,8 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage, OverlayMixin
             page.place(x=0, y=0, relwidth=1, relheight=1)
         page.tkraise()
         self._cur_page = name
-        if name == "SETTINGS":
-            self._refresh_long_stats()      # throttled off-page; fresh on show
+        if name == "STATS":
+            self._refresh_long_stats()      # queries only while shown; fresh on show
         # The lyric sheet stops drawing while hidden; wake it at once.
         if name == "NOW PLAYING":
             self._schedule("progress", 0, self._tick_progress)
@@ -2965,6 +2971,7 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage, OverlayMixin
                     # While a search is showing, new plays wait for it to clear.
                     if not (getattr(self, "_hist_search", None) and self._hist_search.get().strip()):
                         self._add_history_row(ev[1])
+                    self._stats_on_play()
                 elif k == "dropped":
                     n = ev[1]
                     self.lbl_dropped.config(
