@@ -884,6 +884,15 @@ class State:
     instrumental_gaps  = []  # pre-calculated list of {startMs, endMs, gap_ms, key}
     synced = []; plain = []
     blacklisted        = False  # current track matches the user's blacklist
+    # Bridge v2.1 (see CONTRACT.md). synced lines may carry "syl"/"endMs".
+    queue       = []     # next up-to-10 tracks: {uri, uid, title, artist, album_art, duration_ms}
+    volume      = 1.0    # 0.0-1.0
+    shuffle     = False
+    repeat      = 0      # 0 off, 1 context, 2 track
+    liked       = False
+    beats       = []     # beat onsets, ms
+    tempo       = 0.0
+    translation = {}     # {line_index: {"rom": str|None, "tr": str|None}}
     _position_ms = 0
     _pos_mono    = None        # time.monotonic() when _position_ms was last set
 
@@ -1123,6 +1132,11 @@ async def _lrclib_task(uri, artist, title, duration_ms):
         return
     _apply_lyrics(*picked, "LRCLIB")
 
+# Lyrics the bridge fetched ahead for upcoming tracks (lyrics_prefetch),
+# applied the moment one of them starts playing.
+import statusify_bridge as _bridge_mod
+_PREFETCH = _bridge_mod.PrefetchCache(5)
+
 def _handle_pause():
     state.is_playing = False
     event_queue.put(("paused",))
@@ -1141,9 +1155,39 @@ def _send_bridge(obj):
     except Exception:
         return False
 
-def player_command(action):
-    """prev / next / toggle / play / pause, sent to Spotify via the bridge."""
-    return _send_bridge({"type": "player", "action": action})
+def player_command(action, **extra):
+    """prev / next / toggle / play / pause / shuffle / repeat / like, sent to
+    Spotify via the bridge. shuffle/repeat/like update `state` optimistically;
+    the bridge's player_state reply corrects it if the command didn't take."""
+    if not _send_bridge({"type": "player", "action": action, **extra}):
+        return False
+    if action in ("shuffle", "repeat", "like"):
+        if action == "shuffle":
+            state.shuffle = not state.shuffle
+        elif action == "repeat":
+            state.repeat = (int(state.repeat) + 1) % 3
+        else:
+            state.liked = not state.liked
+        event_queue.put(("player_state",))
+    return True
+
+def set_volume(v):
+    """Set Spotify's volume (0.0-1.0). Optimistic, like player_command."""
+    try:
+        v = min(1.0, max(0.0, float(v)))
+    except (TypeError, ValueError):
+        return False
+    if not _send_bridge({"type": "volume", "value": v}):
+        return False
+    state.volume = v
+    event_queue.put(("player_state",))
+    return True
+
+def skip_to_queue(uri, uid=""):
+    """Jump to a track from state.queue (uid disambiguates repeats)."""
+    if not uri:
+        return False
+    return _send_bridge({"type": "skip_to", "uri": uri, "uid": uid or ""})
 
 def seek_to(ms):
     """Seek Spotify to `ms`. The UI moves at once; the bridge confirms."""
@@ -1192,6 +1236,7 @@ async def ws_handler(ws):
                 # (which checks gaps before lyrics) published a phantom
                 # "instrumental" for the next track's first seconds.
                 state.instrumental_gaps = []
+                state.beats = []; state.tempo = 0.0; state.translation = {}
                 state.is_playing = True
                 # Reset the per-song dropped-line counter on every track change.
                 _dropped_lines = 0
@@ -1207,8 +1252,15 @@ async def ws_handler(ws):
                 # A track heard before has its lyrics on disk: use them now
                 # rather than waiting on the network. The bridge still fetches;
                 # real lyrics from it replace these, a miss does not.
-                cached = _cached_lyrics(state.track_uri)
-                if cached:
+                # Lyrics prefetched while the previous song played are
+                # fresher than the cache; either way the bridge's own fetch
+                # still arrives and replaces them.
+                pre = _PREFETCH.pop(state.track_uri)
+                cached = None if pre else _cached_lyrics(state.track_uri)
+                if pre:
+                    p_mode, p_synced, p_plain, p_src = pre
+                    _apply_lyrics(p_mode, p_synced, p_plain, _bridge_mod.preloaded_label(p_src))
+                elif cached:
                     c_mode, c_synced, c_plain, _ = cached
                     _apply_lyrics(c_mode, c_synced, c_plain, "cache")
             elif t == "lyrics":
@@ -1240,6 +1292,39 @@ async def ws_handler(ws):
                 if not was and playing:
                     _on_track_resume()
                     event_queue.put(("resumed",))
+            elif t == "lyrics_prefetch":
+                uri = data.get("track_uri", "")
+                mode = data.get("mode", "none")
+                synced = data.get("synced", []); plain = data.get("plain", [])
+                src = data.get("source", "Spicy")
+                if uri and uri == state.track_uri:
+                    # Arrived just after its track started: use it now unless
+                    # the real fetch already delivered.
+                    if state.lyrics_mode == "none" and mode in ("synced", "plain"):
+                        _apply_lyrics(mode, synced, plain, _bridge_mod.preloaded_label(src))
+                else:
+                    _PREFETCH.put(uri, mode, synced, plain, src)
+            elif t == "queue":
+                state.queue = _bridge_mod.parse_queue(data.get("tracks"))
+                event_queue.put(("queue",))
+            elif t == "player_state":
+                ps = _bridge_mod.parse_player_state(data, {
+                    "volume": state.volume, "shuffle": state.shuffle,
+                    "repeat": state.repeat, "liked": state.liked})
+                state.volume = ps["volume"]; state.shuffle = ps["shuffle"]
+                state.repeat = ps["repeat"]; state.liked = ps["liked"]
+                event_queue.put(("player_state",))
+            elif t == "beats":
+                uri = data.get("track_uri", "")
+                if not uri or uri == state.track_uri:
+                    try:
+                        state.beats = sorted(int(b) for b in (data.get("beats") or []))
+                        state.tempo = float(data.get("tempo") or 0.0)
+                    except (TypeError, ValueError):
+                        state.beats = []; state.tempo = 0.0
+                    event_queue.put(("beats",))
+            elif t == "hello":
+                log(f"Lyrics bridge v{data.get('version', '?')} connected")
             elif t == "lyrics_debug":
                 msg = data.get("message", "")
                 if msg:
@@ -1841,6 +1926,8 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
             # Defer until after the first draw, or Tk shows a flash of window.
             self._schedule("startmin", 400, self._start_hidden)
         self._schedule("bridgecheck", 2500, self._check_bridge_version)
+        self._bridge_health = _bridge_mod.BridgeHealth()
+        self._schedule("bridgehealth", self._HEALTH_EVERY_MS, self._check_bridge_health)
         # Clear any stale request left by a crash, then start watching.
         try:
             if os.path.exists(_SHOW_FLAG):
@@ -2109,6 +2196,8 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
             self._set_error(f"Could not start repair: {e}")
             return
         log("Bridge repair started")
+        if getattr(self, "_bridge_health", None) is not None:
+            self._bridge_health.snooze()   # the repair restarts Spotify
         self._set_error("Repairing — follow the window that just opened (Spotify will restart)")
         self.lbl_err.unbind("<Button-1>"); self.lbl_err.config(cursor="")
         deadline = time.monotonic() + 300
@@ -2124,6 +2213,49 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
             else:
                 self._check_bridge_version()   # restore the clickable warning
         self._schedule("bridge_repair", 3000, check)
+
+    # ── Bridge health ─────────────────────────────────────────────
+    # A Spotify/Spicetify update silently removes the injected bridge: Spotify
+    # runs, nothing connects, lyrics never come. While no bridge is connected,
+    # check every 15 s whether Spotify is running anyway (tasklist, off the Tk
+    # thread); after BridgeHealth.GRACE_S of that, offer the repair.
+    _HEALTH_EVERY_MS = 15000
+
+    def _check_bridge_health(self):
+        h = getattr(self, "_bridge_health", None)
+        if h is not None and h.needs_check() and not getattr(self, "_health_busy", False):
+            self._health_busy = True
+            def work():
+                event_queue.put(("bridge_health", _bridge_mod.spotify_running()))
+            threading.Thread(target=work, daemon=True, name="bridge-health").start()
+        self._schedule("bridgehealth", self._HEALTH_EVERY_MS, self._check_bridge_health)
+
+    def _apply_bridge_health(self, verdict):
+        h = getattr(self, "_bridge_health", None)
+        if h is None:
+            return
+        msg = _bridge_mod.HEALTH_MSG
+        try:
+            shown = msg in self.lbl_err.cget("text")
+        except (AttributeError, tk.TclError):
+            shown = False
+        try:
+            blank = not self.lbl_err.cget("text")
+        except (AttributeError, tk.TclError):
+            blank = False
+        if verdict == "flag" or (verdict is None and h.flagged and blank):
+            # The second case re-shows it after something else (e.g. Discord
+            # connecting) blanked the line — without logging it again, and
+            # without covering some other message.
+            if verdict == "flag":
+                log(f"⚠ {msg}")
+            self._set_error(msg)
+            if _maint.repair_files(_RES_DIR, _APP_DIR):
+                self.lbl_err.config(cursor="hand2")
+                self.lbl_err.bind("<Button-1>", lambda e: self._repair_bridge())
+        elif verdict == "clear" and shown:
+            self._set_error("")
+            self.lbl_err.unbind("<Button-1>"); self.lbl_err.config(cursor="")
 
     def _tray_toggle_rpc(self):
         _hotkey_toggle(self)
@@ -2781,7 +2913,17 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, SettingsPage):
                     log("❌ Close any other Statusify window and restart.")
                     self.lbl_lyric.config(text="Port conflict — restart app", fg="#ff6b6b")
                     self._set_error(f"WebSocket bind failed: {msg}")
-                elif k == "sp":          self.dot_sp.config(fg=ACCENT if ev[1] else MUTED)
+                elif k == "sp":
+                    self.dot_sp.config(fg=ACCENT if ev[1] else MUTED)
+                    h = getattr(self, "_bridge_health", None)
+                    if h is not None:
+                        if ev[1]: self._apply_bridge_health(h.on_connect())
+                        else:     h.on_disconnect()
+                elif k == "bridge_health":
+                    self._health_busy = False
+                    h = getattr(self, "_bridge_health", None)
+                    if h is not None:
+                        self._apply_bridge_health(h.evaluate(ev[1]))
                 elif k == "track":
                     _, ar, ti, art = ev
                     self.lbl_title.config(text=ti); self.lbl_artist.config(text=ar)
