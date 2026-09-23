@@ -29,6 +29,8 @@ try:
 except ImportError:
     Image = ImageDraw = None
 
+import statusify_backdrop as bdm
+
 M = None   # the main module
 
 
@@ -79,23 +81,31 @@ class _Switch:
     def image(self):
         w, h = self.size()
         q = round(self.t * 20) / 20
-        key = ("sw", w, h, q, M.BG2, M.BG4, M.ACCENT, M.TEXT2, M.ACCENT_FG)
+        cover = M._cover_mode()
+        key = ("sw", w, h, q, M.BG2, M.BG4, M.ACCENT, M.TEXT2, M.ACCENT_FG, cover)
         cache = self.p.__dict__.setdefault("_pill_cache", {})
         ph = cache.get(key)
         if ph is None:
             sc = 4
-            off, on = _rgb(M.BG4), _rgb(M.ACCENT)
-            col = tuple(int(off[i] + (on[i] - off[i]) * q) for i in range(3))
             ko, kn = _rgb(M.TEXT2), _rgb(M.ACCENT_FG)
             kcol = tuple(int(ko[i] + (kn[i] - ko[i]) * q) for i in range(3))
-            big = Image.new("RGB", (w * sc, h * sc), _rgb(M.BG2))
+            if cover:
+                # See-through track over the backdrop: white 16 % when off.
+                off, on = self.p._bd_rgba(M.BG4), _rgb(M.ACCENT) + (255,)
+                col = tuple(int(off[i] + (on[i] - off[i]) * q) for i in range(4))
+                big = Image.new("RGBA", (w * sc, h * sc), (0, 0, 0, 0))
+            else:
+                off, on = _rgb(M.BG4), _rgb(M.ACCENT)
+                col = tuple(int(off[i] + (on[i] - off[i]) * q) for i in range(3))
+                big = Image.new("RGB", (w * sc, h * sc), _rgb(M.BG2))
             d = ImageDraw.Draw(big)
             d.rounded_rectangle((0, 0, w * sc - 1, h * sc - 1), radius=h * sc // 2, fill=col)
             pad = 3 * sc
             k = h * sc - 2 * pad
             x = pad + (w * sc - 2 * pad - k) * q
             d.ellipse((x, pad, x + k, pad + k), fill=kcol)
-            ph = M.ImageTk.PhotoImage(big.resize((w, h), Image.LANCZOS))
+            img = bdm._downsample(big, (w, h)) if cover else big.resize((w, h), Image.LANCZOS)
+            ph = M.ImageTk.PhotoImage(img)
             cache[key] = ph
         self.ph = ph            # the shared cache may be trimmed; the item keeps its image
         return ph
@@ -212,7 +222,7 @@ class _Segmented:
         # A page render draws every segmented control, and hover and the
         # slide revisit the same few states, so keep what was drawn.
         key = (seg, tw, h, x, self.hover, self.current(), M._DARK_MODE,
-               M.BG2, M.BG3, M.BG4, M.TEXT, M.TEXT2, M.MUTED)
+               M.BG2, M.BG3, M.BG4, M.TEXT, M.TEXT2, M.MUTED, M._cover_mode())
         ph = self._imgs.get(key)
         if ph is not None:
             self.ph = ph
@@ -225,13 +235,20 @@ class _Segmented:
     def _render(self, seg, tw, h, x):
         S = self.p._ss
         sc = 4
-        big = Image.new("RGB", (tw * sc, h * sc), _rgb(M.BG2))
+        cover = M._cover_mode()
+        if cover:
+            # See-through over the backdrop (statusify_backdrop.to_rgba).
+            big = Image.new("RGBA", (tw * sc, h * sc), (0, 0, 0, 0))
+            track, knob = self.p._bd_rgba(M.BG3), self.p._bd_rgba(M.BG4)
+        else:
+            big = Image.new("RGB", (tw * sc, h * sc), _rgb(M.BG2))
+            track, knob = _rgb(M.BG3), _rgb(M.BG4 if M._DARK_MODE else M.BG2)
         d = ImageDraw.Draw(big)
-        d.rounded_rectangle((0, 0, tw * sc - 1, h * sc - 1), radius=S(8) * sc, fill=_rgb(M.BG3))
+        d.rounded_rectangle((0, 0, tw * sc - 1, h * sc - 1), radius=S(8) * sc, fill=track)
         p = S(3) * sc
         d.rounded_rectangle((x * sc + p, p, (x + seg) * sc + p - 1, h * sc - p - 1),
-                            radius=S(6) * sc, fill=_rgb(M.BG4 if M._DARK_MODE else M.BG2))
-        img = big.resize((tw, h), Image.LANCZOS)
+                            radius=S(6) * sc, fill=knob)
+        img = bdm._downsample(big, (tw, h)) if cover else big.resize((tw, h), Image.LANCZOS)
         dr = ImageDraw.Draw(img)
         TR = self.p._np_text
         px = self.p._px(M.FS_SMALL + 1)
@@ -387,14 +404,32 @@ class SettingsPage:
                 s = 1.0
         return int(round(v * s))
 
-    def _pill_photo(self, w, h, fill, bg, radius=None, outline=None):
-        """Rounded rectangle composited onto `bg`, as a PhotoImage. Cached."""
-        key = (w, h, fill, bg, radius, outline)
+    def _pill_photo(self, w, h, fill, bg, radius=None, outline=None, solid=False, opaque=False):
+        """Rounded rectangle composited onto `bg`, as a PhotoImage. Cached.
+
+        In cover mode the surface tokens become see-through (the page sits
+        on the backdrop): BG and BG2 are clear, BG3/BG4/HOVER_BG white at
+        9/16/6 %, and a fade between two tokens fades between those.
+        solid=True keeps the fill opaque (a tooltip over busy content).
+        opaque=True draws it the flat way even then: an image with any
+        see-through pixel is blended against the canvas on every redraw,
+        which adds up over the heatmap's ~190 cells."""
+        cover = M._cover_mode() and not opaque
+        key = (w, h, fill, bg, radius, outline, cover, solid)
         cache = self.__dict__.setdefault("_pill_cache", {})
         ph = cache.get(key)
         if ph is not None:
             return ph
         r = h // 2 if radius is None else radius
+        if cover:
+            ph = M.ImageTk.PhotoImage(bdm.pill_rgba(
+                w, h, r, _rgb(fill) + (255,) if solid else self._bd_rgba(fill), self._bd_rgba(bg),
+                self._bd_rgba(outline) if outline else None))
+            if len(cache) > 600:
+                self._pill_cache_old = dict(cache)
+                cache.clear()
+            cache[key] = ph
+            return ph
         sc = 4
         big = Image.new("RGB", (w * sc, h * sc), _rgb(bg))
         d = ImageDraw.Draw(big)
@@ -598,7 +633,7 @@ class SettingsPage:
         self._set_gen = getattr(self, "_set_gen", 0) + 1
         cv.page_gen = self._set_gen
         S = self._ss
-        x0, x1 = S(2), W - S(2)
+        x0, x1 = S(22), W - S(2)
         y = S(18)
         for spec in self._set_spec:
             y = getattr(self, "_set_draw_" + spec[0])(cv, x0, x1, y, *spec[1:])
@@ -608,6 +643,7 @@ class SettingsPage:
         total = y + S(28)
         self._set_total = total
         cv.config(scrollregion=(0, 0, W, total))
+        self._bd_attach(cv)
         # Not animated: this also ends any glide, so every real widget is
         # shown again (a render mid-glide left them hidden behind stand-ins).
         self._set_scroll_to(top, animate=False)
@@ -676,6 +712,13 @@ class SettingsPage:
         return bottom
 
     def _set_card_bg(self, cv, x0, y0, x1, y1, tag):
+        if M._cover_mode():
+            # One see-through image: tinted glass with an accent rim.
+            i = cv.create_image(x0, y0, anchor="nw", tags=(tag,),
+                                image=self._card_photo(x1 - x0, y1 - y0, 10))
+            cv.tag_lower(i)
+            cv.tag_lower("bd")
+            return
         r = self._ss(10)
         b = M.BORDER
         ids = [
@@ -827,26 +870,30 @@ class SettingsPage:
             top = self.set_cv.canvasy(0)
         except tk.TclError:
             return
-        sb.delete("all")
+        sb.delete("thumb")
+        self._bd_follow(self.set_cv)
+        self._bd_attach(sb)
         if total <= view:
             return
         th = max(self._ss(28), h * view / total)
         ty = (h - th) * (top / max(1, total - view))
         w = self._ss(4) if not getattr(self, "_set_sb_hot", False) else self._ss(6)
-        x = (sb.winfo_width() - w) // 2
+        x = self._ss(12) - w // 2
         col = M.MUTED if getattr(self, "_set_sb_hot", False) else M.BG4
-        self._rounded_rect(sb, x, ty, x + w, ty + th, w // 2, fill=col, outline="")
+        self._rounded_rect(sb, x, ty, x + w, ty + th, w // 2, fill=col, outline="", tags=("thumb",))
 
     # ── Build ────────────────────────────────────────────────────
     def _build_settings(self):
         p = tk.Frame(self._container, bg=M.BG); self._pages["SETTINGS"] = p
         S = self._ss
         area = tk.Frame(p, bg=M.BG)
-        area.pack(fill="both", expand=True, padx=(S(20), S(6)), pady=(0, S(4)))
+        # No padding: the canvases reach the window's edges so the backdrop
+        # does too (statusify_ui_backdrop); the gutters are drawn instead.
+        area.pack(fill="both", expand=True)
         # The scrollbar is packed first and never unpacked, so the content
         # width can't change while the page scrolls.
-        self._set_sb = tk.Canvas(area, width=S(12), bg=M.BG, highlightthickness=0, bd=0)
-        self._set_sb.pack(side="right", fill="y", padx=(S(6), 0))
+        self._set_sb = tk.Canvas(area, width=S(24), bg=M.BG, highlightthickness=0, bd=0)
+        self._set_sb.pack(side="right", fill="y")
         self.set_cv = tk.Canvas(area, bg=M.BG, highlightthickness=0, bd=0,
                                 yscrollincrement=1, confine=True)
         self.set_cv.pack(side="left", fill="both", expand=True)
@@ -885,6 +932,15 @@ class SettingsPage:
             self._set_scroll_to(frac * max(0, self._set_total - view), animate=False)
         sb.bind("<Button-1>", _sb_drag)
         sb.bind("<B1-Motion>", _sb_drag)
+        self._bd_register(cv, "SETTINGS")
+        self._bd_register(sb, "SETTINGS")
+        self._drag_bind(cv, "SETTINGS")
+        # Stacked under the current page at once (as Stats does), so the
+        # canvas is laid out at its real width now, not mid-slide on the
+        # first visit.
+        if self._cur_page != "SETTINGS":
+            p.place(x=0, y=0, relwidth=1, relheight=1)
+            p.lower()
 
         T = lambda text="", fg=None: _Text(self, text, fg)
         spec = [("title", "Settings", "Changes save as you make them.")]
@@ -1474,15 +1530,17 @@ class SettingsPage:
         self._apply_titlebar_theme()
         self._style_scrollbars()
         self._rebuild_all()
-        self._paint_nav()
+        self._bd_refresh_all()
         self._retint_artwork()
 
     def _apply_album_tint(self, tint):
         """Recolour the window for a new cover. No-op when the tint (or the
         feature being off) means nothing on screen would change."""
-        if tint == M._CUR_TINT:
+        base = M._COVER_BASE
+        if tint == M._CUR_TINT and base == getattr(self, "_painted_cover_base", None):
             return
         M._CUR_TINT = tint
+        self._painted_cover_base = base
         if M.ALBUM_TINT:
             self._repaint_everything()
 
@@ -1493,10 +1551,6 @@ class SettingsPage:
         src = getattr(self, "_hero_src", None)
         if src is not None:
             self._show_hero_image(src)
-        for row, e in list(getattr(self, "_hist_rows", [])):
-            cv = getattr(row, "_statusify_thumb", None)
-            if cv is not None and e.get("album_art"):
-                self._load_thumb(cv, e["album_art"])
 
     def _highlight_theme_btn(self):
         seg = getattr(self, "_theme_seg", None)
@@ -1565,6 +1619,10 @@ class SettingsPage:
             pass
         try:
             self._stats_render()
+        except (AttributeError, tk.TclError):
+            pass
+        try:
+            self._hist_render()
         except (AttributeError, tk.TclError):
             pass
 

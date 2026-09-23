@@ -163,6 +163,12 @@ class NowPlayingPage(fx.NpFxMixin, ex.NpExtrasMixin):
         cv.bind("<ButtonRelease-1>", self._np_on_release)
         cv.bind("<MouseWheel>", self._np_on_wheel)
         cv.bind("<Button-3>", self._np_on_right)
+        # A drag across the sheet pulls the next page in, unless it starts on
+        # something of its own (the seek bar, a button, a panel).
+        def _can_drag(e):
+            key = self._np_hit(e.x, e.y)
+            return key is None or key.startswith("line:")
+        self._drag_bind(cv, "NOW PLAYING", _can_drag)
 
         self._paint_rpc_btn()
         self._paint_topmost_btn()
@@ -490,6 +496,7 @@ class NowPlayingPage(fx.NpFxMixin, ex.NpExtrasMixin):
         self._art_token = url
         if not M.PIL_AVAILABLE or not url:
             self._np_palette = []
+            self._bd_set_cover(None)
             self._default_art(); self._apply_album_tint(None)
             self._np_update_fluid_colors(); return
 
@@ -502,6 +509,7 @@ class NowPlayingPage(fx.NpFxMixin, ex.NpExtrasMixin):
                 return      # skipped on since; a newer cover owns the window
             img, tint, pal = res if res else (None, None, [])
             self._np_palette = pal or []
+            self._bd_set_cover(img, self._np_palette)
             if img is None:
                 self._default_art(); self._apply_album_tint(None)
             else:
@@ -1217,9 +1225,16 @@ class NowPlayingPage(fx.NpFxMixin, ex.NpExtrasMixin):
         """Everything a frame depends on besides a running glide. The clock
         skips a frame whose signature matches the last one: most idle ticks
         change nothing visible (the bar moves a pixel every second or so)."""
-        cache = self._np_fluid_cache
-        max_age = 1e9 if still else (0.08, 0.15, 1e9)[tier]
-        fluid_fresh = bool(cache) and now - cache[2] < max_age and not self._fluid.crossfading()
+        if M._cover_mode():
+            fluid_fresh = True
+            # The shared backdrop's frame number, and where the page is while
+            # it slides (its background is cropped at that offset).
+            cache = (None, None, ((self._bd_shaded or (0, 0, 0, 0))[3],
+                                  self._page_x.get("NOW PLAYING")))
+        else:
+            cache = self._np_fluid_cache
+            max_age = 1e9 if still else (0.08, 0.15, 1e9)[tier]
+            fluid_fresh = bool(cache) and now - cache[2] < max_age and not self._fluid.crossfading()
         dur = getattr(M.state, "duration_ms", 0) or 0
         pos = self._estimate_pos_ms()
         w = max(1, W - 2 * self._S(28))
@@ -1262,7 +1277,12 @@ class NowPlayingPage(fx.NpFxMixin, ex.NpExtrasMixin):
         cache = self._np_fluid_cache
         ckey = ((W, H), bg, self._fluid._to, M._DARK_MODE, still, fs)
         max_age = 1e9 if still else (0.08, 0.15, 1e9)[tier]
-        if (cache and cache[0] == ckey and now - cache[2] < max_age
+        cover = M._cover_mode()
+        if cover:
+            # Cover mode: this page's part of the window's backdrop, which
+            # reaches under the page switcher, so no edge fades.
+            frame = self._bd_np_frame(W, H, now)
+        elif (cache and cache[0] == ckey and now - cache[2] < max_age
                 and not (still and self._fluid.crossfading())):
             frame = cache[1].copy()
         else:
@@ -1271,7 +1291,7 @@ class NowPlayingPage(fx.NpFxMixin, ex.NpExtrasMixin):
                                        0 if fs else self._S(26),
                                        motion_t=40.0 if still else None, dither=tier == 0)
             self._np_fluid_cache = (ckey, frame.copy(), now)
-        busy = self._fluid.crossfading()
+        busy = self._backdrop.crossfading(now) if cover else self._fluid.crossfading()
         # A beat swells the water for a moment (Smooth tier, beat data only).
         _beat, lift = self._np_beat_level(tier)
         if lift:
@@ -1426,7 +1446,8 @@ class NowPlayingPage(fx.NpFxMixin, ex.NpExtrasMixin):
         except Exception as e:
             M.log(f"Lyric sheet frame failed: {e}")
             interval = 1000
-        self._np_fine_timer(animating)
+        # A page slide needs the fine timer too, whichever pages it moves.
+        self._np_fine_timer(animating or getattr(self, "_slide", None) is not None)
         spent = (time.perf_counter() - t0) * 1000.0
         self._schedule("progress", max(1, int(interval - spent)), self._tick_progress)
 

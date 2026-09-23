@@ -222,7 +222,7 @@ class HistoryStore:
         """Newest `limit` plays, oldest first, as history-entry dicts."""
         with self._lock:
             rows = self._db.execute(
-                "SELECT p.id, p.track_uri, p.artist, p.title, p.album_art, p.played_at,"
+                "SELECT p.id, p.track_uri, p.artist, p.title, p.album_art, p.played_at, p.listened_ms,"
                 "       l.mode, l.synced, l.plain"
                 " FROM plays p LEFT JOIN lyrics l ON l.track_uri = p.track_uri"
                 " ORDER BY p.id DESC LIMIT ?", (int(limit),)).fetchall()
@@ -234,7 +234,7 @@ class HistoryStore:
         q = f"%{query.strip().lower()}%"
         with self._lock:
             rows = self._db.execute(
-                "SELECT p.id, p.track_uri, p.artist, p.title, p.album_art, p.played_at,"
+                "SELECT p.id, p.track_uri, p.artist, p.title, p.album_art, p.played_at, p.listened_ms,"
                 "       l.mode, l.synced, l.plain"
                 " FROM plays p LEFT JOIN lyrics l ON l.track_uri = p.track_uri"
                 " WHERE lower(p.title) LIKE ? OR lower(p.artist) LIKE ?"
@@ -362,6 +362,7 @@ class HistoryStore:
             "id": r["id"], "track_uri": r["track_uri"], "artist": r["artist"],
             "title": r["title"], "album_art": r["album_art"],
             "played_at": r["played_at"], "time": display_time(r["played_at"]),
+            "listened_ms": r["listened_ms"] or 0,
             "mode": mode,
             "synced": json.loads(r["synced"]) if r["synced"] else [],
             "plain": json.loads(r["plain"]) if r["plain"] else [],

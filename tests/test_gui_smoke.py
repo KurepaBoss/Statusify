@@ -251,3 +251,222 @@ def test_relayout_does_not_leave_stale_click_targets(app, monkeypatch):
     after = (main.START_MINIMIZED, main.CLOSE_TO_TRAY, main.ALBUM_TINT, main.ANIMATIONS_ENABLED,
              main.SAVE_HISTORY, main.LRCLIB_ENABLED, main.SHOW_PAUSED_RPC)
     assert before == after
+
+
+# ── History page, cover mode, sliding tabs ───────────────────────
+
+class _Ev:
+    def __init__(self, x=0, y=0, x_root=0, y_root=0, state=0):
+        self.x, self.y, self.x_root, self.y_root, self.state = x, y, x_root, y_root, state
+
+
+def _history_with_plays(app, n=40):
+    st = main._HISTORY_STORE
+    base = datetime.datetime.now().replace(microsecond=0)
+    for i in range(n):
+        st.record_play(f"spotify:track:m{i}", "More", f"Extra {i}",
+                       played_at=(base - datetime.timedelta(minutes=5 * i + 1)).isoformat())
+    main.history = st.recent()
+    app._build_deferred_pages()
+    app._root.geometry("520x720")
+    app._show("HISTORY")
+    _pump(app, 10)
+    app._run_history_search()
+    _pump(app, 5)
+
+
+def test_history_is_one_canvas_grouped_by_day(app):
+    _history_with_plays(app, 10)
+    assert not app.hist_cv.winfo_children()               # no widget per row
+    assert len(app._hist_rows) == 15
+    labels = [app.hist_cv.itemcget(i, "text") for i in app.hist_cv.find_all()
+              if app.hist_cv.type(i) == "text"]
+    assert "Today" in labels
+    assert "Synced" in labels                              # Song 0 has synced lyrics
+    assert "plays" in app._hist_caption_text
+
+
+def test_history_hover_follows_the_pointer_through_a_scroll(app, monkeypatch):
+    monkeypatch.setattr(main, "ANIMATIONS_ENABLED", False)
+    _history_with_plays(app, 40)
+    cv = app.hist_cv
+    y = 150
+    app._hist_motion(_Ev(x=200, y=y))
+    first = app._hist_hover
+    assert first is not None
+    assert app._hist_rows[first][0]["y0"] <= cv.canvasy(y) < app._hist_rows[first][0]["y1"]
+    # The list moves under a still pointer: the lit row follows.
+    app._hist_scroll_to(400, animate=False)
+    _pump(app, 2)
+    now = app._hist_hover
+    assert now is not None and now != first
+    assert app._hist_rows[now][0]["y0"] <= cv.canvasy(y) < app._hist_rows[now][0]["y1"]
+    assert app._hist_rows[first][0]["t"] == 0.0            # the old one faded out
+    # Leaving the canvas clears it.
+    cv.event_generate("<Leave>")
+    _pump(app, 2)
+    assert app._hist_hover is None
+
+
+def test_history_hover_follows_a_glide(app, monkeypatch):
+    monkeypatch.setattr(main, "ANIMATIONS_ENABLED", True)
+    _history_with_plays(app, 40)
+    cv = app.hist_cv
+    app._hist_motion(_Ev(x=200, y=200))
+    app._hist_scroll_by(500)
+    t0 = time.monotonic()
+    while app._hist_gliding and time.monotonic() - t0 < 3:
+        _pump(app, 1)
+    i = app._hist_hover
+    assert i is not None and app._hist_rows[i][0]["y0"] <= cv.canvasy(200) < app._hist_rows[i][0]["y1"]
+
+
+def test_clear_history_asks_first(app):
+    _history_with_plays(app, 3)
+    n = main._HISTORY_STORE.count()
+    app._hist_ask_clear()
+    _pump(app, 2)
+    assert main._HISTORY_STORE.count() == n                # nothing deleted yet
+    texts = [app.hist_cv.itemcget(i, "text") for i in app.hist_cv.find_all()
+             if app.hist_cv.type(i) == "text"]
+    assert any(t.startswith("Delete all") for t in texts)
+    app._hist_ask_clear(False)
+    assert main._HISTORY_STORE.count() == n
+    app._clear_history()
+    assert main._HISTORY_STORE.count() == 0 and app._hist_rows == []
+
+
+def test_lyrics_sheet_slides_in_and_escape_closes_it(app, monkeypatch):
+    monkeypatch.setattr(main, "ANIMATIONS_ENABLED", False)
+    _history_with_plays(app, 3)
+    entry = next(e for _, e in app._hist_rows if e.get("synced"))
+    app._show_lyrics(entry)
+    _pump(app, 3)
+    assert app._hist_sheet.winfo_ismapped()
+    assert app._hist_ly_items and "needle" in app._hist_ly_items[0][3]
+    app._hist_ly_search.set("needle")
+    assert app._hist_sh_cv.find_withtag("lyhit")
+    assert app._close_lyrics_panel() is True
+    _pump(app, 3)
+    assert not app._hist_sheet.winfo_ismapped()
+    assert app._close_lyrics_panel() is False
+
+
+def test_stats_open_in_history_still_searches(app):
+    app._build_deferred_pages()
+    app._stats_open_in_history({"title": "Song 3", "artist": "Artist 1"})
+    assert app._cur_page == "HISTORY" and app._hist_search.get() == "Song 3"
+
+
+def _cover_on(app, monkeypatch):
+    from PIL import Image
+    monkeypatch.setattr(main, "ALBUM_TINT", True)
+    monkeypatch.setattr(main, "_DARK_MODE", True)
+    cover = Image.new("RGB", (64, 64), (30, 140, 200))
+    app._bd_set_cover(cover, [(30, 140, 200), (200, 80, 40)])
+    app._apply_album_tint("#1e8cc8")
+    _pump(app, 3)
+
+
+def test_cover_mode_puts_the_backdrop_under_every_page(app, monkeypatch):
+    monkeypatch.setattr(main, "ANIMATIONS_ENABLED", False)
+    app._build_deferred_pages()
+    _cover_on(app, monkeypatch)
+    assert main._cover_mode()
+    assert main.TEXT == "#f5f5f7" and main.ACCENT_FG in ("#000000", "#ffffff")
+    for name, cv in (("HISTORY", app.hist_cv), ("STATS", app.st_cv), ("SETTINGS", app.set_cv)):
+        app._show(name)
+        _pump(app, 5)
+        items = cv.find_withtag("bd")
+        assert items, name
+        assert cv.find_all()[0] == items[0], name          # lowest item
+        assert abs(app._bd_bright - 0.24) < 1e-6
+    app._show("NOW PLAYING")
+    _pump(app, 3)
+    assert abs(app._bd_bright - 0.55) < 1e-6
+    assert app._np_render() is not None
+    # Hidden pages don't keep the frame (it would be redrawn behind the page).
+    assert not app.hist_cv.find_withtag("bd")
+    # No cover: back to the flat theme.
+    app._bd_set_cover(None)
+    app._apply_album_tint(None)
+    app._show("SETTINGS")
+    _pump(app, 3)
+    assert not main._cover_mode() and not app.set_cv.find_withtag("bd")
+
+
+def test_backdrop_stays_put_while_a_canvas_scrolls(app, monkeypatch):
+    monkeypatch.setattr(main, "ANIMATIONS_ENABLED", False)
+    app._build_deferred_pages()
+    _cover_on(app, monkeypatch)
+    app._show("SETTINGS")
+    _pump(app, 5)
+    cv = app.set_cv
+    app._set_scroll_to(300, animate=False)
+    x, y = cv.coords(cv.find_withtag("bd")[0])
+    assert y == cv.canvasy(0) - app._bd_offset(cv)[1]
+    assert x == cv.canvasx(0) - app._bd_offset(cv)[0]
+
+
+def _settle(app, limit=2.0):
+    t0 = time.monotonic()
+    while (app._slide is not None) and time.monotonic() - t0 < limit:
+        _pump(app, 1)
+        time.sleep(0.005)
+
+
+def test_tabs_slide_and_settle(app, monkeypatch):
+    monkeypatch.setattr(main, "ANIMATIONS_ENABLED", True)
+    app._build_deferred_pages()
+    _pump(app, 5)
+    app._show("HISTORY")
+    assert app._cur_page == "HISTORY"                     # side effects start at once
+    assert set(app._page_x) == {"NOW PLAYING", "HISTORY"}
+    _settle(app)
+    assert app._slide is None and not app._page_x
+    assert {p.place_info().get("x") for p in app._pages.values() if p.winfo_manager()} == {"0"}
+    # A click mid-slide retargets from where the pages are.
+    app._show("STATS")
+    time.sleep(0.1)
+    _pump(app, 2)
+    app._show("SETTINGS")
+    assert "SETTINGS" in app._page_x
+    _settle(app)
+    assert app._cur_page == "SETTINGS" and not app._page_x
+
+
+def test_animations_off_switches_instantly(app, monkeypatch):
+    monkeypatch.setattr(main, "ANIMATIONS_ENABLED", False)
+    app._build_deferred_pages()
+    app._show("STATS")
+    assert app._slide is None and not app._page_x and app._cur_page == "STATS"
+
+
+def test_drag_past_the_threshold_switches_page(app, monkeypatch):
+    app._build_deferred_pages()
+    app._root.geometry("520x720")
+    monkeypatch.setattr(main, "ANIMATIONS_ENABLED", False)
+    app._show("HISTORY")
+    monkeypatch.setattr(main, "ANIMATIONS_ENABLED", True)
+    _pump(app, 5)
+    # A short drag springs back.
+    app._drag_press(_Ev(x_root=300, y_root=300), "HISTORY", None)
+    app._drag_motion(_Ev(x_root=290, y_root=300))
+    assert not app._drag["on"]                            # under 12 px: still a click
+    app._drag_motion(_Ev(x_root=270, y_root=301))
+    assert app._drag["on"] and app._page_x["HISTORY"] == -30 and "STATS" in app._page_x
+    app._drag_release(_Ev(x_root=270, y_root=301))
+    _settle(app)
+    assert app._cur_page == "HISTORY"
+    # A long one goes to the next page.
+    app._drag_press(_Ev(x_root=300, y_root=300), "HISTORY", None)
+    for x in (280, 240, 200, 180):
+        app._drag_motion(_Ev(x_root=x, y_root=300))
+        time.sleep(0.02)
+    app._drag_release(_Ev(x_root=180, y_root=300))
+    _settle(app)
+    assert app._cur_page == "STATS"
+    # Vertical gestures are left alone.
+    app._drag_press(_Ev(x_root=300, y_root=300), "STATS", None)
+    app._drag_motion(_Ev(x_root=302, y_root=340))
+    assert app._drag is None

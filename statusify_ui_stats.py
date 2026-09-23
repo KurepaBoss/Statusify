@@ -30,6 +30,7 @@ except ImportError:
     Image = ImageDraw = ImageFilter = None
 
 from statusify_ui_settings import _rgb
+import statusify_backdrop as bdm
 
 M = None   # the main module
 
@@ -293,9 +294,10 @@ class StatsPage:
         p = tk.Frame(self._container, bg=M.BG); self._pages["STATS"] = p
         S = self._ss
         area = tk.Frame(p, bg=M.BG)
-        area.pack(fill="both", expand=True, padx=(S(20), S(6)), pady=(0, S(4)))
-        self._st_sb = tk.Canvas(area, width=S(12), bg=M.BG, highlightthickness=0, bd=0)
-        self._st_sb.pack(side="right", fill="y", padx=(S(6), 0))
+        # Edge to edge, so the backdrop is too (see Settings).
+        area.pack(fill="both", expand=True)
+        self._st_sb = tk.Canvas(area, width=S(24), bg=M.BG, highlightthickness=0, bd=0)
+        self._st_sb.pack(side="right", fill="y")
         self.st_cv = tk.Canvas(area, bg=M.BG, highlightthickness=0, bd=0,
                                yscrollincrement=1, confine=True)
         self.st_cv.pack(side="left", fill="both", expand=True)
@@ -308,7 +310,8 @@ class StatsPage:
         self._st_top_mode = "all"
         today = datetime.date.today()
         self._st_month = (today.year, today.month)
-        self._st_art = {}             # url -> PIL image (raw square)
+        # url -> PIL image (raw square); History fills the same cache.
+        self._st_art = self.__dict__.setdefault("_st_art", {})
         self._st_art_pending = set()
         self._st_thumb_items = {}     # url -> [(item, size, bg)]
         self._st_tags = []
@@ -355,6 +358,9 @@ class StatsPage:
             self._st_scroll_to(frac * max(0, self._st_total - view), animate=False)
         sb.bind("<Button-1>", _sb_drag)
         sb.bind("<B1-Motion>", _sb_drag)
+        self._bd_register(cv, "STATS")
+        self._bd_register(sb, "STATS")
+        self._drag_bind(cv, "STATS")
 
         self._refresh_stats(reschedule=False)
         self._stats_render()
@@ -516,9 +522,13 @@ class StatsPage:
         self._schedule("statsrender", 30, self._stats_render)
 
     # ── Small drawing helpers ────────────────────────────────────
-    def _st_bind(self, tag, cmd, enter=None, leave=None):
-        cv = self.st_cv
-        self._st_tags.append(tag)
+    def _st_bind(self, tag, cmd, enter=None, leave=None, cv=None):
+        cv = cv or self.st_cv
+        # Remembered per canvas, so each page's render can unbind its own.
+        if cv is self.__dict__.get("st_cv"):
+            self._st_tags.append(tag)
+        else:
+            self.__dict__.setdefault("_hist_tags", []).append(tag)
         cv.tag_bind(tag, "<Button-1>", lambda e: cmd())
         cv.tag_bind(tag, "<Enter>", lambda e: (cv.config(cursor="hand2"), enter and enter()))
         cv.tag_bind(tag, "<Leave>", lambda e: (cv.config(cursor=""), leave and leave()))
@@ -535,11 +545,16 @@ class StatsPage:
                 return M.BG2, M.BG4
             if kind == "primary":
                 return (M._blend(M.ACCENT, M.TEXT, 0.15) if hover else M.ACCENT), M.ACCENT_FG
+            if kind == "danger":
+                return (M._blend(M.DANGER, M.TEXT, 0.15) if hover else M.DANGER), M._readable_on(M.DANGER)
             if kind == "ghost":
                 return (M.BG3 if hover else M.BG2), (M.TEXT if hover else M.TEXT2)
+            if kind == "ghost-danger":
+                return (M.BG3 if hover else M.BG2), (M.DANGER if hover else M.TEXT2)
             return (M.BG4 if hover else M.BG3), M.TEXT
         fill, fg = colours(False)
-        tag = f"stb{self._st_gen}_{len(self._st_tags)}"
+        n = len(self.__dict__.get("_st_tags", ())) + len(self.__dict__.get("_hist_tags", ()))
+        tag = f"stb{getattr(self, '_st_gen', 0)}_{n}_{id(cv) % 9973}"
         img = cv.create_image(x, y, anchor="nw", tags=(tag,),
                               image=self._pill_photo(w, h, fill, M.BG2, radius=S(7)))
         txt = cv.create_text(x + w // 2, y + h // 2, text=text, fill=fg, font=font, tags=(tag,))
@@ -556,7 +571,7 @@ class StatsPage:
                 cv.itemconfigure(img, image=self._pill_photo(w, h, f, M.BG2, radius=S(7)))
                 cv.itemconfigure(txt, fill=M._blend(g0, g1, st["t"]))
             self._animate(f"hover:{tag}", 120, apply)
-        self._st_bind(tag, cmd, lambda: fade(1.0), lambda: fade(0.0))
+        self._st_bind(tag, cmd, lambda: fade(1.0), lambda: fade(0.0), cv=cv)
         return w
 
     def _st_fit(self, text, font, w):
@@ -604,10 +619,14 @@ class StatsPage:
         if raw is None:
             return None
         cache = self.__dict__.setdefault("_st_thumb_cache", {})
-        key = (url, size, bg)
+        cover = M._cover_mode()
+        # Over the backdrop the corners are simply clear, whatever is behind.
+        key = (url, size, "rgba" if cover else bg)
         ph = cache.get(key)
         if ph is None:
-            img = M._round_image(raw.resize((size, size), Image.LANCZOS), self._ss(6), bg)
+            small = raw.resize((size, size), Image.LANCZOS)
+            img = (bdm.round_rgba(small, self._ss(6)) if cover
+                   else M._round_image(small, self._ss(6), bg))
             ph = M.ImageTk.PhotoImage(img)
             if len(cache) > 400:
                 cache.clear()
@@ -659,7 +678,7 @@ class StatsPage:
         self._st_heat = None
         self._st_tip = None
         S = self._ss
-        x0, x1 = S(2), W - S(2)
+        x0, x1 = S(22), W - S(2)
         y = S(18)
         y = self._set_draw_title(cv, x0, x1, y, "Stats", "Your listening, at a glance.")
         data = self._st_data or {}
@@ -696,10 +715,12 @@ class StatsPage:
         self._st_total = total
         self._st_drawn_at = time.monotonic()
         cv.config(scrollregion=(0, 0, W, total))
+        self._bd_attach(cv)
         if getattr(self, "_st_gliding", False):
             # A redraw mid-glide keeps the glide going to where it was headed.
             self._st_target = min(self._st_target, max(0, total - cv.winfo_height()))
             cv.yview_moveto(top / total)
+            self._bd_follow(cv)
         else:
             self._st_scroll_to(top, animate=False)
 
@@ -830,7 +851,7 @@ class StatsPage:
         lx = cv.bbox(more)[0] - S(6)
         for c in reversed(cols):
             cv.create_image(lx - cell, yy + S(3), anchor="nw",
-                            image=self._pill_photo(cell, cell, c, M.BG2, radius=S(3)))
+                            image=self._pill_photo(cell, cell, c, M.BG2, radius=S(3), opaque=True))
             lx -= step
         cv.create_text(lx - S(3), yy + S(1), anchor="ne", text="Less", fill=M.MUTED, font=small)
         yy = cv.bbox(t)[3] + S(12)
@@ -857,7 +878,7 @@ class StatsPage:
         for r, name in ((0, "Mon"), (2, "Wed"), (4, "Fri")):
             cv.create_text(x0, gy + r * step + cell // 2, anchor="w", text=name,
                            fill=M.MUTED, font=small)
-        photos = [self._pill_photo(cell, cell, c, M.BG2, radius=S(3)) for c in cols]
+        photos = [self._pill_photo(cell, cell, c, M.BG2, radius=S(3), opaque=True) for c in cols]
         for c in range(weeks):
             for r in range(7):
                 d = start + datetime.timedelta(days=7 * c + r)
@@ -911,7 +932,7 @@ class StatsPage:
         y = cy - ht - S(6)
         img = cv.create_image(x, y, anchor="nw", tags=("sttip",),
                               image=self._pill_photo(w, ht, M.BG4, M.BG2, radius=S(7),
-                                                     outline=M.BORDER))
+                                                     outline=M.BORDER, solid=True))
         cv.create_text(x + w // 2, y + ht // 2, text=text, fill=M.TEXT, font=font, tags=("sttip",))
         cv.tag_raise("sttip")
         self._st_tip = (day, img, text)
@@ -1307,13 +1328,15 @@ class StatsPage:
             top = self.st_cv.canvasy(0)
         except tk.TclError:
             return
-        sb.delete("all")
+        sb.delete("thumb")
+        self._bd_follow(self.st_cv)
+        self._bd_attach(sb)
         if total <= view:
             return
         hot = getattr(self, "_st_sb_hot", False)
         th = max(self._ss(28), h * view / total)
         ty = (h - th) * (top / max(1, total - view))
         w = self._ss(6) if hot else self._ss(4)
-        x = (sb.winfo_width() - w) // 2
+        x = self._ss(12) - w // 2
         self._rounded_rect(sb, x, ty, x + w, ty + th, w // 2,
-                           fill=M.MUTED if hot else M.BG4, outline="")
+                           fill=M.MUTED if hot else M.BG4, outline="", tags=("thumb",))

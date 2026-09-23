@@ -190,7 +190,7 @@ def _open_stats(app):
 
 
 def test_stats_tab_sits_between_history_and_settings(app):
-    labels = [w.cget("text") for w in app._nav.winfo_children()]
+    labels = app._nav_labels()
     assert labels == ["Lyrics", "History", "Stats", "Settings"]
     app._build_deferred_pages()
     for name in ("STATS", "HISTORY", "STATS", "SETTINGS", "STATS"):

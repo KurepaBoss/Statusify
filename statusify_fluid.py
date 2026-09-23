@@ -223,18 +223,14 @@ class FluidField:
             self._fade[key] = m
         return m
 
-    def render(self, size, now, edge_color=None, top_fade=0, bottom_fade=0, motion_t=None,
-               dither=True):
-        """RGB frame of `size` at time `now` (seconds, any monotonic clock).
+    def grid(self, grid_size, now, motion_t=None):
+        """The blurred blob grid (tiny: GRID_W wide) before upscaling.
 
-        `motion_t` overrides the time used for blob positions (a fixed value
-        freezes the water when animations are off; colour crossfades still
-        follow `now`)."""
+        statusify_backdrop mixes this with the blurred cover at grid size, so
+        the two share one upscale instead of paying for two."""
         mt = now if motion_t is None else motion_t
-        w, h = max(8, int(size[0])), max(8, int(size[1]))
+        gw, gh = grid_size
         base, blobs = self.current_colors(now)
-        gw = self.GRID_W
-        gh = max(8, int(round(gw * h / w)))
         grid = Image.new("RGB", (gw, gh), base)
         span = max(gw, gh)
         for b, col in zip(self._blobs, blobs):
@@ -244,7 +240,19 @@ class FluidField:
             d = max(2, int(r * 2))
             mask = self._sprite.resize((d, d), Image.BILINEAR)
             grid.paste(col, (int(cx * gw - d / 2), int(cy * gh - d / 2)), mask)
-        grid = grid.filter(ImageFilter.GaussianBlur(2.2))
+        return grid.filter(ImageFilter.GaussianBlur(2.2))
+
+    def render(self, size, now, edge_color=None, top_fade=0, bottom_fade=0, motion_t=None,
+               dither=True):
+        """RGB frame of `size` at time `now` (seconds, any monotonic clock).
+
+        `motion_t` overrides the time used for blob positions (a fixed value
+        freezes the water when animations are off; colour crossfades still
+        follow `now`)."""
+        w, h = max(8, int(size[0])), max(8, int(size[1]))
+        gw = self.GRID_W
+        gh = max(8, int(round(gw * h / w)))
+        grid = self.grid((gw, gh), now, motion_t)
         # Two-step upscale: straight to full size from 40 px leaves faint
         # diamond artefacts from the bicubic kernel on large flat areas.
         mid = grid.resize((gw * 4, gh * 4), Image.BICUBIC).filter(ImageFilter.GaussianBlur(3))

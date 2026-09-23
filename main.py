@@ -1793,11 +1793,12 @@ async def rpc_loop(rpc):
         display = join_lines(group)
         log(f"RPC ({len(group)}L)  ·  {display[:55]}"); event_queue.put(("line", display))
 
-from statusify_colors import _hex_to_rgb, _blend, _readable_on
+from statusify_colors import _hex_to_rgb, _blend, _readable_on, contrast_ratio as _contrast
 from statusify_colors import tinted_palette as _tinted_palette
+import statusify_backdrop as _backdrop
 
 # ── GUI colors ────────────────────────────────────────────────────
-def _apply_palette(dark: bool, accent: str, tint=None):
+def _apply_palette(dark: bool, accent: str, tint=None, cover=None):
     global BG, BG2, BG3, BG4, ACCENT, MUTED, TEXT, TEXT2, BORDER, _DARK_MODE
     global ACCENT_SOFT, ACCENT_FG, HOVER_BG, SHADOW, DANGER, WARN
     global _PREV_BG, _PREV_BG2, _PREV_BG3, _PREV_BG4
@@ -1874,16 +1875,41 @@ def _apply_palette(dark: bool, accent: str, tint=None):
     ACCENT_SOFT = _blend(BG3, ACCENT, 0.22 if dark else 0.16)
     ACCENT_FG   = _readable_on(ACCENT)
     HOVER_BG    = _blend(BG2, TEXT, 0.06 if dark else 0.05)
+    if cover and dark:
+        # Cover mode (statusify_backdrop): the pages sit on the blurred cover
+        # and their surfaces are see-through. These solid values are what
+        # those surfaces look like on average, for the few things that must
+        # be opaque (text inputs, dialogs); canvas pages draw the tokens as
+        # translucent images instead (SettingsPage._pill_photo).
+        BG     = cover
+        BG2    = _blend(cover, "#0a0a0e", 0.42)
+        BG3    = _blend(BG2, "#ffffff", 0.09)
+        BG4    = _blend(BG2, "#ffffff", 0.16)
+        HOVER_BG = _blend(BG2, "#ffffff", 0.06)
+        TEXT, TEXT2, MUTED = _backdrop.TEXT, _backdrop.TEXT2, _backdrop.MUTED
+        SHADOW = "#000000"
+        ACCENT_SOFT = _blend(BG2, ACCENT, 0.20)
+        BORDER = _blend(BG2, ACCENT, 0.33)
+        # Black on accent fills wherever it reads better (the design's rule).
+        ACCENT_FG = "#000000" if _contrast("#000000", ACCENT) >= _contrast("#ffffff", ACCENT) else "#ffffff"
 
 # USER_ACCENT is the colour picked in Settings; ACCENT is what is on screen,
 # which in album-tint mode comes from the cover instead.
 USER_ACCENT  = ACCENT
 ALBUM_TINT   = (_cfg_get("preferences", "album_tint", "true").lower() == "true")
 _CUR_TINT    = None    # tint of the current cover, or None
+# Cover mode: with album tint on in the dark theme, a playing song's cover,
+# blurred, is the background of every page (statusify_backdrop). This is the
+# backdrop's average colour behind the pages, or None when there is no cover.
+_COVER_BASE  = None
+
+def _cover_mode():
+    return bool(ALBUM_TINT and _DARK_MODE and _COVER_BASE and PIL_AVAILABLE)
 
 def _repalette():
     """Rebuild the palette from theme + accent + (if enabled) album tint."""
-    _apply_palette(_DARK_MODE, USER_ACCENT, _CUR_TINT if ALBUM_TINT else None)
+    _apply_palette(_DARK_MODE, USER_ACCENT, _CUR_TINT if ALBUM_TINT else None,
+                   _COVER_BASE if _cover_mode() else None)
 
 _apply_palette(_DARK_MODE, ACCENT)
 # After _apply_palette the names BG, BG2 … ACCENT … are module-level strings.
@@ -1927,8 +1953,9 @@ import statusify_ui_history
 import statusify_ui_settings
 import statusify_ui_overlay
 import statusify_ui_stats
+import statusify_ui_backdrop
 for _ui_mod in (statusify_ui_mini, statusify_ui_now_playing, statusify_ui_history, statusify_ui_settings,
-                statusify_ui_overlay, statusify_ui_stats):
+                statusify_ui_overlay, statusify_ui_stats, statusify_ui_backdrop):
     _ui_mod.M = sys.modules[__name__]
 from statusify_ui_mini import MiniTrayMixin
 from statusify_ui_now_playing import NowPlayingPage
@@ -1936,8 +1963,10 @@ from statusify_ui_history import HistoryPage
 from statusify_ui_settings import SettingsPage
 from statusify_ui_overlay import OverlayMixin
 from statusify_ui_stats import StatsPage
+from statusify_ui_backdrop import BackdropMixin
 
-class App(MiniTrayMixin, NowPlayingPage, HistoryPage, StatsPage, SettingsPage, OverlayMixin):
+class App(MiniTrayMixin, NowPlayingPage, HistoryPage, StatsPage, SettingsPage, OverlayMixin,
+          BackdropMixin):
     """
     Single Tk() window in a native Windows frame.
 
@@ -1994,10 +2023,8 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, StatsPage, SettingsPage, O
         self._timers = {}
         self._alive  = True
         self._hidden = False
-        # Smooth-scroll chase state for the History list (see _smooth_scroll).
-        self._scroll_target = 0.0
-        self._scroll_active = False
         self._style_scrollbars()
+        self._bd_init()
         self._build()
         self._tray_start()
         self._poll()
@@ -2231,6 +2258,7 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, StatsPage, SettingsPage, O
     def _focus_history_search(self):
         try:
             self._show("HISTORY")
+            self._hist_close_sheet()
             self._hist_search_entry.focus_set()
             self._hist_search_entry.select_range(0, "end")
         except (AttributeError, tk.TclError):
@@ -2775,25 +2803,9 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, StatsPage, SettingsPage, O
     def _build(self):
         W = self.win
         # ── Page switcher ─────────────────────────────────────────
-        # A segmented control pinned to the bottom, like a media app, so the
-        # lyric sheet gets the whole top of the window. Packed before the page
-        # container so it keeps its height when the window shrinks.
-        nav_row = tk.Frame(W, bg=BG); nav_row.pack(side="bottom", fill="x", pady=(SP_XS, SP_MD))
-        nav = tk.Frame(nav_row, bg=BG2, padx=3, pady=3); nav.pack()
-        self._nav = nav
-        self._tab_btns = {}
-        for name, label in (("NOW PLAYING", "Lyrics"), ("HISTORY", "History"),
-                            ("STATS", "Stats"), ("SETTINGS", "Settings")):
-            b = tk.Label(nav, text=label, fg=MUTED, bg=BG2,
-                         font=self._f(FS_SMALL, True), cursor="hand2",
-                         padx=SP_LG, pady=SP_XS + 1)
-            b.pack(side="left", padx=1)
-            b.bind("<Button-1>", lambda e, n=name: self._show(n))
-            b.bind("<Enter>", lambda e, w=b, n=name:
-                   None if self._cur_page == n else w.config(fg=TEXT2))
-            b.bind("<Leave>", lambda e, w=b, n=name:
-                   None if self._cur_page == n else w.config(fg=MUTED))
-            self._tab_btns[name] = b
+        # Packed before the page container so it keeps its height when the
+        # window shrinks (statusify_ui_backdrop._build_nav).
+        self._build_nav()
 
         # ── Page container ────────────────────────────────────────
         self._container = tk.Frame(W, bg=BG); self._container.pack(fill="both", expand=True)
@@ -2816,7 +2828,7 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, StatsPage, SettingsPage, O
 
     # ── Page switcher ─────────────────────────────────────────────
     def _show(self, name):
-        if self._cur_page == name:
+        if self._cur_page == name and self._slide is None:
             return
         # Deferred pages (History/Settings) are built lazily — construct on the
         # first switch if the idle builder hasn't run yet.
@@ -2829,48 +2841,52 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, StatsPage, SettingsPage, O
             if name not in self._pages:
                 return
         # Remember the Settings scroll position as we leave it.
-        if self._cur_page == "SETTINGS" and hasattr(self, "set_cv"):
+        if self._cur_page == "SETTINGS" and name != "SETTINGS" and hasattr(self, "set_cv"):
             try: self._set_scroll_pos = self.set_cv.yview()[0]
             except Exception: pass
-        # Pages are stacked in one spot and raised, never re-packed. Packing a
-        # page made Tk lay out its whole widget tree again, so every tab click
-        # cost ~60 ms (several frames) — the app felt a beat behind the mouse.
+        old = self._cur_page
+        positions = self._slide_positions()      # before the current page changes
         page = self._pages[name]
         if not page.winfo_manager():
             page.place(x=0, y=0, relwidth=1, relheight=1)
-        page.tkraise()
         self._cur_page = name
+        slide = (old is not None and ANIMATIONS_ENABLED and not self._hidden
+                 and not getattr(self, "_np_fs", None))
+        if slide:
+            # Pages slide sideways over a background that stays put
+            # (statusify_ui_backdrop). A click mid-slide carries on from
+            # where the pages are.
+            self._slide_to(name, positions)
+        else:
+            # Pages are stacked in one spot and raised, never re-packed.
+            # Packing a page made Tk lay out its whole widget tree again, so
+            # every tab click cost ~60 ms — the app felt a beat behind the mouse.
+            self._slide_stop()
+            page.tkraise()
+            self._bd_set_brightness(statusify_ui_backdrop.page_brightness(name))
+            self._bd_refresh_visible()
+        # The page's own work starts with the slide, not after it.
         if name == "STATS":
             self._refresh_long_stats()      # queries only while shown; fresh on show
         # The lyric sheet stops drawing while hidden; wake it at once.
         if name == "NOW PLAYING":
             self._schedule("progress", 0, self._tick_progress)
         # Restore where the user last was on the Settings page.
-        if name == "SETTINGS" and hasattr(self, "set_cv"):
+        if name == "SETTINGS" and hasattr(self, "set_cv") and old != "SETTINGS":
             pos = getattr(self, "_set_scroll_pos", 0.0)
-            self._root.after_idle(lambda: self._safe_yview(self.set_cv, pos))
-        self._paint_nav(animate=True)
+            self._root.after_idle(lambda: (self._safe_yview(self.set_cv, pos),
+                                           self._set_draw_thumb()))
+        self._paint_nav(animate=slide)
 
     def _paint_nav(self, animate=False):
-        """Raise the selected segment of the page switcher; mute the rest.
+        """Redraw the page switcher (palette change) or move its pill.
 
-        On a click the old segment sinks and the new one rises over 140 ms.
-        The page itself switches at once; only the switcher eases, so it
-        reads as feedback rather than lag. Palette changes repaint instantly."""
-        nav = getattr(self, "_nav", None)
-        if nav is None:
-            return
-        try:
-            nav.config(bg=BG2)
-            for n, b in self._tab_btns.items():
-                sel = (n == self._cur_page)
-                bg, fg = (BG4 if sel else BG2), (TEXT if sel else MUTED)
-                if animate:
-                    self._fade_colors(f"hover:{b}", b, 140, bg=bg, fg=fg)
-                else:
-                    b.config(bg=bg, fg=fg)
-        except tk.TclError:
-            pass
+        The pill follows the pages themselves (statusify_ui_backdrop), so a
+        slide or a drag carries it along; this only has to redraw."""
+        if animate:
+            self._nav_update()
+        else:
+            self._nav_draw()
 
     @staticmethod
     def _safe_yview(canvas, fraction):
