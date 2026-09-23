@@ -192,6 +192,44 @@ def _ensure_icon_path():
         _ICON_PATH = on_disk if os.path.exists(on_disk) else _write_icon()
     return _ICON_PATH
 
+_HICONS = {}  # size -> HICON, loaded once and kept for the process lifetime
+
+def _set_native_icon(tkwin):
+    """Give a Tk toplevel its own Windows icons via WM_SETICON.
+
+    Tk alone is unreliable here: `iconbitmap` picks a small frame of a
+    multi-size .ico and scales it up (blurry), and `iconphoto(True, ...)`
+    only sets the icon of the class every Tk toplevel shares, which later
+    toplevels (mini player, overlay) reset to Tk's feather. Loading the .ico
+    at the exact DPI-aware sizes Windows wants and attaching it to this one
+    window is what native programs do, and it wins over the class icon.
+    Returns False if the window has no frame yet (not mapped)."""
+    try:
+        u = ctypes.windll.user32
+        hwnd = int(tkwin.wm_frame(), 16)
+        if hwnd == tkwin.winfo_id():
+            return False  # wrapper not created yet
+        u.LoadImageW.restype = ctypes.c_void_p
+        u.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint,
+                                 ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        u.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_void_p]
+        try:
+            dpi = u.GetDpiForWindow(ctypes.c_void_p(hwnd)) or 96
+            metric = lambda m: u.GetSystemMetricsForDpi(m, dpi)
+        except AttributeError:  # pre-1607 Windows 10
+            metric = u.GetSystemMetrics
+        path = _ensure_icon_path()
+        for which, sm in ((1, 11), (0, 49)):  # ICON_BIG/SM_CXICON, ICON_SMALL/SM_CXSMICON
+            size = metric(sm)
+            if size not in _HICONS:
+                _HICONS[size] = u.LoadImageW(None, path, 1, size, size, 0x10)  # IMAGE_ICON, LR_LOADFROMFILE
+            if _HICONS[size]:
+                u.SendMessageW(ctypes.c_void_p(hwnd), 0x80, which, ctypes.c_void_p(_HICONS[size]))  # WM_SETICON
+        return True
+    except Exception as e:
+        log(f"Native icon skipped: {e}")
+        return True
+
 # Set by _install_bridge() when the bridge injected into Spotify's xpui bundle
 # differs from the one we ship — i.e. "Spotify is running an old bridge and
 # `spicetify apply` has not been run since". See App._check_bridge_version.
@@ -2077,13 +2115,12 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, StatsPage, SettingsPage, O
             self._cancel(key)
 
     def _apply_icon(self):
-        """Apply the embedded .ico as the window and taskbar icon."""
+        """Apply the app icon to the title bar, taskbar and Alt-Tab.
+
+        iconphoto(True, ...) is the Tk-level default, which dialogs inherit;
+        the main window then gets its own Win32 icons (_set_native_icon) once
+        its frame exists, because the shared default gets overwritten."""
         try:
-            global _ICON_PATH
-            if _ICON_PATH is None:
-                _ICON_PATH = _write_icon()
-            self._root.iconbitmap(default=_ICON_PATH)
-            # Also set via iconphoto for the taskbar (Pillow path)
             if PIL_AVAILABLE:
                 from io import BytesIO
                 data  = base64.b64decode(_ICON_B64)
@@ -2101,6 +2138,11 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, StatsPage, SettingsPage, O
                     self._root.iconphoto(True, *photos)
         except Exception as e:
             log(f"Icon apply skipped: {e}")
+
+        def _native(tries=40):
+            if not _set_native_icon(self._root) and tries:
+                self._root.after(50, _native, tries - 1)
+        self._root.after_idle(_native)
 
     def _center(self, force=False):
         """Restore the last window geometry, or centre on first run.
