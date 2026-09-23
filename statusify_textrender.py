@@ -7,11 +7,12 @@ Yu Gothic / Microsoft YaHei for CJK, Malgun Gothic for Hangul, Leelawadee for
 Thai, Segoe UI Emoji / Symbol for pictographs, Segoe UI for everything else
 (Latin, Greek, Cyrillic, Arabic, Hebrew).
 """
+import glob
 import os
 import re
 
 try:
-    from PIL import ImageFont
+    from PIL import Image, ImageDraw, ImageFont
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -31,6 +32,57 @@ _FILES = {
     ("sym", "regular"):   ["seguisym.ttf"],
     ("emoji", "regular"): ["seguiemj.ttf", "seguisym.ttf"],
 }
+
+
+# Lyric font families the user can choose (Settings → Appearance). Each
+# weight lists (file pattern, variation name) candidates; the first one found
+# in the system or the per-user font folder wins. "Segoe UI" is the built-in
+# default and uses _FILES. Only the "main" script changes family: CJK, Hangul,
+# Thai, symbols and emoji keep their own fonts, and any other character the
+# chosen family lacks falls back to Segoe UI.
+FAMILIES = {
+    "Segoe UI Variable": {"regular": [("SegUIVar.ttf", b"Regular")],
+                          "semibold": [("SegUIVar.ttf", b"Semibold Display")],
+                          "bold": [("SegUIVar.ttf", b"Bold Display")]},
+    "Bahnschrift": {"regular": [("bahnschrift.ttf", b"Regular")],
+                    "semibold": [("bahnschrift.ttf", b"SemiBold")],
+                    "bold": [("bahnschrift.ttf", b"Bold")]},
+    "Georgia": {"regular": [("georgia.ttf", None)],
+                "semibold": [("georgiab.ttf", None)], "bold": [("georgiab.ttf", None)]},
+    "Consolas": {"regular": [("consola.ttf", None)],
+                 "semibold": [("consolab.ttf", None)], "bold": [("consolab.ttf", None)]},
+    "Lexend": {"regular": [("Lexend-Regular.*", None), ("Lexend*wght*.ttf", b"Regular")],
+               "semibold": [("Lexend-SemiBold.*", None), ("Lexend*wght*.ttf", b"SemiBold"),
+                            ("Lexend-Bold.*", None)],
+               "bold": [("Lexend-Bold.*", None), ("Lexend*wght*.ttf", b"Bold")]},
+    "OpenDyslexic": {"regular": [("OpenDyslexic-Regular.*", None), ("OpenDyslexic*Regular.*", None)],
+                     "semibold": [("OpenDyslexic-Bold.*", None), ("OpenDyslexic*Bold.*", None)],
+                     "bold": [("OpenDyslexic-Bold.*", None), ("OpenDyslexic*Bold.*", None)]},
+}
+DEFAULT_FAMILY = "Segoe UI"
+
+
+def _font_dirs():
+    user = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts")
+    return [_FONT_DIR] + ([user] if os.path.isdir(user) else [])
+
+
+def _find_font(pattern):
+    for d in _font_dirs():
+        hits = sorted(glob.glob(os.path.join(d, pattern)))
+        hits = [h for h in hits if h.lower().endswith((".ttf", ".otf", ".ttc"))]
+        if hits:
+            return hits[0]
+    return None
+
+
+def available_families():
+    """Families that are installed here, the default first."""
+    out = [DEFAULT_FAMILY]
+    for name, spec in FAMILIES.items():
+        if any(_find_font(p) for p, _v in spec["regular"]):
+            out.append(name)
+    return out
 
 
 def _script(ch):
@@ -56,10 +108,63 @@ _BREAK_ANY = {"cjk", "hangul", "thai"}
 class TextRenderer:
     """Font cache plus measuring, wrapping and drawing across scripts."""
 
-    def __init__(self):
+    def __init__(self, family=None):
         self._fonts = {}
+        self.family = family if family in FAMILIES else None
+        self._covered = {}      # char -> does the family have it
+        self._notdef = None
+
+    def _family_font(self, weight, px):
+        spec = FAMILIES[self.family]
+        for pattern, var in spec.get(weight) or spec["regular"]:
+            path = _find_font(pattern)
+            if not path:
+                continue
+            try:
+                f = ImageFont.truetype(path, int(px))
+                if var:
+                    try:
+                        f.set_variation_by_name(var)
+                    except Exception:
+                        pass
+                return f
+            except OSError:
+                continue
+        return None
+
+    def _has(self, ch):
+        """Whether the chosen family draws `ch` (not its missing-glyph box)."""
+        ok = self._covered.get(ch)
+        if ok is None:
+            f = self.font("main", "regular", 24)
+
+            def ink(c):
+                im = Image.new("L", (40, 40), 0)
+                ImageDraw.Draw(im).text((4, 4), c, font=f, fill=255)
+                return im.tobytes()
+            try:
+                if self._notdef is None:
+                    self._notdef = ink(chr(0xFFFF))
+                got = ink(ch)
+                ok = any(got) and got != self._notdef
+            except Exception:
+                ok = False
+            self._covered[ch] = ok
+        return ok
 
     def font(self, script, weight, px):
+        if script == "main" and self.family:
+            key = ("fam", weight, int(px))
+            f = self._fonts.get(key)
+            if f is None:
+                f = self._family_font(weight, px) or self._builtin("main", weight, px)
+                self._fonts[key] = f
+            return f
+        return self._builtin(script, weight, px)
+
+    def _builtin(self, script, weight, px):
+        if script == "fb":
+            script = "main"
         w = weight if (script, weight) in _FILES else (
             "bold" if weight != "regular" and (script, "bold") in _FILES else "regular")
         key = (script, w, int(px))
@@ -79,8 +184,11 @@ class TextRenderer:
 
     def runs(self, text):
         out = []
+        fam = self.family
         for ch in text:
             sc = _script(ch)
+            if fam and sc == "main" and ord(ch) > 0xFF and not ch.isspace() and not self._has(ch):
+                sc = "fb"              # the chosen family lacks it: Segoe UI
             if ch.isspace() and out:
                 sc = out[-1][0]        # spaces stay with the run they follow
             if out and out[-1][0] == sc:
