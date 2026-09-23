@@ -323,7 +323,8 @@ def test_prefs_persist_and_reload(app):
     app._ov_loaded = False                           # as on the next launch
     p = app._ov_prefs()
     assert p == {"enabled": True, "locked": True, "size": 40, "next": False}
-    assert app._ov_anchor == (geo[2] + geo[0] // 2, geo[3] + geo[1])
+    assert app._ov_anchor[0] == geo[2] + geo[0] // 2
+    assert app._ov_anchor[1] in (geo[3], geo[3] + geo[1])
     app._overlay_init()                              # startup restores it
     assert app._ov_top is not None
     assert app._ov_geo == geo
@@ -346,3 +347,24 @@ def test_settings_rows_drive_the_overlay(app):
     app._ov_hotkey_save()                            # what <Return> / focus-out run
     assert ov.hotkey_combo() == "ctrl+alt+l" and calls
     assert main._cfg_get("preferences", "hotkey_overlay", "") == "ctrl+alt+l"
+
+
+def test_resizing_keeps_the_strip_in_place(app):
+    """Text size changes must not walk the overlay around the screen."""
+    app._overlay_set_enabled(True)
+    work, _dpi = app._ov_monitor(0, 0, primary=True)
+    for place in ("top", "bottom"):
+        W, H, x, _y = app._ov_geo
+        y = work[1] + 40 if place == "top" else work[3] - H - 40
+        app._ov_anchor = ov.anchor_for(x, y, W, H, work)
+        app._ov_relayout()
+        W0, H0, x0, y0 = app._ov_geo
+        for size in (48, 20, 60, 30):
+            app._overlay_set_size(size)
+        app._overlay_set_size(app._ov_size)   # no-op
+        W1, H1, x1, y1 = app._ov_geo
+        assert x1 + W1 // 2 == x0 + W0 // 2                # same centre
+        if place == "top":
+            assert y1 == y0                                  # top edge stays
+        else:
+            assert y1 + H1 == y0 + H0                        # bottom edge stays

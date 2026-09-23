@@ -276,6 +276,10 @@ class NowPlayingPage(fx.NpFxMixin, ex.NpExtrasMixin):
         cheap = self._np_cheap_key
         if not (cheap(old) and cheap(key)):
             self._np_invalidate()
+        if key == "vol" and hasattr(self, "_np_toast_show"):
+            v = float(getattr(M.state, "volume", 1.0) or 0.0)
+            self._np_toast_show((f"Volume {int(round(v * 100))}%" if v > 0.001 else "Muted")
+                                + "  ·  scroll to change, click to mute", v)
         self._np_render()
 
     def _np_on_motion(self, e):

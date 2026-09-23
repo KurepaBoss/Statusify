@@ -1263,7 +1263,8 @@ class StatsPage:
         total = max(1, self._st_total)
         view = cv.winfo_height()
         maxy = max(0, total - view)
-        y = max(0.0, min(float(maxy), float(y)))
+        # Whole pixels (yscrollincrement=1): see _set_scroll_to in Settings.
+        y = float(int(round(max(0.0, min(float(maxy), float(y))))))
         self._st_target = y
         if not animate or not M.ANIMATIONS_ENABLED:
             cv.yview_moveto(y / total)
@@ -1275,16 +1276,20 @@ class StatsPage:
         self._stats_hide_tip()
 
         def step():
+            # Fractional yview_moveto steps rounded back to the same pixel near
+            # the end, so the glide never finished and re-armed every 15 ms.
             cur = cv.canvasy(0)
             diff = self._st_target - cur
-            if abs(diff) < 1.0:
-                cv.yview_moveto(self._st_target / total)
-                self._st_gliding = False
+            if abs(diff) >= 1.0:
+                move = int(round(diff * 0.25)) or (1 if diff > 0 else -1)
+                cv.yview_scroll(move, "units")
                 self._st_draw_thumb()
-                return
-            cv.yview_moveto((cur + diff * 0.25) / total)
+                if cv.canvasy(0) != cur:
+                    self._schedule("statsscroll", 15, step)
+                    return
+            self._st_gliding = False
+            self._st_target = cv.canvasy(0)
             self._st_draw_thumb()
-            self._schedule("statsscroll", 15, step)
         step()
 
     def _st_scroll_by(self, dy):

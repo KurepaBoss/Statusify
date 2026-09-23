@@ -46,9 +46,15 @@ class _Text:
         self._o = {"text": text, "fg": fg}
         self.font = font
         self.item = None
+        self.slot_w = None      # width of its slot in a _Buttons row, once drawn
 
     def config(self, **kw):
-        if not any(self._o.get(k) != v for k, v in kw.items()):
+        font_changed = False
+        if "font" in kw:
+            f = kw.pop("font")
+            font_changed = f != self.font
+            self.font = f
+        if not font_changed and not any(self._o.get(k) != v for k, v in kw.items()):
             return
         self._o.update(kw)
         self._page._set_text_changed(self)
@@ -91,14 +97,14 @@ class _Switch:
             d.ellipse((x, pad, x + k, pad + k), fill=kcol)
             ph = M.ImageTk.PhotoImage(big.resize((w, h), Image.LANCZOS))
             cache[key] = ph
+        self.ph = ph            # the shared cache may be trimmed; the item keeps its image
         return ph
 
     def draw(self, cv, x, y):
         self.item = cv.create_image(x, y, anchor="nw", image=self.image(), tags=(self.tag,))
         self.p._set_bind(self.tag, self.click)
 
-    def sync(self, animate=True):
-        target = 1.0 if self.get() else 0.0
+    def _run(self, target, animate=True):
         start = self.t
         if start == target:
             return
@@ -110,13 +116,23 @@ class _Switch:
             except tk.TclError:
                 pass
         if animate:
-            self.p._animate(f"switch:{self.tag}", 160, apply)
+            self.p._set_animate(f"switch:{self.tag}", 160, apply)
         else:
             apply(1.0)
 
+    def sync(self, animate=True):
+        self._run(1.0 if self.get() else 0.0, animate)
+
     def click(self, _e=None):
+        # Move the knob and get it on screen before the setting's side
+        # effects run (a config write, an overlay window, a repaint), so the
+        # switch answers the click at once however long those take.
+        want = 0.0 if self.get() else 1.0
+        self._run(want)
+        self.p._set_flush()
         self.toggle()
-        self.sync()
+        if (1.0 if self.get() else 0.0) != want:
+            self.sync()             # the setting refused the change
 
 
 class _Buttons:
@@ -131,7 +147,7 @@ class _Buttons:
     def _w(self, it):
         if it[0] == "btn":
             return self.p._f(M.FS_SMALL, True).measure(it[1]) + self.p._ss(24)
-        f = self.p._f(M.FS_SMALL, True)
+        f = self.p._slot_font(it[1])
         return max(self.p._ss(it[2]), f.measure(it[1].cget("text")) + self.p._ss(12))
 
     def size(self):
@@ -149,7 +165,8 @@ class _Buttons:
                 slot = it[1]
                 col = slot.cget("fg") or M.TEXT2
                 slot.item = cv.create_text(x + w // 2, y + h // 2, text=slot.cget("text"),
-                                           fill=col, font=self.p._f(M.FS_SMALL, True))
+                                           fill=col, font=slot.font or self.p._f(M.FS_SMALL, True))
+                slot.slot_w = w     # a new value that still fits is redrawn in place
             x += w + gap
 
 
@@ -162,24 +179,50 @@ class _Segmented:
         self.hover = None
         self.item = None
         self.tag = f"seg{id(self)}"
+        self.want = None        # the key just clicked, shown before choose() returns
+        self.max_w = None       # set by _full_seg: squeeze the segments to fit
+        self._imgs = {}
 
     def dims(self):
         f = self.p._f(M.FS_SMALL, True)
-        seg = max(f.measure(t) for t, _ in self.options) + self.p._ss(28)
-        return seg, seg * len(self.options) + self.p._ss(6), self.p._ss(30)
+        n = len(self.options)
+        label = max(f.measure(t) for t, _ in self.options)
+        seg = label + self.p._ss(28)
+        if self.max_w and seg * n + self.p._ss(6) > self.max_w:
+            seg = max(label + self.p._ss(8), (self.max_w - self.p._ss(6)) // n)
+        return seg, seg * n + self.p._ss(6), self.p._ss(30)
 
     def size(self):
         _, w, h = self.dims()
         return w, h
 
+    def current(self):
+        return self.want if self.want is not None else self.get()
+
     def target(self):
         keys = [k for _, k in self.options]
         seg, _, _ = self.dims()
-        return (keys.index(self.get()) if self.get() in keys else 0) * seg
+        cur = self.current()
+        return (keys.index(cur) if cur in keys else 0) * seg
 
     def image(self):
         seg, tw, h = self.dims()
-        x = self.x if self.x is not None else self.target()
+        x = int(round(self.x if self.x is not None else self.target()))
+        # Rendering the track costs ~2 ms (4x supersampled, then LANCZOS).
+        # A page render draws every segmented control, and hover and the
+        # slide revisit the same few states, so keep what was drawn.
+        key = (seg, tw, h, x, self.hover, self.current(), M._DARK_MODE,
+               M.BG2, M.BG3, M.BG4, M.TEXT, M.TEXT2, M.MUTED)
+        ph = self._imgs.get(key)
+        if ph is not None:
+            self.ph = ph
+            return ph
+        if len(self._imgs) > 96:
+            self._imgs.clear()
+        self.ph = self._imgs[key] = self._render(seg, tw, h, x)
+        return self.ph
+
+    def _render(self, seg, tw, h, x):
         S = self.p._ss
         sc = 4
         big = Image.new("RGB", (tw * sc, h * sc), _rgb(M.BG2))
@@ -192,15 +235,14 @@ class _Segmented:
         dr = ImageDraw.Draw(img)
         TR = self.p._np_text
         px = self.p._px(M.FS_SMALL + 1)
-        cur = self.get()
+        cur = self.current()
         for i, (label, key) in enumerate(self.options):
             sx = S(3) + i * seg
             col = M.TEXT if key == cur else (M.TEXT2 if self.hover == i else M.MUTED)
             lw = TR.measure(label, "semibold", px)
             TR.draw(dr, (sx + (seg - lw) / 2, (h - TR.line_height("semibold", px)) / 2),
                     label, "semibold", px, _rgb(col))
-        self.ph = M.ImageTk.PhotoImage(img)
-        return self.ph
+        return M.ImageTk.PhotoImage(img)
 
     def refresh(self):
         try:
@@ -223,8 +265,17 @@ class _Segmented:
         return max(0, min(len(self.options) - 1, int(x // seg)))
 
     def click(self, e):
-        self.choose(self.options[self._at(e)][1])
+        key = self.options[self._at(e)][1]
+        # Show the choice first (see _Switch.click), then apply it.
+        self.want = key
         self.slide()
+        self.p._set_flush()
+        try:
+            self.choose(key)
+        finally:
+            self.want = None
+        if self.get() != key:
+            self.slide()            # refused, or it means something else now
 
     def slide(self, animate=True):
         tx = self.target()
@@ -237,7 +288,7 @@ class _Segmented:
             self.x = sx + (tx - sx) * e
             self.refresh()
         if animate:
-            self.p._animate(f"seg:{self.tag}", 220, apply)
+            self.p._set_animate(f"seg:{self.tag}", 220, apply)
         else:
             apply(1.0)
 
@@ -286,11 +337,15 @@ class _Widget:
     def draw(self, cv, x, y, width=None):
         w = width or self.w.winfo_reqwidth()
         h = self.h or self.w.winfo_reqheight()
+        # Its own tag per render, so a click that lands on the stand-in (the
+        # real widget is hidden mid-glide) can bring the widget back and
+        # focus it; see SettingsPage._set_embed_click.
+        self.tag = f"embedph{getattr(cv, 'page_gen', 0)}_{len(cv.page_widgets)}"
         cv.create_rectangle(x, y, x + w - 1, y + h - 1, fill=self.w.cget("bg"),
-                            outline=M.BORDER, tags=("embedph",))
+                            outline=M.BORDER, tags=("embedph", self.tag))
         self.ph = cv.create_text(x + 6, y + 4, anchor="nw", text="", fill=self.w.cget("fg"),
                                  font=self.w.cget("font"), width=max(10, w - 12),
-                                 tags=("embedph",))
+                                 tags=("embedph", self.tag))
         self.ph_h = h
         kw = {"width": width} if width else {}
         if self.h:
@@ -351,9 +406,45 @@ class SettingsPage:
             d.rounded_rectangle((0, 0, w * sc - 1, h * sc - 1), radius=r * sc, fill=_rgb(fill))
         ph = M.ImageTk.PhotoImage(big.resize((w, h), Image.LANCZOS))
         if len(cache) > 600:
+            # Keep the last generation alive: items drawn from it earlier in
+            # this same render would otherwise lose their image (Tk deletes a
+            # PhotoImage with its last Python reference) and show as blanks.
+            self._pill_cache_old = dict(cache)
             cache.clear()
         cache[key] = ph
         return ph
+
+    def _set_animate(self, key, duration_ms, apply):
+        """_animate, but the click frame already shows movement.
+
+        _animate's first call is apply(0): the control redrawn exactly as it
+        was, so the first visible change waited a whole frame (~17 ms
+        measured). Start one frame in instead."""
+        frame = 1000.0 / getattr(self, "ANIM_FPS", 60)
+        lead = 1.0 - (1.0 - min(1.0, frame / max(1, duration_ms))) ** 3
+        self._animate(key, duration_ms, lambda e: apply(e if e >= 1.0 else max(e, lead)))
+
+    def _set_flush(self):
+        """Paint pending canvas changes now, inside the click handler, so a
+        slow side effect that follows can't hold back the feedback."""
+        try:
+            self.set_cv.update_idletasks()
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _slot_font(self, slot):
+        """The Tk font a _Buttons value slot is drawn in."""
+        f = getattr(slot, "font", None)
+        if not f:
+            return self._f(M.FS_SMALL, True)
+        cache = self.__dict__.setdefault("_slot_fonts", {})
+        k = repr(f)
+        if k not in cache:
+            try:
+                cache[k] = M.tkfont.Font(font=f)
+            except tk.TclError:
+                return self._f(M.FS_SMALL, True)
+        return cache[k]
 
     def _corner(self, r, q):
         """Anti-aliased card corner (quadrant q: 0 tl, 1 tr, 2 bl, 3 br)."""
@@ -455,12 +546,23 @@ class SettingsPage:
         cv = getattr(self, "set_cv", None)
         if cv is None or slot.item is None:
             return
+        kw = {"text": slot.cget("text"), "fill": slot.cget("fg") or M.TEXT2}
+        if slot.font:
+            kw["font"] = slot.font
         try:
             before = cv.bbox(slot.item)
-            cv.itemconfigure(slot.item, text=slot.cget("text"),
-                             fill=slot.cget("fg") or M.TEXT2)
+            cv.itemconfigure(slot.item, **kw)
             after = cv.bbox(slot.item)
         except tk.TclError:
+            return
+        if slot.slot_w:
+            # A value in a button row is centred in a slot at least min_width
+            # wide. Only a value that no longer fits needs the row laid out
+            # again; everything else was just redrawn in place. (Comparing
+            # against the previous text's width re-rendered the whole page,
+            # ~25 ms, whenever a value got a few pixels wider.)
+            if self._slot_font(slot).measure(kw["text"]) + self._ss(12) > slot.slot_w:
+                self._set_relayout_soon()
             return
         if not before or not after or (before[3] - before[1]) != (after[3] - after[1]) \
                 or (after[2] - after[0]) > (before[2] - before[0]) + 4:
@@ -478,6 +580,7 @@ class SettingsPage:
         if W < 120:
             return
         top = cv.canvasy(0)
+        focused = self._set_focused_embed()
         cv.delete("all")
         cv.page_widgets = []
         # Tag bindings outlive the items that carried them. Position-based
@@ -493,15 +596,40 @@ class SettingsPage:
                     pass
         self._set_live_tags = []
         self._set_gen = getattr(self, "_set_gen", 0) + 1
+        cv.page_gen = self._set_gen
         S = self._ss
         x0, x1 = S(2), W - S(2)
         y = S(18)
         for spec in self._set_spec:
             y = getattr(self, "_set_draw_" + spec[0])(cv, x0, x1, y, *spec[1:])
+        for wd in cv.page_widgets:
+            self._set_live_tags.append(wd.tag)
+            cv.tag_bind(wd.tag, "<Button-1>", lambda e, wd=wd: self._set_embed_click(wd, e))
         total = y + S(28)
         self._set_total = total
         cv.config(scrollregion=(0, 0, W, total))
+        # Not animated: this also ends any glide, so every real widget is
+        # shown again (a render mid-glide left them hidden behind stand-ins).
         self._set_scroll_to(top, animate=False)
+        # The inputs are re-embedded, not recreated; keep the caret where it was.
+        if focused is not None and any(wd.w is focused for wd in cv.page_widgets):
+            try:
+                if cv.focus_get() is not focused:
+                    focused.focus_set()
+            except (tk.TclError, KeyError):
+                pass
+
+    def _set_focused_embed(self):
+        """The embedded input that has keyboard focus, if any."""
+        cv = self.set_cv
+        try:
+            f = cv.focus_get()
+        except (tk.TclError, KeyError):
+            return None
+        for wd in getattr(cv, "page_widgets", ()):
+            if wd.w is f:
+                return f
+        return None
 
     def _set_draw_title(self, cv, x0, x1, y, title, sub):
         S = self._ss
@@ -594,11 +722,16 @@ class SettingsPage:
         total = max(1, getattr(self, "_set_total", 1))
         view = cv.winfo_height()
         maxy = max(0, total - view)
-        y = max(0.0, min(float(maxy), float(y)))
-        self._set_target = y
+        # Whole pixels: the canvas scrolls in 1 px units (yscrollincrement).
+        y = int(round(max(0.0, min(float(maxy), float(y)))))
+        self._set_target = float(y)
         if not animate or not M.ANIMATIONS_ENABLED:
+            was_gliding = self._set_glide_stop()
+            self._set_target = float(y)
             cv.yview_moveto(y / total)
             self._set_draw_thumb()
+            if was_gliding:
+                self._set_embeds(True)
             return
         if getattr(self, "_set_gliding", False):
             return
@@ -606,18 +739,67 @@ class SettingsPage:
         self._set_embeds(False)
 
         def step():
+            # The glide used to set a fractional position with yview_moveto.
+            # Tk rounds that to a whole pixel, so a quarter of a 1 px (or,
+            # upwards, 2 px) gap rounded back to where the view already was:
+            # the glide never arrived, re-armed itself every 15 ms for good,
+            # and kept every text box hidden behind its unclickable stand-in.
+            # Step in whole pixels, at least one, and stop at an edge.
             cur = cv.canvasy(0)
             diff = self._set_target - cur
-            if abs(diff) < 1.0:
-                cv.yview_moveto(self._set_target / total)
-                self._set_gliding = False
+            if abs(diff) >= 1.0:
+                move = int(round(diff * 0.25)) or (1 if diff > 0 else -1)
+                cv.yview_scroll(move, "units")
                 self._set_draw_thumb()
-                self._set_embeds(True)
-                return
-            cv.yview_moveto((cur + diff * 0.25) / total)
+                if cv.canvasy(0) != cur:
+                    self._schedule("setscroll", 15, step)
+                    return
+            self._set_gliding = False
+            self._set_target = cv.canvasy(0)
             self._set_draw_thumb()
-            self._schedule("setscroll", 15, step)
+            self._set_embeds(True)
         step()
+
+    def _set_glide_stop(self):
+        """End a glide where it is. Returns whether one was running."""
+        was = getattr(self, "_set_gliding", False)
+        self._cancel("setscroll")
+        self._set_gliding = False
+        if was:
+            try:
+                self._set_target = self.set_cv.canvasy(0)
+            except tk.TclError:
+                pass
+        return was
+
+    def _set_embed_click(self, wd, e):
+        """A click on a stand-in: the real widget was hidden for a glide.
+        Stop the glide right there, so the field stays under the pointer,
+        bring the widgets back and focus this one as its own click would."""
+        self._set_glide_stop()
+        self._set_embeds(True)
+        self._set_draw_thumb()
+        self._set_flush()
+        self._set_focus_widget(wd.w, e.x_root, e.y_root)
+        return "break"
+
+    @staticmethod
+    def _set_focus_widget(w, x_root, y_root):
+        try:
+            w.focus_set()
+            x, y = x_root - w.winfo_rootx(), y_root - w.winfo_rooty()
+            if isinstance(w, tk.Entry):
+                w.icursor(f"@{x}")
+                w.selection_clear()
+            elif isinstance(w, tk.Text):
+                w.mark_set("insert", f"@{x},{y}")
+            elif isinstance(w, tk.Listbox):
+                i = w.nearest(y)
+                w.selection_clear(0, "end")
+                w.selection_set(i)
+                w.activate(i)
+        except tk.TclError:
+            pass
 
     def _set_embeds(self, show):
         """Swap the real input widgets for their drawn stand-ins (see _Widget)."""
@@ -738,9 +920,11 @@ class SettingsPage:
                 self._refresh_track_offset()
         self._refresh_track_offset()
 
+        # Switches save with _cfg_set_soon: the value is live in memory at
+        # once and the file is written off the Tk thread when clicking stops.
         def _toggle_lrclib():
             M.LRCLIB_ENABLED = not M.LRCLIB_ENABLED
-            M._cfg_set("preferences", "lrclib_fallback", str(M.LRCLIB_ENABLED).lower())
+            M._cfg_set_soon("preferences", "lrclib_fallback", str(M.LRCLIB_ENABLED).lower())
 
         spec += [("section", "Lyrics"), ("card", [
             {"title": "Offset for this track",
@@ -757,20 +941,24 @@ class SettingsPage:
         ] + self._translate_rows())]
 
         # ── Appearance ─────────────────────────────────────────────
-        self._theme_seg = _Segmented(self, [("Dark", "dark"), ("Light", "light")],
-                                     lambda: "dark" if M._DARK_MODE else "light", self._set_theme)
+        self._theme_seg = _Segmented(
+            self, [("Dark", "dark"), ("Light", "light")],
+            lambda: getattr(self, "_theme_want", None) or ("dark" if M._DARK_MODE else "light"),
+            self._set_theme_soon)
 
         def _toggle_tint():
             M.ALBUM_TINT = not M.ALBUM_TINT
-            M._cfg_set("preferences", "album_tint", str(M.ALBUM_TINT).lower())
-            self._repaint_everything()
+            M._cfg_set_soon("preferences", "album_tint", str(M.ALBUM_TINT).lower())
+            # Recolouring rebuilds every page (~50 ms). Let the knob finish
+            # its 160 ms slide first; repeated clicks make one repaint.
+            self._schedule("setrepaint", 170, self._repaint_everything)
         def _toggle_anim():
             M.ANIMATIONS_ENABLED = not M.ANIMATIONS_ENABLED
-            M._cfg_set("preferences", "animations", str(M.ANIMATIONS_ENABLED).lower())
+            M._cfg_set_soon("preferences", "animations", str(M.ANIMATIONS_ENABLED).lower())
             M.log(f"Smooth animations {'enabled' if M.ANIMATIONS_ENABLED else 'disabled'}")
         def _set_quality(q):
             M.RENDER_QUALITY = q
-            M._cfg_set("preferences", "render_quality", q)
+            M._cfg_set_soon("preferences", "render_quality", q)
             # Auto starts measuring afresh.
             self._np_auto_tier, self._np_frames, self._np_cost = 0, 0, None
             self._np_fluid_cache = None
@@ -798,16 +986,17 @@ class SettingsPage:
         # ── Window ─────────────────────────────────────────────────
         def _toggle_ct():
             M.CLOSE_TO_TRAY = not M.CLOSE_TO_TRAY
-            M._cfg_set("preferences", "close_to_tray", str(M.CLOSE_TO_TRAY).lower())
+            M._cfg_set_soon("preferences", "close_to_tray", str(M.CLOSE_TO_TRAY).lower())
             if M.CLOSE_TO_TRAY and not getattr(self, "_tray", None):
                 M.log("Note: pystray not installed — close will minimise instead")
         def _toggle_sm():
             M.START_MINIMIZED = not M.START_MINIMIZED
-            M._cfg_set("preferences", "start_minimized", str(M.START_MINIMIZED).lower())
+            M._cfg_set_soon("preferences", "start_minimized", str(M.START_MINIMIZED).lower())
         self._startup_on = M._get_startup_enabled()
         def _toggle_startup():
+            # A registry write; after the knob has moved, once per burst.
             self._startup_on = not self._startup_on
-            M._set_startup_enabled(self._startup_on)
+            self._schedule("setstartup", 200, lambda: M._set_startup_enabled(self._startup_on))
         spec += [("section", "Window and startup"), ("card", [
             {"title": "Always on top", "desc": "Ctrl+T",
              "ctl": self._switch_ctl(lambda: M.ALWAYS_ON_TOP, lambda: self._toggle_topmost())},
@@ -828,18 +1017,18 @@ class SettingsPage:
         rpc = M._rpc_mod
         def _toggle_paused_rpc():
             M.SHOW_PAUSED_RPC = not M.SHOW_PAUSED_RPC
-            M._cfg_set("preferences", "show_paused_rpc", str(M.SHOW_PAUSED_RPC).lower())
+            M._cfg_set_soon("preferences", "show_paused_rpc", str(M.SHOW_PAUSED_RPC).lower())
             M.log(f'Paused RPC {"enabled" if M.SHOW_PAUSED_RPC else "disabled"}')
         def _toggle_status_song():
             on = rpc.status_display_type != rpc.STATUS_DISPLAY_DETAILS
             rpc.status_display_type = rpc.STATUS_DISPLAY_DETAILS if on else rpc.STATUS_DISPLAY_NAME
-            M._cfg_set("preferences", "status_shows_song", str(on).lower())
+            M._cfg_set_soon("preferences", "status_shows_song", str(on).lower())
         def _toggle_link():
             rpc.link_track = not rpc.link_track
-            M._cfg_set("preferences", "link_track", str(rpc.link_track).lower())
+            M._cfg_set_soon("preferences", "link_track", str(rpc.link_track).lower())
         def _toggle_listen_btn():
             rpc.listen_button = not rpc.listen_button
-            M._cfg_set("preferences", "listen_button", str(rpc.listen_button).lower())
+            M._cfg_set_soon("preferences", "listen_button", str(rpc.listen_button).lower())
 
         self._instr_var = tk.StringVar(value=M.INSTRUMENTAL_TEXT)
         ent_it = self._entry(self._instr_var, 20)
@@ -901,9 +1090,9 @@ class SettingsPage:
                 M._hotkey_skip_combo       = self._skip_var.get().strip()
                 M._hotkey_toggle_combo     = self._toggle_var.get().strip()
                 M._hotkey_skip_instr_combo = self._skip_instr_var.get().strip()
-                M._cfg_set("preferences", "hotkey_skip",       M._hotkey_skip_combo)
-                M._cfg_set("preferences", "hotkey_toggle",     M._hotkey_toggle_combo)
-                M._cfg_set("preferences", "hotkey_skip_instr", M._hotkey_skip_instr_combo)
+                M._cfg_set_soon("preferences", "hotkey_skip",       M._hotkey_skip_combo)
+                M._cfg_set_soon("preferences", "hotkey_toggle",     M._hotkey_toggle_combo)
+                M._cfg_set_soon("preferences", "hotkey_skip_instr", M._hotkey_skip_instr_combo)
                 M._register_hotkeys(self)
                 M.log("Hotkeys saved & re-registered")
             for title, var in (("Skip track", self._skip_var),
@@ -921,7 +1110,7 @@ class SettingsPage:
         # ── History & privacy ──────────────────────────────────────
         def _toggle_save_hist():
             M.SAVE_HISTORY = not M.SAVE_HISTORY
-            M._cfg_set("preferences", "save_history", str(M.SAVE_HISTORY).lower())
+            M._cfg_set_soon("preferences", "save_history", str(M.SAVE_HISTORY).lower())
             M.log(f'Session history {"enabled" if M.SAVE_HISTORY else "disabled"}')
         self._bl_txt = tk.Text(cv, bg=M.BG3, fg=M.TEXT, font=self._f(M.FS_BODY), height=4, width=1,
                                relief="flat", wrap="word", padx=S(8), pady=S(6),
@@ -982,6 +1171,7 @@ class SettingsPage:
     def _full_seg(self, seg):
         """A segmented control on its own full-width line under a row."""
         def draw(cv, x0, x1, y):
+            seg.max_w = x1 - x0         # narrower segments at the minimum window width
             seg.draw(cv, x0, y)
             return seg.size()[1] + self._ss(12)
         return {"kind": "extra", "draw": draw, "nodiv": True}
@@ -1018,14 +1208,104 @@ class SettingsPage:
         ]
 
     def _sleep_rows(self):
+        import statusify_sleep as sleep
+        S = self._ss
         self.lbl_sleep = _Text(self, "Off")
+        self._sleep_custom_open = False
+        hint = f"{sleep.CUSTOM_MIN}–{sleep.CUSTOM_MAX} minutes"
+        self._sleep_custom_msg = _Text(self, hint, M.MUTED)
+        self._sleep_custom_var = tk.StringVar(value="45")
+        self._sleep_custom_ent = None
+        custom = {}
+
+        def _field():
+            # Made on first use: most people never open Custom, and the page
+            # keeps its native children to the inputs everyone sees.
+            if "w" not in custom:
+                ent = self._entry(self._sleep_custom_var, 4)
+                ent.config(justify="center")
+                ent.bind("<Return>", _start)
+                ent.bind("<KP_Enter>", _start)
+                ent.bind("<Escape>", lambda e: (_open(False), "break")[1])
+                self._sleep_custom_ent = ent
+                custom["w"] = _Widget(ent, height=S(28))
+            return custom["w"]
+
+        def _open(on):
+            if on == self._sleep_custom_open:
+                return
+            self._sleep_custom_open = on
+            self._sleep_custom_msg.config(text=hint, fg=M.MUTED)
+            if on:
+                _field()
+            ent = self._sleep_custom_ent
+            self._set_render()          # the minutes row comes or goes
+            if ent is None:
+                return
+            try:
+                if on:
+                    ent.focus_set()
+                    ent.select_range(0, "end")
+                    ent.icursor("end")
+                elif self.set_cv.focus_get() is ent:
+                    self.set_cv.focus_set()     # don't type into a hidden field
+            except (tk.TclError, KeyError):
+                pass
+        self._sleep_custom_close = lambda: _open(False)
+
+        def _start(_e=None):
+            m = sleep.parse_minutes(self._sleep_custom_var.get())
+            if m is None:
+                self._sleep_custom_msg.config(text=f"Use {hint}", fg=M.DANGER)
+                ent = self._sleep_custom_ent
+                if ent is not None:
+                    ent.focus_set()
+                    ent.select_range(0, "end")
+                return "break"
+            self._sleep_custom_var.set(str(m))
+            self._sleep_timer_set(m)
+            _open(False)
+            return "break"
+        self._sleep_custom_start = _start
+
+        def _get():
+            t = getattr(self, "_sleep_timer", None)
+            v = t.value() if t else "off"
+            if self._sleep_custom_open or v not in sleep.PRESETS:
+                return "custom"
+            return v
 
         def _choose(v):
+            if v == "custom":
+                _open(True)
+                return
+            _open(False)
             self._sleep_timer_set(None if v == "off" else ("eos" if v == "eos" else int(v)))
         self._sleep_seg = _Segmented(
-            self, [("Off", "off"), ("15m", "15"), ("30m", "30"), ("1h", "60"), ("Song", "eos")],
-            lambda: self._sleep_timer.value() if getattr(self, "_sleep_timer", None) else "off",
-            _choose)
+            self, [("Off", "off"), ("15m", "15"), ("30m", "30"), ("1h", "60"), ("Song", "eos"),
+                   ("Custom", "custom")],
+            _get, _choose)
+
+        def _draw_custom(cv, x0, x1, y):
+            """[ 45 ] min  (Start)  1–600 minutes, while Custom is open."""
+            if not self._sleep_custom_open:
+                return 0
+            h = S(28)
+            custom_w = _field()
+            custom_w.draw(cv, x0, y)
+            x = x0 + custom_w.size()[0] + S(6)
+            t = cv.create_text(x, y + h // 2, anchor="w", text="min", fill=M.TEXT2,
+                               font=self._f(M.FS_SMALL))
+            x = cv.bbox(t)[2] + S(12)
+            bw = self._f(M.FS_SMALL, True).measure("Start") + S(24)
+            self._set_button(cv, x, y, bw, h, "Start", _start, "primary")
+            x += bw + S(10)
+            msg = self._sleep_custom_msg
+            msg.item = cv.create_text(x, y + h // 2, anchor="w", text=msg.cget("text"),
+                                      fill=msg.cget("fg") or M.MUTED, font=self._f(M.FS_SMALL),
+                                      width=max(S(40), x1 - x))
+            return max(h, cv.bbox(msg.item)[3] - y) + S(12)
+
         try:
             self._sleep_timer_changed()
         except Exception:
@@ -1036,6 +1316,7 @@ class SettingsPage:
                      "Forgotten when Statusify closes.",
              "ctl": _Buttons(self, ("value", self.lbl_sleep, 72))},
             self._full_seg(self._sleep_seg),
+            {"kind": "extra", "draw": _draw_custom, "nodiv": True},
         ]
 
     # ── Profiles ─────────────────────────────────────────────────
@@ -1174,9 +1455,17 @@ class SettingsPage:
     # ── Theming ──────────────────────────────────────────────────
     def _set_theme(self, key):
         """Set dark or light theme from the segmented control."""
+        self._theme_want = None
         M._DARK_MODE = (key == "dark")
-        M._cfg_set("preferences", "dark_mode", str(M._DARK_MODE).lower())
+        M._cfg_set_soon("preferences", "dark_mode", str(M._DARK_MODE).lower())
         self._repaint_everything()
+
+    def _set_theme_soon(self, key):
+        """The Theme control's click. The segment moves at once; the
+        recolour (~50 ms, every page) runs as soon as that frame is on
+        screen, once per burst of clicks."""
+        self._theme_want = key
+        self._schedule("settheme", 0, lambda: self._set_theme(key))
 
     def _repaint_everything(self):
         """Rebuild the palette (theme + accent + album tint) and push it onto
@@ -1218,7 +1507,7 @@ class SettingsPage:
         color = tkcolor.askcolor(color=M.USER_ACCENT, title="Choose accent colour")[1]
         if color:
             M.USER_ACCENT = color
-            M._cfg_set("preferences", "accent_color", color)
+            M._cfg_set_soon("preferences", "accent_color", color)
             self._repaint_everything()
 
     def _rebuild_all(self):

@@ -22,6 +22,32 @@ def init(config_path, log_fn=None):
         log = log_fn
 
 
+def unmojibake(text):
+    """Undo UTF-8-read-as-cp1252 corruption, however many layers deep.
+
+    Only accepted when the round trip is exact and the result is shorter
+    (each layer turns one character into 2-4), so genuine accented text such
+    as "Beyoncé" is left alone."""
+    for _ in range(6):
+        try:
+            fixed = text.encode("cp1252").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            break
+        if fixed == text or len(fixed) >= len(text):
+            break
+        text = fixed
+    return text
+
+def _repair_mojibake_cfg(cfg):
+    changed = False
+    for sec in cfg.sections():
+        for key, val in cfg.items(sec, raw=True):
+            fixed = unmojibake(val)
+            if fixed != val:
+                cfg.set(sec, key, fixed)
+                changed = True
+    return changed
+
 def _load_config():
     """Return the cached ConfigParser, reading from disk only once.
 
@@ -35,7 +61,19 @@ def _load_config():
         if _CFG_CACHE is None:
             cfg = configparser.ConfigParser()
             try:
-                cfg.read(_CONFIG_PATH)
+                # UTF-8, as _save_config writes it. A bare read() decoded with
+                # the Windows code page (cp1252), so every save re-encoded
+                # non-ASCII values one layer deeper ("🎵" -> "ðŸŽµ" -> ...),
+                # and Discord showed the garbage as the instrumental text.
+                try:
+                    cfg.read(_CONFIG_PATH, encoding="utf-8")
+                except UnicodeDecodeError:
+                    cfg = configparser.ConfigParser()
+                    cfg.read(_CONFIG_PATH, encoding="cp1252")
+                if _repair_mojibake_cfg(cfg):
+                    log("Config: repaired garbled (double-encoded) text values")
+                    _CFG_CACHE = cfg
+                    _save_config(cfg)
             except (OSError, configparser.Error) as e:
                 # A corrupt config must not prevent startup — fall back to
                 # defaults and say so, rather than dying before the GUI exists.

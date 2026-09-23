@@ -70,10 +70,15 @@ def set_beat_react(on):
     M._cfg_set("preferences", "beat_react", str(_beat_react).lower())
 
 
+# Installed but indistinguishable from the default at lyric sizes: offering
+# it made the first click of the font picker look like it did nothing.
+_NEAR_DUPLICATES = {"Segoe UI Variable"}
+
+
 def families():
     global _families
     if _families is None:
-        _families = available_families()
+        _families = [f for f in available_families() if f not in _NEAR_DUPLICATES]
     return _families
 
 
@@ -728,6 +733,10 @@ class NpFxMixin:
         beat toggle. The control classes are passed in to avoid an import
         cycle with statusify_ui_settings."""
         self.lbl_lyric_font = T(lyric_font(), M.TEXT)
+        # The name is drawn in its own font, so a change shows at once even
+        # while the lyric page itself is out of sight.
+        size = self._f(M.FS_SMALL, True).actual("size")
+        self.lbl_lyric_font.font = (lyric_font(), size, "bold")
 
         def step_font(d):
             fams = families()
@@ -735,6 +744,7 @@ class NpFxMixin:
             i = fams.index(cur) if cur in fams else 0
             name = fams[(i + d) % len(fams)]
             self._np_set_lyric_font(name)
+            self.lbl_lyric_font.font = (name, size, "bold")
             self.lbl_lyric_font.config(text=name)
 
         def size_get():

@@ -593,6 +593,17 @@ def _lut(k, cap=255):
 
 
 # ── The mixin ────────────────────────────────────────────────────────
+
+def anchor_for(x, y, w, h, work=None):
+    """(centre x, edge y, top?) for a strip at x,y,w,h: pinned by its top edge
+    in the upper half of the monitor's work area, else by its bottom edge."""
+    cx = x + w // 2
+    if work:
+        top = (y + h / 2) < (work[1] + work[3]) / 2
+    else:
+        top = False
+    return (cx, y, True) if top else (cx, y + h, False)
+
 class OverlayMixin:
     """Desktop lyrics overlay for App. All state lives in _ov_* attributes."""
 
@@ -672,7 +683,7 @@ class OverlayMixin:
             mon = monitor_at(cx, by - 1) if NATIVE else None
             # Only honour it on a monitor that still exists.
             if not NATIVE or (mon and mon[2]):
-                self._ov_anchor = (cx, by)
+                self._ov_anchor = anchor_for(x, y, w, h, mon[0] if (NATIVE and mon) else None)
 
     def _ov_prefs(self):
         self._ov_load_prefs()
@@ -808,9 +819,9 @@ class OverlayMixin:
         if self._ov_anchor is None:
             work, dpi = self._ov_monitor(0, 0, primary=True)
             s = dpi / 96.0
-            self._ov_anchor = ((work[0] + work[2]) // 2, work[3] - int(36 * s))
-        cx, by = self._ov_anchor
-        work, dpi = self._ov_monitor(cx, by - 1)
+            self._ov_anchor = ((work[0] + work[2]) // 2, work[3] - int(36 * s), False)
+        cx, ey, top = self._ov_anchor
+        work, dpi = self._ov_monitor(cx, ey + (1 if top else -1))
         s = dpi / 96.0
         TR = self._ov_text
         px = max(8, int(round(self._ov_size * s)))
@@ -823,8 +834,10 @@ class OverlayMixin:
         ww = work[2] - work[0]
         W = int(min(ww - int(16 * s), max(int(560 * s), px * 30)))
         H = bar + pad + 2 * lh + (gap + nlh if self._ov_show_next else 0) + pad
-        x, y = clamp_rect(cx - W // 2, by - H, W, H, work)
-        self._ov_anchor = (x + W // 2, y + H)
+        # A size change keeps the edge nearest the screen edge where it is (the
+        # strip grows away from it). Clamping moves only what is shown: the
+        # anchor is left alone, or every resize near an edge crept the strip.
+        x, y = clamp_rect(cx - W // 2, ey if top else ey - H, W, H, work)
         self._ov_m = {"s": s, "px": px, "npx": npx, "lh": lh, "nlh": nlh, "pad": pad,
                       "bar": bar, "gap": gap, "W": W, "H": H, "dpi": dpi}
         self._ov_set_geo(W, H, x, y, save=True)
@@ -884,7 +897,7 @@ class OverlayMixin:
         W, H, x, y = self._ov_geo
         if (x, y) == (d[2], d[3]):
             return "break"            # a click, not a drag
-        self._ov_anchor = (x + W // 2, y + H)
+        self._ov_anchor = anchor_for(x, y, W, H, self._ov_monitor(x + W // 2, y + H // 2)[0])
         # Re-fit for the monitor it was dropped on (work area and DPI).
         self._ov_relayout()
         return "break"

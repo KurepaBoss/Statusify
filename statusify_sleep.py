@@ -21,6 +21,25 @@ EOS = "eos"
 # one. The track-change check below catches it if the ping comes in late.
 EOS_LEAD_S = 0.6
 
+# The Settings control's fixed choices (SleepTimer.value() keys). Any other
+# minute count was typed into its Custom field.
+PRESETS = ("off", "15", "30", "60", EOS)
+CUSTOM_MIN, CUSTOM_MAX = 1, 600
+
+
+def parse_minutes(text):
+    """A typed custom duration: whole minutes, CUSTOM_MIN..CUSTOM_MAX, with
+    an optional "m"/"min" suffix. None when it isn't one."""
+    s = str(text or "").strip().lower()
+    for suffix in ("minutes", "min", "m"):
+        if s.endswith(suffix):
+            s = s[:-len(suffix)].strip()
+            break
+    if not s.isdigit():
+        return None
+    m = int(s)
+    return m if CUSTOM_MIN <= m <= CUSTOM_MAX else None
+
 
 class SleepTimer:
     def __init__(self, clock=time.monotonic, pause=None, state=None):
@@ -56,7 +75,7 @@ class SleepTimer:
         return self.mode is not None
 
     def value(self):
-        """The segmented-control key: "off", "15", "30", "60" or "eos"."""
+        """"off", "eos" or the minutes as a string ("15", or a custom "45")."""
         if self.mode == EOS:
             return EOS
         if self.mode == "min":
@@ -180,9 +199,16 @@ def _sleep_timer_changed(self):
         lbl.config(text=text, fg=M.ACCENT if t.active else M.TEXT2)
     seg = getattr(self, "_sleep_seg", None)
     v = _timer(self).value()
-    changed = v != self.__dict__.get("_sleep_seg_val")
+    prev = self.__dict__.get("_sleep_seg_val")
+    changed = v != prev
     if seg is not None and getattr(seg, "item", None) is not None and changed:
         self._sleep_seg_val = v
+        if v == "off" and prev not in (None, "off") and getattr(self, "_sleep_custom_open", False):
+            # The timer went off (it fired) with the Custom field still open:
+            # fold it away so the control reads Off, like the timer.
+            close = getattr(self, "_sleep_custom_close", None)
+            if close is not None:
+                close()
         seg.slide()
 
 

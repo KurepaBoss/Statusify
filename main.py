@@ -646,9 +646,10 @@ _session_listen_secs  = 0.0   # accumulated while playing
 _track_start_mono     = None   # monotonic time we started the current track
 
 def _on_track_start():
-    global _session_songs, _track_start_mono
-    _session_songs += 1
-    _track_start_mono = time.monotonic()
+    # The track counts towards "songs this session" only once it has really
+    # been heard (see _maybe_commit_play), not the moment Spotify reports it.
+    global _track_start_mono
+    _track_start_mono = time.monotonic() if state.is_playing else None
     event_queue.put(("stats",))
 
 def _on_track_pause():
@@ -926,7 +927,9 @@ history = []
 _HISTORY_STORE = None
 # The play in progress: its row id, the session-listen clock when it started,
 # and its in-memory entry once lyrics have arrived.
-_current_play = {"id": None, "listen_start": 0.0, "entry": None}
+_current_play = {"id": None, "listen_start": 0.0, "entry": None, "pending": None}
+# A track becomes a play (history row, stats) only after this much listening.
+PLAY_COMMIT_S = 20.0
 
 # ── Lyric helpers ─────────────────────────────────────────────────
 # NOTE: every helper below offsets by _track_offset_ms(), NOT the raw global
@@ -1143,6 +1146,7 @@ import statusify_bridge as _bridge_mod
 _PREFETCH = _bridge_mod.PrefetchCache(5)
 
 def _handle_pause():
+    _maybe_commit_play()
     state.is_playing = False
     event_queue.put(("paused",))
     _on_track_pause()
@@ -1160,6 +1164,30 @@ def _send_bridge(obj):
     except Exception:
         return False
 
+# Values the user just set, held against the bridge's reports for a moment:
+# Spotify applies a change after the bridge has already sent its follow-up
+# player_state, which still carries the old value. Taking that report
+# snapped the volume back to where it was, so every wheel step started again
+# from the old level and the control seemed stuck on one value.
+_OPTIMISTIC = {}          # field -> (value, monotonic deadline)
+OPTIMISTIC_HOLD_S = 2.5
+
+def _hold(field, value):
+    _OPTIMISTIC[field] = (value, time.monotonic() + OPTIMISTIC_HOLD_S)
+
+def _merge_reported(field, reported):
+    """The value to show for `field` given what the bridge reported."""
+    held = _OPTIMISTIC.get(field)
+    if held is None:
+        return reported
+    value, until = held
+    same = (abs(float(reported) - float(value)) < 0.006 if field == "volume"
+            else reported == value)
+    if same or time.monotonic() > until:
+        _OPTIMISTIC.pop(field, None)
+        return reported
+    return value
+
 def player_command(action, **extra):
     """prev / next / toggle / play / pause / shuffle / repeat / like, sent to
     Spotify via the bridge. shuffle/repeat/like update `state` optimistically;
@@ -1168,11 +1196,11 @@ def player_command(action, **extra):
         return False
     if action in ("shuffle", "repeat", "like"):
         if action == "shuffle":
-            state.shuffle = not state.shuffle
+            state.shuffle = not state.shuffle; _hold("shuffle", state.shuffle)
         elif action == "repeat":
-            state.repeat = (int(state.repeat) + 1) % 3
+            state.repeat = (int(state.repeat) + 1) % 3; _hold("repeat", state.repeat)
         else:
-            state.liked = not state.liked
+            state.liked = not state.liked; _hold("liked", state.liked)
         event_queue.put(("player_state",))
     return True
 
@@ -1185,6 +1213,7 @@ def set_volume(v):
     if not _send_bridge({"type": "volume", "value": v}):
         return False
     state.volume = v
+    _hold("volume", v)
     event_queue.put(("player_state",))
     return True
 
@@ -1230,6 +1259,7 @@ async def ws_handler(ws):
                 if state.is_playing:
                     _handle_pause()
             elif t == "track_change":
+                _maybe_commit_play()          # the previous track, if it earned it
                 state.artist    = data.get("artist",""); state.title = data.get("title","")
                 state.album_art = data.get("album_art","")
                 state.album     = data.get("album","") or ""
@@ -1302,6 +1332,8 @@ async def ws_handler(ws):
                 if not was and playing:
                     _on_track_resume()
                     event_queue.put(("resumed",))
+                if playing:
+                    _maybe_commit_play()
             elif t == "lyrics_prefetch":
                 uri = data.get("track_uri", "")
                 mode = data.get("mode", "none")
@@ -1321,8 +1353,10 @@ async def ws_handler(ws):
                 ps = _bridge_mod.parse_player_state(data, {
                     "volume": state.volume, "shuffle": state.shuffle,
                     "repeat": state.repeat, "liked": state.liked})
-                state.volume = ps["volume"]; state.shuffle = ps["shuffle"]
-                state.repeat = ps["repeat"]; state.liked = ps["liked"]
+                state.volume  = _merge_reported("volume",  ps["volume"])
+                state.shuffle = _merge_reported("shuffle", ps["shuffle"])
+                state.repeat  = _merge_reported("repeat",  ps["repeat"])
+                state.liked   = _merge_reported("liked",   ps["liked"])
                 event_queue.put(("player_state",))
             elif t == "beats":
                 uri = data.get("track_uri", "")
@@ -1371,18 +1405,70 @@ def _finish_play():
             log(f"Could not save listening time: {e}")
 
 def _start_play():
-    """Record a new play for the track in `state`. Called on track_change."""
+    """Begin a candidate play for the track in `state`. Called on track_change.
+
+    Nothing is written yet: opening Statusify on a paused song, or skipping
+    past one, must not count as listening. _maybe_commit_play records it once
+    PLAY_COMMIT_S seconds have actually been played."""
     _finish_play()
     _current_play["id"] = None
     _current_play["entry"] = None
     _current_play["listen_start"] = _get_listen_time()
+    _current_play["pending"] = None
+    if state.track_uri:
+        _current_play["pending"] = {
+            "track_uri": state.track_uri, "artist": state.artist, "title": state.title,
+            "album_art": state.album_art,
+            "played_at": datetime.datetime.now().replace(microsecond=0),
+        }
+
+def _maybe_commit_play():
+    """Turn the candidate play into a real one after PLAY_COMMIT_S of playback."""
+    global _session_songs
+    p = _current_play.get("pending")
+    if not p or p["track_uri"] != state.track_uri:
+        return False
+    if _get_listen_time() - _current_play["listen_start"] < PLAY_COMMIT_S:
+        return False
+    _current_play["pending"] = None
+    _session_songs += 1
     st = _store()
-    if st and state.track_uri:
+    if st:
         try:
-            _current_play["id"] = st.record_play(state.track_uri, state.artist,
-                                                 state.title, state.album_art)
+            _current_play["id"] = st.record_play(p["track_uri"], p["artist"], p["title"],
+                                                 p["album_art"], p["played_at"].isoformat())
         except Exception as e:
             log(f"Could not record play: {e}")
+    entry = _current_play["entry"]
+    if entry is None:
+        entry = _new_history_entry(state.lyrics_mode, state.synced, state.plain)
+    entry["id"] = _current_play["id"]
+    entry.pop("_draft", None)
+    _publish_history_entry(entry)
+    event_queue.put(("stats",))
+    return True
+
+def _new_history_entry(mode, synced, plain):
+    p = _current_play.get("pending") or {}
+    now = p.get("played_at") or datetime.datetime.now().replace(microsecond=0)
+    return {
+        "id": _current_play["id"], "track_uri": state.track_uri,
+        "artist": state.artist, "title": state.title,
+        "album_art": state.album_art, "mode": mode, "synced": synced, "plain": plain,
+        "played_at": now.isoformat(), "time": now.strftime("%H:%M"),
+    }
+
+def _publish_history_entry(entry):
+    _current_play["entry"] = entry
+    history.append(entry)
+    # Bounds the in-memory list (each entry holds a lyric sheet). The full
+    # history stays in the database, where search still reaches it.
+    while len(history) > MAX_HISTORY_ROWS:
+        history.pop(0)
+    # The event carries the entry itself rather than its index. Indices shift
+    # the moment the front is trimmed, which would repoint every already-
+    # rendered row's LYRICS button at the wrong song.
+    event_queue.put(("history_add", entry))
 
 def _save_history(mode, synced, plain, source=""):
     """Attach lyrics to the play in progress and show it in the History tab.
@@ -1400,23 +1486,13 @@ def _save_history(mode, synced, plain, source=""):
     if entry is not None and entry["track_uri"] == state.track_uri:
         entry["synced"] = synced; entry["plain"] = plain; entry["mode"] = mode
         return
-    now = datetime.datetime.now().replace(microsecond=0)
-    entry = {
-        "id": _current_play["id"], "track_uri": state.track_uri,
-        "artist": state.artist, "title": state.title,
-        "album_art": state.album_art, "mode": mode, "synced": synced, "plain": plain,
-        "played_at": now.isoformat(), "time": now.strftime("%H:%M"),
-    }
-    _current_play["entry"] = entry
-    history.append(entry)
-    # Bounds the in-memory list (each entry holds a lyric sheet). The full
-    # history stays in the database, where search still reaches it.
-    while len(history) > MAX_HISTORY_ROWS:
-        history.pop(0)
-    # The event carries the entry itself rather than its index. Indices shift
-    # the moment the front is trimmed, which would repoint every already-
-    # rendered row's LYRICS button at the wrong song.
-    event_queue.put(("history_add", entry))
+    if _current_play.get("pending"):
+        # Not a play yet: keep the lyrics on a draft entry that
+        # _maybe_commit_play publishes once the track has really been heard.
+        _current_play["entry"] = _new_history_entry(mode, synced, plain)
+        _current_play["entry"]["_draft"] = True
+        return
+    _publish_history_entry(_new_history_entry(mode, synced, plain))
 
 def _cached_lyrics(uri):
     """(mode, synced, plain, source) from the local lyric cache, or None."""
