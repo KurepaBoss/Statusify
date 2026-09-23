@@ -42,6 +42,16 @@ CREATE TABLE IF NOT EXISTS lyrics (
     source     TEXT NOT NULL DEFAULT '',
     fetched_at TEXT NOT NULL
 );
+-- Lyrics the user picked by hand ("Wrong lyrics? Search…"): they win over
+-- the cache and over whatever the bridge sends for that track.
+CREATE TABLE IF NOT EXISTS lyric_pins (
+    track_uri  TEXT PRIMARY KEY,
+    mode       TEXT NOT NULL,
+    synced     TEXT NOT NULL DEFAULT '[]',
+    plain      TEXT NOT NULL DEFAULT '[]',
+    source     TEXT NOT NULL DEFAULT '',
+    pinned_at  TEXT NOT NULL
+);
 """
 
 
@@ -145,10 +155,50 @@ class HistoryStore:
                  json.dumps(plain or [], ensure_ascii=False), source or "", _now_iso()))
             self._db.commit()
 
+    def pin_lyrics(self, track_uri, mode, synced, plain, source=""):
+        """Remember lyrics the user chose for a track; they win from now on."""
+        if not track_uri or mode not in ("synced", "plain"):
+            return
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO lyric_pins(track_uri, mode, synced, plain, source, pinned_at)"
+                " VALUES (?,?,?,?,?,?)",
+                (track_uri, mode, json.dumps(synced or [], ensure_ascii=False),
+                 json.dumps(plain or [], ensure_ascii=False), source or "", _now_iso()))
+            self._db.commit()
+
+    def unpin_lyrics(self, track_uri):
+        """Forget a pinned choice (and the cached copy of it). True if there was one."""
+        if not track_uri:
+            return False
+        with self._lock:
+            row = self._db.execute("SELECT source FROM lyric_pins WHERE track_uri=?",
+                                   (track_uri,)).fetchone()
+            if not row:
+                return False
+            self._db.execute("DELETE FROM lyric_pins WHERE track_uri=?", (track_uri,))
+            self._db.execute("DELETE FROM lyrics WHERE track_uri=? AND source=?",
+                             (track_uri, row["source"]))
+            self._db.commit()
+        return True
+
+    def get_pin(self, track_uri):
+        """(mode, synced, plain, source) the user pinned for a track, or None."""
+        if not track_uri:
+            return None
+        with self._lock:
+            row = self._db.execute(
+                "SELECT mode, synced, plain, source FROM lyric_pins WHERE track_uri=?",
+                (track_uri,)).fetchone()
+        if not row:
+            return None
+        return row["mode"], json.loads(row["synced"]), json.loads(row["plain"]), row["source"]
+
     def clear(self):
         with self._lock:
             self._db.execute("DELETE FROM plays")
             self._db.execute("DELETE FROM lyrics")
+            self._db.execute("DELETE FROM lyric_pins")
             self._db.commit()
             try:
                 self._db.execute("VACUUM")

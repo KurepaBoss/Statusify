@@ -1069,6 +1069,9 @@ _rpc_mod.album_fn = lambda: getattr(state, "album", "")
 # Lyric romanisation / translation (sublines under each lyric line).
 import statusify_translate as _translate_mod
 _translate_mod.M = sys.modules[__name__]
+# Lyrics the user picked by hand ("Wrong lyrics? Search…") stay pinned.
+import statusify_np_extras as _np_ex
+_np_ex.M = sys.modules[__name__]
 
 # ── WebSocket ─────────────────────────────────────────────────────
 def _apply_lyrics(mode, synced, plain, src):
@@ -1258,13 +1261,16 @@ async def ws_handler(ws):
                 # fresher than the cache; either way the bridge's own fetch
                 # still arrives and replaces them.
                 pre = _PREFETCH.pop(state.track_uri)
+                if pre and _np_ex.keep_pinned(state.track_uri, *pre):
+                    pre = None                   # the user's pick wins
                 cached = None if pre else _cached_lyrics(state.track_uri)
                 if pre:
                     p_mode, p_synced, p_plain, p_src = pre
                     _apply_lyrics(p_mode, p_synced, p_plain, _bridge_mod.preloaded_label(p_src))
                 elif cached:
-                    c_mode, c_synced, c_plain, _ = cached
-                    _apply_lyrics(c_mode, c_synced, c_plain, "cache")
+                    c_mode, c_synced, c_plain, c_src = cached
+                    _apply_lyrics(c_mode, c_synced, c_plain,
+                                  c_src if _np_ex.is_pin_source(c_src) else "cache")
             elif t == "lyrics":
                 mode   = data.get("mode", data.get("lyrics_mode","none"))
                 synced = data.get("synced",[]); plain = data.get("plain",[])
@@ -1280,6 +1286,8 @@ async def ws_handler(ws):
                     # Already showing cached lyrics; a failed fetch keeps them.
                     log(f"Lyrics ({src})  ·  none  ·  keeping cached lyrics")
                 elif uri == state.track_uri or (not uri and state.lyrics_mode == "none"):
+                    if _np_ex.keep_pinned(state.track_uri, mode, synced, plain, src):
+                        continue                 # lyrics the user chose stay
                     _apply_lyrics(mode, synced, plain, src)
                     if mode == "none":
                         _maybe_fetch_lrclib(state.track_uri)
@@ -1416,7 +1424,8 @@ def _cached_lyrics(uri):
     if not st:
         return None
     try:
-        return st.get_lyrics(uri)
+        # Lyrics the user pinned win over whatever was fetched last.
+        return st.get_pin(uri) or st.get_lyrics(uri)
     except Exception as e:
         log(f"Lyric cache read failed: {e}")
         return None
@@ -2097,13 +2106,14 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, StatsPage, SettingsPage, O
         combos without stealing keys from other apps."""
         W = self._root
         binds = {
-            "<Escape>":           lambda e: self._np_fullscreen_exit() or self._close_lyrics_panel(),
+            "<Escape>":           lambda e: (self._np_close_overlays() or self._np_fullscreen_exit()
+                                             or self._close_lyrics_panel()),
             "<F11>":              lambda e: self._np_fullscreen_toggle(),
             "<Control-f>":        lambda e: self._focus_history_search(),
             "<Control-Key-1>":    lambda e: self._show("NOW PLAYING"),
             "<Control-Key-2>":    lambda e: self._show("HISTORY"),
-            "<Control-Key-3>":    lambda e: self._show("SETTINGS"),
-            "<Control-Key-4>":    lambda e: self._show("STATS"),
+            "<Control-Key-3>":    lambda e: self._show("STATS"),
+            "<Control-Key-4>":    lambda e: self._show("SETTINGS"),
             "<Control-c>":        lambda e: self._copy_current_lyric(),
             "<Control-m>":        lambda e: self._toggle_mini(),
             "<Control-t>":        lambda e: self._toggle_topmost(),
@@ -2111,6 +2121,11 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, StatsPage, SettingsPage, O
             "<space>":            lambda e: self._key_player(e, "toggle"),
             "<Control-Left>":     lambda e: self._key_player(e, "prev"),
             "<Control-Right>":    lambda e: self._key_player(e, "next"),
+            "<Control-Up>":       lambda e: self._np_key_extra(e, "vol_up"),
+            "<Control-Down>":     lambda e: self._np_key_extra(e, "vol_down"),
+            "<Control-s>":        lambda e: self._np_key_extra(e, "shuffle"),
+            "<Control-r>":        lambda e: self._np_key_extra(e, "repeat"),
+            "<Control-l>":        lambda e: self._np_key_extra(e, "like"),
             "<Left>":             lambda e: self._key_seek(e, -5000),
             "<Right>":            lambda e: self._key_seek(e, 5000),
         }
@@ -3002,6 +3017,13 @@ class App(MiniTrayMixin, NowPlayingPage, HistoryPage, StatsPage, SettingsPage, O
                     self.dot_dc.config(fg=ACCENT if enabled else MUTED)
                 elif k == "overlay_toggle":
                     self._toggle_overlay()
+                elif k in ("queue", "player_state", "translation", "beats"):
+                    self._np_on_event(k)
+                elif k == "np_call":             # lyric page work finished off-thread
+                    try:
+                        ev[1]()
+                    except Exception as e:
+                        log(f"Lyric page update failed: {e}")
                 elif k == "update_available":
                     _, tag, url, changelog, setup = ev
                     self._show_update_dialog(tag, url, changelog, setup)
