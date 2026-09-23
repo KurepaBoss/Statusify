@@ -862,6 +862,11 @@ class MiniTrayMixin:
                 P.MenuItem(lambda item: ("Hide mini player" if getattr(self, "_mini", None) is not None
                                          else "Show mini player"), _do(self._toggle_mini)),
                 P.MenuItem("Always on top",      _do(self._toggle_topmost)),
+                P.MenuItem("Desktop overlay", _do(lambda: self._toggle_overlay()),
+                           checked=lambda item: bool(getattr(self, "_ov_enabled", False))),
+                P.MenuItem(lambda item: ("Lock overlay in place" if getattr(self, "_ov_locked", True) is False
+                                         else "Unlock overlay to move"),
+                           _do(lambda: self._overlay_toggle_lock())),
                 P.Menu.SEPARATOR,
                 P.MenuItem("Toggle Discord RPC", _do(self._tray_toggle_rpc)),
                 P.MenuItem("Reconnect RPC",      _do(self._reconnect_rpc)),

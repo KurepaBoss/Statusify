@@ -22,6 +22,7 @@ import time
 import tkinter as tk
 
 import statusify_fluid as fluid
+import statusify_np_extras as ex
 import statusify_np_fx as fx
 from statusify_textrender import TextRenderer
 
@@ -80,7 +81,7 @@ def _clamp(v, lo=0.0, hi=1.0):
     return lo if v < lo else hi if v > hi else v
 
 
-class NowPlayingPage(fx.NpFxMixin):
+class NowPlayingPage(fx.NpFxMixin, ex.NpExtrasMixin):
 
     SHEET_LYRIC_PT = 20      # lyric lines, before the user's size boost
     LINE_MOVE_S = 0.72       # how long a line change glides
@@ -99,8 +100,9 @@ class NowPlayingPage(fx.NpFxMixin):
         self._np_photo = None
         self._np_size = (0, 0)
         self._np_text = TextRenderer()
-        fx.M = M
+        fx.M = ex.M = M
         self._np_fx_init()
+        self._np_ex_init()
         self._fluid = fluid.FluidField()
         self._np_palette = []
         try:
@@ -237,7 +239,8 @@ class NowPlayingPage(fx.NpFxMixin):
         elif name in ("prev", "next"):
             pass
         else:
-            self._np_invalidate(header=False)
+            # The Spotify dot also greys out the header's heart.
+            self._np_invalidate(header=(name == "dot_sp"))
 
     # ── Tk events ────────────────────────────────────────────────
     def _np_on_configure(self, e):
@@ -265,12 +268,12 @@ class NowPlayingPage(fx.NpFxMixin):
         old = self._np_hover
         self._np_hover = key
         try:
-            self.np_cv.config(cursor="hand2" if key else "")
+            self.np_cv.config(cursor="hand2" if key and key not in ("panel", "menu:") else "")
         except tk.TclError:
             pass
-        # Hovering a lyric line or the seek bar only changes the frame, not
-        # the cached header/footer layers.
-        cheap = lambda k: k is None or k == "seek" or str(k).startswith("line:")
+        # Hovering a lyric line, the seek bar or a panel row only changes the
+        # frame, not the cached header/footer layers.
+        cheap = self._np_cheap_key
         if not (cheap(old) and cheap(key)):
             self._np_invalidate()
         self._np_render()
@@ -290,6 +293,8 @@ class NowPlayingPage(fx.NpFxMixin):
 
     def _np_on_click(self, e):
         key = self._np_hit(e.x, e.y)
+        if self._np_ex_click(key, e):      # panels, menus, the new controls
+            return
         if key == "seek":
             self._np_drag = self._np_seek_frac(e.x)
             self._np_render()
@@ -335,7 +340,10 @@ class NowPlayingPage(fx.NpFxMixin):
 
     def _np_on_wheel(self, e):
         """Browse the lyrics. The sheet stops following the song while you
-        read, then drifts back to the current line a few seconds later."""
+        read, then drifts back to the current line a few seconds later.
+        Over the play button or the speaker it changes the volume instead."""
+        if self._np_ex_wheel(e):
+            return
         if self._ly is None:
             return
         items = self._ly["items"]
@@ -405,9 +413,12 @@ class NowPlayingPage(fx.NpFxMixin):
 
     def _np_on_right(self, e):
         """Right-click on the delay stepper: this song follows the global
-        delay again."""
-        if self._np_hit(e.x, e.y) in ("delay", "dec", "inc", "delay_lbl"):
+        delay again. Anywhere on the sheet: the lyric menu."""
+        key = self._np_hit(e.x, e.y)
+        if key in ("delay", "dec", "inc", "delay_lbl"):
             self._np_reset_song_offset()
+        else:
+            self._np_ex_right(key, e)
 
     def _np_offset_is_song(self):
         """True when the song playing has its own saved offset."""
@@ -598,7 +609,7 @@ class NowPlayingPage(fx.NpFxMixin):
     def _np_lyric_model(self, W):
         key, texts, idx = self._np_lyric_source()
         px = self._np_lyric_px()
-        full_key = (key, W, px, fx.lyric_font(), self._np_lyric_pad(W))
+        full_key = (key, W, px, fx.lyric_font(), self._np_lyric_pad(W), self._np_sub_key())
         ly = self._ly
         now = time.monotonic()
         if ly is None or ly["key"] != full_key:
@@ -641,17 +652,27 @@ class NowPlayingPage(fx.NpFxMixin):
         lh = int(TR.line_height("bold", px) * 1.02)
         gap = int(px * 0.62)
         margin = self._S(10)      # room for the blur to spread
+        # Romanisation / translation under a line: smaller, part of the
+        # line's own mask and height, so it blurs and glides with it.
+        subs = self._np_sublines(len(texts))
+        spx = int(px * 0.62)
+        slh = int(TR.line_height("semibold", spx) * 1.04)
+        sgap = int(px * 0.16)
         items, y = [], 0
-        for t in texts:
+        for n, t in enumerate(texts):
             lines = TR.wrap(t, "bold", px, maxw)
             h = lh * len(lines)
             w = int(max(TR.measure(ln, "bold", px) for ln in lines)) if lines else 0
             dots = t == "• • •"
             if dots:
                 w = int(3 * px * 0.40 + 2 * px * 0.28)
+            sub = TR.wrap(subs[n], "semibold", spx, maxw) if subs and subs[n] and not dots else []
+            if sub:
+                h += sgap + slh * len(sub)
+                w = max(w, int(max(TR.measure(ln, "semibold", spx) for ln in sub)))
             items.append({"text": t, "lines": lines, "mask": None, "blur": {}, "h": h,
                           "w": w, "y": y, "m": margin, "lh": lh, "maxw": maxw, "px": px,
-                          "dots": dots})
+                          "dots": dots, "sub": sub, "spx": spx, "slh": slh, "sgap": sgap})
             y += h + gap
         return items
 
@@ -662,6 +683,9 @@ class NowPlayingPage(fx.NpFxMixin):
             d = ImageDraw.Draw(mask)
             for k, ln in enumerate(it["lines"]):
                 self._np_lyric_text.draw(d, (m, m + k * it["lh"]), ln, "bold", it["px"], 255)
+            sy = m + len(it["lines"]) * it["lh"] + it.get("sgap", 0)
+            for k, ln in enumerate(it.get("sub") or ()):
+                self._np_lyric_text.draw(d, (m, sy + k * it["slh"]), ln, "semibold", it["spx"], 166)
             it["mask"] = mask
         return it["mask"]
 
@@ -880,11 +904,23 @@ class NowPlayingPage(fx.NpFxMixin):
         hits.append((fx1, py1, fx1 + fb, py1 + ph, "fs"))
         px1 = fx1
 
+        # "⋯": Up next, lyric search, share.
+        mx1 = px1 - S(4) - fb
+        if self._np_hover == "more":
+            self._np_pill(layer, (mx1, py1, mx1 + fb, py1 + ph), 0.16)
+        layer.alpha_composite(self._np_icon("more", gs, self._np_rgba(0.95 if self._np_hover == "more" else 0.62)),
+                              (mx1 + (fb - gs) // 2, py1 + (ph - gs) // 2))
+        hits.append((mx1, py1, mx1 + fb, py1 + ph, "more"))
+        px1 = mx1
+
         # Title, artist, lyric source.
         tx = pad + A + S(14)
         maxw = px1 - S(14) - tx
         tpx, apx, ipx = self._px(13), self._px(10.5), self._px(9)
-        title = TR.ellipsize(self.lbl_title.cget("text") or "", "semibold", tpx, maxw)
+        has_track = bool(getattr(M.state, "track_uri", ""))
+        hs = S(16)                          # the heart after the title
+        title = TR.ellipsize(self.lbl_title.cget("text") or "", "semibold", tpx,
+                             maxw - (hs + S(10) if has_track else 0))
         artist = TR.ellipsize(self.lbl_artist.cget("text") or "", "regular", apx, maxw)
         info = (self.lbl_info.cget("text") or "").lstrip("· ").strip()
         info = TR.ellipsize(info, "regular", ipx, maxw)
@@ -893,7 +929,17 @@ class NowPlayingPage(fx.NpFxMixin):
         lh_i = TR.line_height("regular", ipx) if info else 0
         block = lh_t + lh_a + lh_i
         y = top + (A - block) // 2
-        TR.draw(d, (tx, y), title, "semibold", tpx, self._np_rgba(1.0))
+        tw = TR.draw(d, (tx, y), title, "semibold", tpx, self._np_rgba(1.0))
+        if has_track:
+            liked = bool(getattr(M.state, "liked", False))
+            hov = self._np_hover == "like"
+            a = (1.0 if hov or liked else 0.55) * (1.0 if self.dot_sp.on else 0.45)
+            col = self._np_accent() if liked else self._np_fg()
+            hx = int(tx + tw + S(8))
+            hy = int(y + (lh_t - hs) // 2 + S(1))
+            layer.alpha_composite(self._np_icon("heart" if liked else "heart_o", hs, col + (int(255 * a),)),
+                                  (hx, hy))
+            hits.append((hx - S(5), hy - S(5), hx + hs + S(5), hy + hs + S(5), "like"))
         TR.draw(d, (tx, y + lh_t), artist, "regular", apx, self._np_rgba(0.72))
         if info:
             TR.draw(d, (tx, y + lh_t + lh_a), info, "regular", ipx, self._np_rgba(0.45))
@@ -903,12 +949,14 @@ class NowPlayingPage(fx.NpFxMixin):
     def _np_footer_key(self, W, pos, dur):
         pk, pt = self._np_pressed
         pressed = pk if time.monotonic() - pt < 0.16 else None
+        st = M.state
         return (W, self._fmt_time(pos), self._fmt_time(dur) if dur else "--:--",
                 M._track_offset_ms(), self._np_offset_is_song(), M.ALWAYS_ON_TOP, self.dot_sp.on, self.dot_dc.on,
                 self.lbl_rl.cget("text"), self.lbl_dropped.cget("text"),
                 self.lbl_err.cget("text"), bool(self.lbl_err._binds),
-                self._np_hover if not str(self._np_hover).startswith("line:") else None,
-                M._DARK_MODE, M.ACCENT, self._np_playing(), pressed)
+                self._np_ctl_hover(), M._DARK_MODE, M.ACCENT, self._np_playing(), pressed,
+                st.shuffle, st.repeat, round(st.volume * 100), self._np_panel if not self._np_panel_closing else None,
+                self._np_overlay_on(), self._np_sleep_text())
 
     def _np_icon(self, kind, size, rgba):
         """Anti-aliased transport glyph (prev / next / play / pause), cached."""
@@ -920,7 +968,9 @@ class NowPlayingPage(fx.NpFxMixin):
         n = size * sc
         m = Image.new("L", (n, n), 0)
         d = ImageDraw.Draw(m)
-        if kind in ("full", "unfull"):
+        if kind in ex.ICONS:
+            m = ex.icon_mask(kind, n)
+        elif kind in ("full", "unfull"):
             w = max(4, int(n * 0.11))
             a, b = (n * 0.12, n * 0.42) if kind == "full" else (n * 0.08, n * 0.36)
             for cx, cy, sx, sy in ((0, 0, 1, 1), (n, 0, -1, 1), (0, n, 1, -1), (n, n, -1, -1)):
@@ -962,7 +1012,7 @@ class NowPlayingPage(fx.NpFxMixin):
         # Top-down: seek bar, times, transport, controls, (error), status.
         bar_y = S(10)
         times_y = bar_y + S(10)
-        tr_y = times_y + S(2)
+        tr_y = times_y + S(10)          # clear of the times under the bar
         tr_h = S(44)
         ctl_y = tr_y + tr_h + S(10)
         ctl_h = S(32)
@@ -1009,6 +1059,7 @@ class NowPlayingPage(fx.NpFxMixin):
             layer.alpha_composite(self._np_icon(key, sz, fg + (int(255 * a),)),
                                   (x - sz // 2, cy - sz // 2))
             hits.append(box + (key,))
+        self._np_footer_extras(layer, d, W, cx, cy, big, gap, hov, pressed, live, hits)
 
         # Delay stepper: "Delay", then a chip with minus, value, plus.
         x = pad
@@ -1043,10 +1094,23 @@ class NowPlayingPage(fx.NpFxMixin):
         TR.draw(d, (x + seg + (val_w - vw) / 2, cy - lh_s / 2), vtxt, "semibold", spx, vcol)
         hits.append((x + seg, ctl_y, x + seg + val_w, ctl_y + ctl_h, "delay"))
 
-        # Quiet actions, right-aligned: Mini, On top, Copy.
+        # Quiet actions, right-aligned: Mini, Overlay, On top, Copy. What
+        # doesn't fit beside the stepper goes into a "⋯" menu.
         rx = W - pad
-        for key, label, lit in (("copy", "Copy", False), ("top", "On top", M.ALWAYS_ON_TOP),
-                                ("mini", "Mini", False)):
+        acts = (("copy", "Copy", False), ("top", "On top", M.ALWAYS_ON_TOP),
+                ("overlay", "Overlay", self._np_overlay_on()), ("mini", "Mini", False))
+        shown, self._np_overflow = self._np_fit_actions(acts, rx - (x + chip_w + S(12)), spx)
+        if self._np_overflow:
+            w = S(34)
+            x1 = rx - w
+            if hov == "ov_more" or any(o[2] for o in self._np_overflow):
+                self._np_pill(layer, (x1, ctl_y, rx, ctl_y + ctl_h), 0.16 if hov == "ov_more" else 0.10)
+            gs = S(14)
+            layer.alpha_composite(self._np_icon("more", gs, self._np_rgba(0.95 if hov == "ov_more" else 0.62)),
+                                  (x1 + (w - gs) // 2, cy - gs // 2))
+            hits.append((x1, ctl_y, rx, ctl_y + ctl_h, "ov_more"))
+            rx = x1 - S(4)
+        for key, label, lit in shown:
             w = int(TR.measure(label, "semibold", spx)) + S(22)
             x1 = rx - w
             if hov == key or lit:
@@ -1076,6 +1140,14 @@ class NowPlayingPage(fx.NpFxMixin):
                       fill=(self._np_accent() + (255,)) if slot.on else self._np_rgba(0.3))
             x += dot + S(6)
             x += int(TR.draw(d, (x, stat_y), label, "regular", spx, self._np_rgba(0.55))) + S(16)
+        sleep = self._np_sleep_text()
+        if sleep:
+            gs = S(11)
+            layer.alpha_composite(self._np_icon("moon", gs, self._np_accent() + (230,)),
+                                  (x, stat_y + (lh_s - gs) // 2))
+            x += gs + S(6)
+            TR.draw(d, (x, stat_y), TR.ellipsize(sleep, "regular", spx, max(20, W - pad - x)), "regular", spx,
+                    self._np_rgba(0.72))
         right = " · ".join(t for t in (self.lbl_dropped.cget("text"), self.lbl_rl.cget("text")) if t)
         if right:
             rw = TR.measure(right, "regular", spx)
@@ -1152,7 +1224,7 @@ class NowPlayingPage(fx.NpFxMixin):
                 self._np_hover, self._np_drag, self._np_mouse if self._np_hover == "seek" else None,
                 id(self._np_hdr), id(self._np_ftr), self._sheet_idx, self._np_playing(),
                 round(self._ly_user), self._ly_user_target, M._DARK_MODE,
-                self._np_fx_sig(now, tier))
+                self._np_fx_sig(now, tier), self._np_ex_sig())
 
     def _np_render(self, force=True):
         """Compose and show one frame. Returns True while something glides.
@@ -1242,7 +1314,8 @@ class NowPlayingPage(fx.NpFxMixin):
             chrome()
             # Lyrics between the two.
             busy = self._np_draw_lyrics(frame, hdr.size[1] + self._S(4), fy - self._S(4), now) or busy
-            self._np_hits = (list(hhits) + [(x1, y1 + fy, x2, y2 + fy, k) for x1, y1, x2, y2, k in fhits]
+            busy = self._np_draw_extras(frame, hdr.size[1] + self._S(4), fy - self._S(4), now) or busy
+            self._np_hits = (self._np_ex_hits + list(hhits) + [(x1, y1 + fy, x2, y2 + fy, k) for x1, y1, x2, y2, k in fhits]
                              + getattr(self, "_ly_rects", []))
         else:
             # Fullscreen: the lyrics get the whole screen; the controls float
@@ -1260,7 +1333,8 @@ class NowPlayingPage(fx.NpFxMixin):
                 if before:
                     for b, old in zip(boxes, before):
                         frame.paste(Image.blend(old, frame.crop(b), level), b[:2])
-            self._np_hits = ((list(hhits) + [(x1, y1 + fy, x2, y2 + fy, k) for x1, y1, x2, y2, k in fhits]
+            busy = self._np_draw_extras(frame, hdr.size[1] + self._S(4), fy - self._S(4), now) or busy
+            self._np_hits = self._np_ex_hits + ((list(hhits) + [(x1, y1 + fy, x2, y2 + fy, k) for x1, y1, x2, y2, k in fhits]
                               if level >= 0.5 else []) + getattr(self, "_ly_rects", []))
 
         try:

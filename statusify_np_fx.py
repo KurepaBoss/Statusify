@@ -338,6 +338,9 @@ class NpFxMixin:
                 lx = m + int(limits[r])
                 if lx < W:
                     lvl.paste(lo, (max(0, lx), y0, W, y1))
+        if it.get("sub"):
+            # A romanised / translated sub-line isn't sung word by word.
+            lvl.paste(hi, (0, m + nrows * lh, W, H))
         return ImageChops.multiply(base, lvl)
 
     def _np_kara_busy(self, ly, t_ms):
