@@ -1,9 +1,9 @@
 <div align="center">
   <img src="https://raw.githubusercontent.com/KurepaBoss/Statusify/main/statusify_icon_preview.png" width="128" />
-  <h1>Statusify v2.1.0</h1>
+  <h1>Statusify v2.2.0</h1>
   <p><strong>The ultimate Discord Rich Presence & Spotify Lyrics bridge.</strong></p>
 
-  ![Statusify v2.1.0](https://img.shields.io/badge/Statusify-v2.1.0-brightgreen?style=for-the-badge)
+  ![Statusify v2.2.0](https://img.shields.io/badge/Statusify-v2.2.0-brightgreen?style=for-the-badge)
   ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge)
   ![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078d6?style=for-the-badge)
   ![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)
@@ -22,38 +22,24 @@ Lyrics come straight from Spicetify over a local WebSocket — no API keys, no p
 
 ---
 
-## 🆕 What's New in v2.1.0
+## 🆕 What's New in v2.2.0
 
-**Karaoke lyrics.** When the lyrics have word timing (most Spicy Lyrics tracks do), each word lights up as it's sung, with the word being sung filling from left to right. Instrumental breaks show three breathing dots that fill up over the gap instead of a blank line.
+**Lyrics reach Discord on time.** Discord accepts only five status updates every 20 seconds, and a fast verse outruns that. Statusify used to spend each update the moment a line started and then fall behind; it now plans the updates ahead from the lyric sheet, packing lines together before a fast passage instead of running out in the middle of one. Tested across 211 real songs, the line being sung is missing from your status about a third as often as before. A line that comes back after an instrumental break (a hook, say) is now shown again, instead of the 🎵 marker staying up for the rest of the song, and the *lines dropped* counter now counts every line that never reached Discord.
 
-**A desktop lyrics overlay.** A transparent strip that shows the current line (and optionally the next one) on top of anything, including borderless games. Clicks pass straight through it. Unlock it to drag it or scroll to resize, then lock it again. Turn it on with the *Overlay* button, the tray menu, `Ctrl+Alt+O`, or *Settings → Lyrics*.
+**Your cover as the background.** With *Colours from the album art* on and the dark theme, the playing song's cover, blurred and slowly drifting, sits behind every page. Cards and controls turn translucent over it, and the lyric page shows it brighter than the rest. *Settings → Appearance.*
 
-**A new Stats tab.** Your recently played songs with covers and times, a GitHub-style heatmap of plays per day, your top songs, the listening overview that used to live in Settings, and a monthly *Wrapped* card (top song, top artist, listening time, busiest hour, longest streak) that you can save or copy as an image.
+**A rebuilt History tab.** Plays are grouped by day with each session's listening time, badges show whether a song had synced or plain lyrics, and a song's lyrics slide in as a sheet. Clearing your history now asks first.
 
-**More control over Spotify.** Shuffle, repeat and like buttons, and volume on the mouse wheel over the play button or speaker icon (click the speaker to mute). *Up Next* shows your queue; click a song to jump to it. Shortcuts: `Ctrl+↑/↓` volume, `Ctrl+S` shuffle, `Ctrl+R` repeat, `Ctrl+L` like.
+**Sliding tabs.** Pages slide from one to the next and the tab pill follows them; drag sideways (or flick) to switch. With *Motion* turned off, tabs switch instantly.
 
-**Lyrics that are right, and ready.** The next song's lyrics load while the current one plays, so the sheet is never empty at a track change. If a song has the wrong lyrics, *⋯ → Wrong lyrics? Search…* lets you pick the right version from LRCLIB, and your choice is kept for that song.
-
-**Romanised and translated lines.** Under each lyric line, optionally show a romanisation (Japanese, Chinese, Korean, Cyrillic, Greek and more) and/or a translation into your language. Results are cached, so replays work offline. *Settings → Lyrics → Under each line.*
-
-**Share a line.** Right-click any lyric line to copy it or turn it into a 1080×1350 image with the song's colours and cover.
-
-**Fullscreen.** `F11` fills the screen with big lyrics; the controls fade away until you move the mouse.
-
-**A better mini player.** A rounded pill with the cover, the lyric and play controls. It snaps to screen corners and edges and fades when you're not using it. The tray icon's tooltip shows the song and the current line; middle-click it to play or pause.
-
-**Smaller things.** Pick the lyric font and size. The background can pulse gently with the beat when beat data is available. A sleep timer pauses Spotify after 15, 30 or 60 minutes, any custom time, or at the end of the song. A song now counts as played (history and stats) only after 20 seconds of actual listening, so opening Statusify on a paused song no longer adds it. The delay stepper now saves timing per song (shift-click for the global delay). Discord shows the album on hover and a *Listen on Spotify* button. If a Spotify update breaks the bridge, Statusify notices and offers a one-click repair. Animations now run at a true 60 fps on *Smooth* (they were capped near 32 by Windows' timer). The Statusify icon now shows correctly on the taskbar, title bar and Alt-Tab (it was Tk's feather or a blurry copy), and the exe, shortcuts and tray use a sharp multi-size icon.
-
-**Updating:** the Spotify bridge changed, so it has to be re-applied once. The installer does this for you; if you run from source, click the *Lyrics bridge out of date* message after updating.
-
-Notes for v2.0 and earlier are on the [Releases page](https://github.com/KurepaBoss/Statusify/releases).
+Notes for v2.1 and earlier are on the [Releases page](https://github.com/KurepaBoss/Statusify/releases).
 
 ---
 
 ## ✨ Key Features
 
 **Presence & lyrics**
-- 🎤 **Synced lyrics** on your Discord status, driven by Spicetify's exact playback position.
+- 🎤 **Synced lyrics** on your Discord status, driven by Spicetify's exact playback position and planned ahead so fast verses keep up despite Discord's five-updates-per-20-seconds limit.
 - 🎸 **Instrumental handling** — detects instrumental gaps and shows your own custom text instead of a blank line.
 - ⏸️ **Paused indicator** — optionally keep a "Paused" status instead of clearing your presence.
 - 🖼️ **Album art** on the presence, with a local disk cache so the same track never re-downloads.
@@ -66,11 +52,11 @@ Notes for v2.0 and earlier are on the [Releases page](https://github.com/KurepaB
 - 🪟 **Desktop overlay** — the current lyric floating over any app or game, click-through.
 - ⏯️ **Playback controls** — previous, play/pause, next, shuffle, repeat, like, volume, a seek bar, an Up Next queue, and click-a-lyric-line to jump there.
 - 🚀 **Zero-config startup** — a setup wizard on first run and self-installing dependencies.
-- 📂 **Listening history** — every play saved as it happens, with its date; search everything you've played by song, artist, or even lyric content, and export any track's lyrics as a timestamped `.lrc` or plain `.txt`.
+- 📂 **Listening history** — every play saved as it happens, grouped by day with each session's listening time; search everything you've played by song, artist, or even lyric content, and export any track's lyrics as a timestamped `.lrc` or plain `.txt`.
 - 🎭 **Multi-profile support** — manage multiple Discord Application IDs and switch between them instantly.
 - 💊 **Mini player** — a compact pill with cover, lyric and controls that snaps to screen edges.
 - 🔔 **System tray** — close-to-tray, so Statusify keeps running out of the way.
-- 🎨 **Themes** — smooth dark and light modes with custom accent colours.
+- 🎨 **Themes** — smooth dark and light modes with custom accent colours, or the playing song's cover, blurred, behind every page.
 - ⌨️ **Global hotkeys** for toggling RPC, skipping the current track, and skipping instrumentals.
 - 🚫 **Blacklist** — case-insensitive terms matched against artist and title, so anything you'd rather not broadcast never reaches Discord.
 - 📊 **Stats tab** — recently played, a plays-per-day heatmap, top songs and artists, and a monthly Wrapped card you can save as an image.
