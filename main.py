@@ -472,16 +472,11 @@ def _request_show():
     except Exception:
         pass
 
+# Discord's SET_ACTIVITY limit is a server-side quota — it cannot be raised or
+# opted out of — so the only lever is spending each slot on the right lines
+# (statusify_presence_plan).
 RATE_LIMIT_CALLS  = 5
 RATE_LIMIT_WINDOW = 20.0
-# Seconds of song time one presence update has to buy to be sustainable.
-# Discord's SET_ACTIVITY limit is a server-side quota — it cannot be raised or
-# opted out of — so the only lever is spending each slot on more song.
-RPC_BUDGET_S      = RATE_LIMIT_WINDOW / RATE_LIMIT_CALLS   # 4.0 s per call
-# Headroom on top of the budget. The loop ticks at 20 Hz and the Spicetify
-# bridge pings position only every few seconds, so a group aimed exactly at
-# 4.0 s lands under it about half the time.
-GROUP_MARGIN_MS   = 750
 MAX_STATE         = 128
 LYRIC_DELAY_MS    = 0       # user-adjustable lyric timing offset (ms)
 _ENV_PATH         = os.path.join(_APP_DIR, ".env")
@@ -996,57 +991,6 @@ def get_nth(w, n):
         if count == n:
             return state.synced[j]["words"]
     return ""
-
-# Stays in main.py: unlike join_lines/_calc_instrumental_gaps this reads the
-# module-level `state` and MAX_STATE, so it is not independently testable.
-def _line_index(w):
-    """Index of `w` in state.synced, disambiguating repeats by playback position.
-
-    get_line_dur and get_nth each re-derive this with their own full scan, so
-    pick_group used to walk the whole lyric sheet three times to build one
-    group. Resolve it once and walk forward from there."""
-    pos = state.position_ms + _track_offset_ms()
-    best = None
-    for i, e in enumerate(state.synced):
-        if e["words"] == w:
-            if best is None or abs(e["startMs"] - pos) < abs(best[0] - pos):
-                best = (e["startMs"], i)
-    return best[1] if best else None
-
-def pick_group(line1):
-    """Pick the lyric lines to publish in one presence update.
-
-    Discord allows RATE_LIMIT_CALLS SET_ACTIVITY frames per RATE_LIMIT_WINDOW
-    seconds, so a sustainable update buys at least RPC_BUDGET_S of song time.
-    The old version chose the group from the FIRST line's duration alone, with
-    a single-line cutoff at 3500 ms — which meant every line lasting 3.5-4.0 s
-    was published on its own and scheduled the next call under the 4.0 s
-    budget. The live log showed the consequence precisely: single-line calls
-    sat at a median spacing of exactly 4.0 s, zero headroom, and the limiter
-    absorbed the overrun as lyric lag.
-
-    So group by what actually matters — cumulative coverage — rather than by
-    the head line's duration, packing lines until the group spans a budget
-    period (plus a margin for tick and position-ping jitter) or runs into
-    MAX_STATE. Fast passages group more, slow passages stay on one line
-    exactly as before."""
-    if state.lyrics_mode != "synced" or not state.synced: return [line1], 0
-    i = _line_index(line1)
-    if i is None: return [line1], 0
-
-    def dur(j):
-        nxt = state.synced[j+1]["startMs"] if j+1 < len(state.synced) else state.duration_ms
-        return max(0, nxt - state.synced[j]["startMs"])
-
-    target = RPC_BUDGET_S * 1000 + GROUP_MARGIN_MS
-    group   = [line1]
-    covered = dur(i)
-    j = i + 1
-    while covered < target and j < len(state.synced):
-        cand = group + [state.synced[j]["words"]]
-        if len(join_lines(cand)) > MAX_STATE: break
-        group = cand; covered += dur(j); j += 1
-    return group, len(group) - 1
 
 # Handle on the live DiscordRPC instance so the GUI can act on it (force a
 # reconnect, send a test presence). A dict rather than a bare global so the
@@ -1599,22 +1543,43 @@ def _persist_history():
     st.close()
 
 # ── RPC loop ──────────────────────────────────────────────────────
+# What goes to Discord, and when, is planned by statusify_presence_plan.
+import bisect
+import statusify_presence_plan as _plan
+
+# A seek, a buffering stall or a big offset change moves playback off the
+# clock a plan was made on; past this much drift, plan again from here.
+PLAN_DRIFT_MS = 1500
+
 async def rpc_loop(rpc):
     global _dropped_lines
     rl = {"t":[]}
-    last_uri = track_mono = None
-    title_sent = False; last_line = None; skip = []
-    gap_mono = None; gap_shown_idx = -1; was_playing = False
+    last_uri = None; was_playing = False
     calibration_until = 0.0   # Feature 6: don't RPC until this monotonic time
     rpc_was_enabled = _rpc_enabled
+    # What Discord is showing for this track, as a set of texts, with
+    # _plan.TITLE / _plan.GAP standing in for the title-only presence and the
+    # instrumental marker.
+    #
+    # This replaces `last_line`/`skip`, which remembered the text last
+    # PUBLISHED rather than what was on screen. Once the instrumental marker
+    # or a title-only presence replaced a line, a line with the same words —
+    # a hook coming back after the break — still matched and was skipped as a
+    # duplicate, so the marker stayed up for the rest of the song.
+    shown = frozenset()
+    upcoming = None            # the plan: Publishes in send order; None = re-plan
+    plan_src = None            # the lyric sheet it was made from
+    plan_anchor = (0.0, 0.0)   # (lyric position, monotonic) when it was made
+    units = []; unit_starts = []
+    cur_key = None             # the unit being sung, to count dropped lines
+    cur_line = None; cur_seen = False
+    rl_noted = None            # the unit whose rate-limit wait was reported
 
     def reset_track_state():
         """Forget everything we've published, so the next tick starts clean."""
-        nonlocal last_uri, track_mono, title_sent, last_line, skip
-        nonlocal gap_mono, gap_shown_idx, was_playing, calibration_until
-        last_uri = track_mono = None; title_sent = False
-        last_line = None; skip = []; gap_mono = None; gap_shown_idx = -1
-        was_playing = False; calibration_until = 0.0
+        nonlocal last_uri, was_playing, calibration_until, shown, upcoming, cur_key
+        last_uri = None; was_playing = False; calibration_until = 0.0
+        shown = frozenset(); upcoming = None; cur_key = None
 
     # Does Discord currently hold a presence from us? clear_activity() is a
     # SET_ACTIVITY frame like any other and spends a rate-limit slot, so
@@ -1651,9 +1616,10 @@ async def rpc_loop(rpc):
         await rpc.clear_activity(); rec()
         have_presence = False
         return True
-    def wait():
-        if avail(): return 0.0
-        return max(0.0, RATE_LIMIT_WINDOW - (time.monotonic() - min(rl["t"])))
+
+    def unit_at(pos):
+        i = bisect.bisect_right(unit_starts, pos) - 1
+        return units[i] if 0 <= i < len(units) and pos < units[i].end else None
 
     while True:
         await asyncio.sleep(0.05)
@@ -1700,98 +1666,91 @@ async def rpc_loop(rpc):
             if last_uri != state.track_uri:
                 await clear()
                 last_uri = state.track_uri
+                shown = frozenset(); upcoming = None
                 event_queue.put(("line", "— blacklisted —"))
             continue
+        now = time.monotonic()
         if state.track_uri != last_uri:
-            last_uri = state.track_uri; track_mono = time.monotonic()
-            title_sent = False; last_line = None; skip = []; gap_mono = None; gap_shown_idx = -1
-            calibration_until = time.monotonic() + 1.5  # Feature 6: wait 1.5s to prevent Discord RPC rate-limit on rapid skips
-            continue
+            last_uri = state.track_uri
+            shown = frozenset(); upcoming = None; cur_key = None
+            calibration_until = now + 1.5  # Feature 6: wait 1.5s to prevent Discord RPC rate-limit on rapid skips
 
-        # Feature 6: skip RPC until calibration gate has passed
-        if time.monotonic() < calibration_until:
-            continue
-
-        line1, _ = get_current_line()
         # Per-track offset (#13), falling back to the global when unset.
         pos = state.position_ms + _track_offset_ms()
+        src = (state.lyrics_mode, state.synced, state.plain,
+               state.duration_ms, state.instrumental_gaps)
+        jumped = (plan_src is not None and abs(
+            pos - plan_anchor[0] - (now - plan_anchor[1]) * 1000.0) > PLAN_DRIFT_MS)
+        if jumped:
+            cur_key = None          # a seek: lines jumped over were not dropped
+        if (upcoming is None or jumped or src != plan_src
+                or pos >= plan_anchor[0] + _plan.PLAN_HORIZON_MS / 2):
+            # Re-plan from here: after every send (the plan is a forecast;
+            # the ledger and the playback position are the truth), when the
+            # lyrics change, after a seek, and before the horizon runs out.
+            avail()                 # prune the ledger
+            units = _plan.build_units(*src)
+            unit_starts = [u.start for u in units]
+            upcoming = _plan.plan(
+                units, pos, [pos - (now - x) * 1000.0 for x in rl["t"]], shown,
+                pos + max(0.0, calibration_until - now) * 1000.0,
+                calls=RATE_LIMIT_CALLS, window_ms=RATE_LIMIT_WINDOW * 1000.0,
+                max_state=MAX_STATE)
+            plan_src = src; plan_anchor = (pos, now)
 
-        # ── Instrumental detection — use pre-calculated gap list ──────
-        active_gap = None
-        for gap in state.instrumental_gaps:
-            if gap["gap_ms"] > 3000 and gap["startMs"] <= pos < gap["endMs"]:
-                active_gap = gap
-                break
+        # Count a line as dropped when the song moves past it without its
+        # words ever having been on Discord.
+        u = unit_at(pos)
+        key = (u.kind, u.start) if u else None
+        if key != cur_key:
+            if cur_key is not None and cur_line is not None and not cur_seen:
+                _dropped_lines += 1
+                log(f"Dropped  ·  {cur_line[:40]}")
+                event_queue.put(("dropped", _dropped_lines))
+            cur_key = key; cur_seen = False
+            cur_line = u.text if u is not None and u.kind == "line" else None
+        if cur_line in shown:
+            cur_seen = True
 
-        # Active gap display
-        if active_gap:
-            if gap_shown_idx != active_gap["key"]:
-                if not avail():
-                    w = wait()
-                    if w > 0 and (active_gap["gap_ms"] / 1000) > w + 1.0:
-                        log(f"Instrumental waiting for rate limit  ·  {w:.1f}s")
-                        await asyncio.sleep(w + 0.05)
-                if avail():
-                    gap_shown_idx = active_gap["key"]; title_sent = True; rec()
-                    have_presence = True
-                    instr_text = INSTRUMENTAL_TEXT  # Feature 5: custom instrumental text
-                    await rpc.set_activity(state.title, state.artist, [instr_text], state.album_art, state.position_ms, state.duration_ms)
-                    log(f"RPC instrumental  (gap {active_gap['gap_ms']/1000:.1f}s)")
-                    event_queue.put(("line", instr_text))
+        if not upcoming:
             continue
-
-        if not line1:
-            # No lyric line for this instant. That covers a lot of ordinary
-            # cases: the track has no lyrics at all, it is an instrumental or
-            # a podcast, the fetch failed, or the lyrics simply have not
-            # arrived yet (they land a second or two after the track change).
-            #
-            # This used to be a bare `continue`, and since it was the only
-            # thing standing between a playing track and the sole set_activity
-            # call below, "no lyrics" meant Statusify published NOTHING —
-            # despite already holding the title, artist, album art and
-            # timestamps. That is why a lyrics-side failure showed up as
-            # "the Rich Presence isn't working at all".
-            #
-            # `title_sent` has existed all along and was never read; this is
-            # the gate it was written for. One publish per track, not one per
-            # 50ms tick, so an unlyricked album can't exhaust the rate limit.
-            if not title_sent and avail():
-                title_sent = True; rec(); have_presence = True
-                await rpc.set_activity(state.title, state.artist, [],
-                                       state.album_art,
-                                       state.position_ms, state.duration_ms)
-                log(f"RPC title-only  ·  {state.artist} — {state.title}")
-                event_queue.put(("line", ""))
+        ev = upcoming[0]
+        if pos >= ev.end:
+            upcoming = None         # overtaken (a stall, a late tick): re-plan
             continue
-        # ─────────────────────────────────────────────────────────────
-
-        gap_mono = None; title_sent = True
-        if line1 == last_line or line1 in skip: continue
-        group, _ = pick_group(line1)
-
+        if pos < ev.t:
+            # The sung line is not on Discord and the budget says wait.
+            if (cur_line is not None and not cur_seen and now >= calibration_until
+                    and rl_noted != (last_uri, key)):
+                rl_noted = (last_uri, key)
+                w = (ev.t - pos) / 1000.0
+                log(f"Rate limited  ·  {w:.1f}s"); event_queue.put(("rl", w))
+            continue
         if not avail():
-            w = wait(); log(f"Rate limited  ·  {w:.1f}s"); event_queue.put(("rl", w))
-            await asyncio.sleep(w + 0.05)
-            # After waiting, resync to whatever line is current now.
-            # Don't try to send stale line1 — the song has moved on.
-            cur, _ = get_current_line()
-            if not cur or cur == last_line or cur in skip:
-                # Nothing new to send yet
-                last_line = line1; skip = group[1:]
-                if cur and cur != line1:
-                    _dropped_lines += 1
-                    log(f"Dropped (moved on)  ·  {line1[:40]}")
-                    event_queue.put(("dropped", _dropped_lines))
-                continue
-            # Send the current line instead of the original stale one
-            line1 = cur
-            group, _ = pick_group(line1)
+            continue                # a hair early by the ledger's clock
 
-        last_line = line1; skip = group[1:]; rec(); have_presence = True
-        await rpc.set_activity(state.title, state.artist, group, state.album_art, state.position_ms, state.duration_ms)
-        display = join_lines(group)
-        log(f"RPC ({len(group)}L)  ·  {display[:55]}"); event_queue.put(("line", display))
+        if ev.kind == "line":
+            lines = list(ev.lines)
+            await rpc.set_activity(state.title, state.artist, lines, state.album_art,
+                                   state.position_ms, state.duration_ms)
+            display = join_lines(lines)
+            log(f"RPC ({len(lines)}L)  ·  {display[:55]}"); event_queue.put(("line", display))
+        elif ev.kind == "gap":
+            instr_text = INSTRUMENTAL_TEXT  # Feature 5: custom instrumental text
+            await rpc.set_activity(state.title, state.artist, [instr_text], state.album_art,
+                                   state.position_ms, state.duration_ms)
+            log(f"RPC instrumental  (gap {(ev.end - ev.start) / 1000:.1f}s)")
+            event_queue.put(("line", instr_text))
+        else:
+            await rpc.set_activity(state.title, state.artist, [], state.album_art,
+                                   state.position_ms, state.duration_ms)
+            log(f"RPC title-only  ·  {state.artist} — {state.title}")
+            event_queue.put(("line", ""))
+        rec(); have_presence = True
+        shown = _plan.shown_for(ev)
+        if cur_line in shown:
+            cur_seen = True
+        upcoming = None             # re-plan from what is on screen now
 
 from statusify_colors import _hex_to_rgb, _blend, _readable_on, contrast_ratio as _contrast
 from statusify_colors import tinted_palette as _tinted_palette

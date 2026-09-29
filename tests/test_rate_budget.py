@@ -11,6 +11,10 @@ call every 4.0 s sustained. Two things conspired to overrun that budget.
    exactly 4.0 s (zero headroom), against 5.0 s for two-line and 6.0 s for
    three-line calls. 327 throttle events in one log.
 
+   pick_group has since been replaced by a planner that looks ahead instead
+   of padding each update to a fixed span of song; its budget tests (the same
+   3.6 s, 1.2 s and mixed-cadence sheets) live in test_presence_plan.py.
+
 2. clear_activity() sends a SET_ACTIVITY frame like any other and spends a
    slot, but every call site followed it with rl["t"].clear(), wiping the
    local ledger. After a pause, a blacklisted track or an RPC toggle Statusify
@@ -29,85 +33,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import main
 
 
-def _load(durations_ms):
-    """Install a synced lyric sheet whose lines last the given durations."""
-    t = 0
-    synced = []
-    for i, d in enumerate(durations_ms):
-        synced.append({"startMs": t, "words": f"line {i}"})
-        t += d
-    main.state.synced = synced
-    main.state.plain = []
-    main.state.lyrics_mode = "synced"
-    main.state.duration_ms = t
-    main.state.track_uri = ""
-    main.state.is_playing = False
-    main.state._position_ms = 0
-    main.state._pos_mono = None
-    return synced
-
-
-def _coverage(durations_ms, group_start_index):
-    """Song-time, in seconds, that one presence call buys us."""
-    main.state._position_ms = sum(durations_ms[:group_start_index])
-    line1 = f"line {group_start_index}"
-    group, _ = main.pick_group(line1)
-    return sum(durations_ms[group_start_index:group_start_index + len(group)]) / 1000.0, group
-
-
-BUDGET_S = main.RATE_LIMIT_WINDOW / main.RATE_LIMIT_CALLS   # 4.0 s per call
-
-
 def test_budget_period_is_four_seconds():
-    assert BUDGET_S == 4.0
-
-
-def test_group_covers_budget_for_midlength_lines():
-    """Lines of 3.6 s each: one line per call spends the budget faster than
-    it refills. The group must span at least one budget period."""
-    durs = [3600] * 12
-    _load(durs)
-    cov, group = _coverage(durs, 2)
-    assert cov >= BUDGET_S, f"group {group} covers only {cov:.1f}s of a {BUDGET_S}s budget"
-
-
-def test_group_covers_budget_for_rapid_lines():
-    """Fast rap verse: 1.2 s lines. Three of them is still only 3.6 s."""
-    durs = [1200] * 20
-    _load(durs)
-    cov, group = _coverage(durs, 3)
-    assert cov >= BUDGET_S, f"group {group} covers only {cov:.1f}s of a {BUDGET_S}s budget"
-
-
-def test_group_covers_budget_across_a_real_verse():
-    """Mixed cadence. Every call over the whole sheet must buy >= budget,
-    except where the sheet itself runs out of lines."""
-    durs = [2800, 3600, 1500, 3900, 2200, 3700, 1100, 3400, 2600, 3800,
-            1900, 3650, 2400, 3550, 1300, 3750, 2900, 3450, 2100, 3850]
-    _load(durs)
-    i = 0
-    short = []
-    while i < len(durs) - 4:
-        cov, group = _coverage(durs, i)
-        if cov < BUDGET_S:
-            short.append((i, group, round(cov, 2)))
-        i += len(group)
-    assert not short, f"{len(short)} calls under the {BUDGET_S}s budget: {short[:5]}"
-
-
-def test_group_never_exceeds_state_limit():
-    durs = [800] * 30
-    _load(durs)
-    _, group = _coverage(durs, 0)
-    assert len(main.join_lines(group)) <= main.MAX_STATE
-
-
-def test_unsynced_lyrics_still_single_line():
-    durs = [1000] * 10
-    _load(durs)
-    main.state.lyrics_mode = "plain"
-    group, _ = main.pick_group("line 0")
-    assert group == ["line 0"]
+    assert main.RATE_LIMIT_WINDOW / main.RATE_LIMIT_CALLS == 4.0
 
 
 # ── The ledger: clears spend a slot like anything else ────────────────
