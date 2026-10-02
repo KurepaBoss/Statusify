@@ -7,12 +7,15 @@ pub const URL: &str = "https://lrclib.net/api/search";
 
 #[derive(Debug)]
 pub enum Error {
-    /// Network trouble or a 5xx: worth trying again later.
-    Retryable(String),
+    /// The lookup failed (network, HTTP error, unreadable answer): the track
+    /// is forgotten so a later trigger may try again (main.py _lrclib_task).
+    Failed(String),
     /// Answered, but nothing usable.
     NoMatch,
 }
 
+/// One search. Err((retry, message)): network trouble, a 5xx or an
+/// unreadable body are worth another attempt; a 4xx is not.
 async fn search_once(client: &reqwest::Client, base: &str, artist: &str, title: &str) -> Result<serde_json::Value, (bool, String)> {
     let r = client
         .get(base)
@@ -25,23 +28,25 @@ async fn search_once(client: &reqwest::Client, base: &str, artist: &str, title: 
     if !code.is_success() {
         return Err((code.is_server_error(), format!("HTTP {code}")));
     }
-    r.json().await.map_err(|e| (false, e.to_string()))
+    r.json().await.map_err(|e| (true, format!("bad JSON: {e}")))
 }
 
 /// Search with up to three attempts; LRCLIB answers 503 under load,
 /// sometimes several times in a row.
+#[allow(dead_code)] // the engine passes its own backoff
 pub async fn fetch(client: &reqwest::Client, base: &str, artist: &str, title: &str, duration_ms: i64) -> Result<Lyrics, Error> {
-    for attempt in 1..=3u64 {
+    fetch_with_backoff(client, base, artist, title, duration_ms, Duration::from_secs(3)).await
+}
+
+pub async fn fetch_with_backoff(client: &reqwest::Client, base: &str, artist: &str, title: &str, duration_ms: i64, step: Duration) -> Result<Lyrics, Error> {
+    for attempt in 1..=3u32 {
         match search_once(client, base, artist, title).await {
             Ok(results) => return pick_lrclib(&results, duration_ms).ok_or(Error::NoMatch),
             Err((retry, msg)) => {
-                if !retry {
-                    return Err(Error::NoMatch);
+                if !retry || attempt == 3 {
+                    return Err(Error::Failed(msg));
                 }
-                if attempt == 3 {
-                    return Err(Error::Retryable(msg));
-                }
-                tokio::time::sleep(Duration::from_secs(3 * attempt)).await;
+                tokio::time::sleep(step * attempt).await;
             }
         }
     }
@@ -51,7 +56,7 @@ pub async fn fetch(client: &reqwest::Client, base: &str, artist: &str, title: &s
 pub fn client() -> reqwest::Client {
     reqwest::Client::builder()
         // LRCLIB asks clients to identify themselves.
-        .user_agent(concat!("Statusify/", env!("CARGO_PKG_VERSION"), " (https://github.com/KurepaBoss/Statusify)"))
+        .user_agent(format!("Statusify/{} (https://github.com/KurepaBoss/Statusify)", crate::engine::maint::APP_VERSION))
         .build()
         .expect("http client")
 }

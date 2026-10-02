@@ -9,7 +9,8 @@
 //!   sleep_value, in_instrumental, instrumental_gap {start_ms,end_ms}|null,
 //!   dropped_lines, rate_limited_until_ms, blacklisted, lrclib_enabled,
 //!   update_available ({tag,url,changelog,setup}|null), bridge_warning,
-//!   bridge_outdated }
+//!   bridge_outdated, discord_error ("" or why the presence is not reaching
+//!   Discord: pipe missing, handshake rejected, pipe closed) }
 //!
 //! Actions: get_state; set_rpc_enabled {enabled}; toggle_rpc;
 //! set_track_offset {ms|null, global?}; nudge_track_offset {delta_ms, global?};
@@ -116,6 +117,7 @@ pub fn state_json(e: &Engine, cfg: &Config) -> Value {
             "update_available": c.update.clone(),
             "bridge_warning": c.bridge_warning,
             "bridge_outdated": c.bridge_outdated,
+            "discord_error": if c.presence_running { crate::discord::LINK.error() } else { String::new() },
         })
     })
 }
@@ -183,6 +185,7 @@ pub fn act(env: &Env, action: &str, args: &Value) -> Result<Value, String> {
             let ms = arg_i64(args, "ms");
             let global = args.get("global").and_then(|v| v.as_bool()).unwrap_or(false);
             match (current(e), global) {
+                (_, true) => set_global(env, ms.ok_or("ms expected")?),
                 (Some((uri, ..)), false) => {
                     set_track_offset(env, &uri, ms);
                     crate::log(&match ms {
@@ -190,7 +193,9 @@ pub fn act(env: &Env, action: &str, args: &Value) -> Result<Value, String> {
                         None => "Lyric offset for this song cleared; using the global delay".into(),
                     });
                 }
-                _ => set_global(env, ms.unwrap_or(0)),
+                // Between songs a per-track call has no song to apply to;
+                // it must not fall through to (and wipe) the global delay.
+                (None, false) => crate::log("No track playing — per-track offset not saved"),
             }
         }
         "nudge_track_offset" => {
@@ -261,10 +266,42 @@ pub fn act(env: &Env, action: &str, args: &Value) -> Result<Value, String> {
             }
             e.core.with(|c| c.test_request = true);
         }
-        "reconnect_rpc" => crate::discord::request_reconnect(),
+        "reconnect_rpc" => {
+            if !e.core.with(|c| c.presence_running) {
+                crate::log("Reconnect: no active RPC connection to reset");
+                return Err("No Discord connection to reset".into());
+            }
+            crate::discord::LINK.request_reconnect();
+            crate::discord::LINK.clear_error();
+            crate::log(if e.snapshot().discord_user.is_some() {
+                "Reconnect requested — backend will re-handshake shortly"
+            } else {
+                "Reconnect requested — retrying Discord now"
+            });
+        }
         _ => return Err(format!("core: unknown action {action}")),
     }
     Ok(state_json(e, env.config))
+}
+
+/// Drop the out-of-date warning once Spotify runs the bridge we ship.
+/// True when it was cleared.
+fn clear_outdated_if_current(e: &Engine, appdata: &std::path::Path) -> bool {
+    if maint::bridge_needs_apply(appdata, maint::BRIDGE_JS) {
+        return false;
+    }
+    let cleared = e.core.with(|c| {
+        let was = c.bridge_outdated;
+        c.bridge_outdated = false;
+        if c.bridge_warning == OUTDATED_MSG {
+            c.bridge_warning.clear();
+        }
+        was
+    });
+    if cleared {
+        crate::log("Spicetify bridge is current");
+    }
+    cleared
 }
 
 /// Copy our bridge into Spicetify's Extensions folder if stale, and note
@@ -289,6 +326,14 @@ fn install_bridge(e: &Engine, appdata: &std::path::Path) {
         }
         Err(m) => crate::log(&m),
     }
+}
+
+/// A failed download / verify / launch falls back to the release page
+/// (main.py _show_update_dialog._install).
+fn update_failed(err: &str, url: &str) -> Value {
+    let msg = format!("Update failed: {err} — opening the download page");
+    crate::log(&msg);
+    json!({"installed": false, "open_url": url, "error": msg})
 }
 
 impl Core {
@@ -320,12 +365,14 @@ impl Core {
         // Bridge health: Spotify running, no bridge connected for a while.
         let mut verdict = None;
         let mut check = false;
+        let mut reconnected = false;
         {
             let mut rt = self.rt.lock().unwrap();
             let was = rt.bridge_was_connected;
             let h = rt.health.get_or_insert_with(|| BridgeHealth::new(now));
             if snap.bridge_connected && !h.connected {
                 verdict = h.on_connect();
+                reconnected = true;
             } else if !snap.bridge_connected && was {
                 h.on_disconnect(now);
             }
@@ -339,6 +386,14 @@ impl Core {
         }
         if let Some(v) = verdict {
             self.apply_health(ctx, v);
+        }
+        // A bridge (re)connect is the moment to re-check the injected copy:
+        // the user may have run `spicetify apply` themselves (main.py
+        // ws_handler clears _BRIDGE_UPDATED here).
+        if reconnected && e.core.with(|c| c.bridge_outdated) {
+            if let Some(appdata) = Core::env(ctx).appdata {
+                clear_outdated_if_current(e, &appdata);
+            }
         }
         if check {
             let (me, c) = (self.clone(), ctx.clone());
@@ -427,14 +482,18 @@ impl Core {
         }
         let client = crate::lrclib::client();
         let dest = std::env::temp_dir().join("statusify-update");
-        let path = tauri::async_runtime::block_on(maint::download_verified(&client, setup, sha, &dest)).map_err(|err| {
-            crate::log(&format!("Update download failed: {err}"));
-            format!("Update failed: {err}")
-        })?;
-        crate::log(&format!("Update v{} downloaded and verified — installing", u["tag"].as_str().unwrap_or("?")));
-        maint::launch_silent_update(&path).map_err(|err| format!("Could not start the installer: {err}"))?;
-        ctx.app.exit(0);
-        Ok(json!({"installed": true}))
+        let res = tauri::async_runtime::block_on(maint::download_verified(&client, setup, sha, &dest))
+            .and_then(|path| {
+                crate::log(&format!("Update v{} downloaded and verified — installing", u["tag"].as_str().unwrap_or("?")));
+                maint::launch_silent_update(&path).map_err(|err| format!("could not start the installer: {err}"))
+            });
+        match res {
+            Ok(()) => {
+                ctx.app.exit(0);
+                Ok(json!({"installed": true}))
+            }
+            Err(err) => Ok(update_failed(&err, &url)),
+        }
     }
 
     /// Re-wire the bridge: refresh the Extensions copy, then run the
@@ -704,6 +763,64 @@ mod tests {
         assert_eq!(s["instrumental_gap"]["end_ms"], 30000);
         t.engine.handle(&json!({"type":"position","position_ms":31000,"duration_ms":36000,"is_playing":false}));
         assert_eq!(t.act("get_state", json!({})).unwrap()["in_instrumental"], false);
+    }
+
+    #[tokio::test]
+    async fn per_track_offset_calls_between_songs_leave_the_global_alone() {
+        let t = T::new("[preferences]\nlyric_delay_ms = -40\n");
+        let cfg = Arc::new(Config::open(&t.dir));
+        let engine = Engine::new(None, |_| {});
+        engine.set_config(cfg.clone());
+        let env = Env { engine: &engine, config: &cfg, outbox: &t.outbox, appdata: None };
+        let s = act(&env, "set_track_offset", &json!({"ms": null})).unwrap();
+        assert_eq!(s["global_delay_ms"], -40);
+        let s = act(&env, "set_track_offset", &json!({"ms": 300})).unwrap();
+        assert_eq!(s["global_delay_ms"], -40);
+        assert!(cfg.section("offsets").is_empty());
+        // explicitly global
+        let s = act(&env, "set_track_offset", &json!({"ms": 300, "global": true})).unwrap();
+        assert_eq!(s["global_delay_ms"], 300);
+        assert!(act(&env, "set_track_offset", &json!({"ms": null, "global": true})).is_err());
+    }
+
+    #[tokio::test]
+    async fn reconnect_needs_a_presence_and_discord_errors_are_reported() {
+        let t = T::new("");
+        assert_eq!(t.act("reconnect_rpc", json!({})).unwrap_err(), "No Discord connection to reset");
+        // no presence configured: no Discord error to show
+        assert_eq!(t.act("get_state", json!({})).unwrap()["discord_error"], "");
+        t.engine.core.with(|c| c.presence_running = true);
+        assert!(t.act("reconnect_rpc", json!({})).is_ok());
+        assert!(t.act("get_state", json!({})).unwrap()["discord_error"].is_string());
+    }
+
+    #[test]
+    fn failed_update_opens_the_download_page() {
+        let v = update_failed("HTTP 404", "https://example.invalid/rel");
+        assert_eq!(v["installed"], false);
+        assert_eq!(v["open_url"], "https://example.invalid/rel");
+        assert!(v["error"].as_str().unwrap().starts_with("Update failed: HTTP 404"));
+    }
+
+    #[tokio::test]
+    async fn outdated_warning_clears_once_the_injected_bridge_matches() {
+        let t = T::new("");
+        let appdata = t.dir.join("appdata");
+        let injected = maint::injected_bridge_path(&appdata);
+        std::fs::create_dir_all(injected.parent().unwrap()).unwrap();
+        std::fs::write(&injected, b"old bridge").unwrap();
+        t.engine.core.with(|c| {
+            c.bridge_outdated = true;
+            c.bridge_warning = OUTDATED_MSG.into();
+        });
+        assert!(!clear_outdated_if_current(&t.engine, &appdata));
+        assert!(t.engine.core.with(|c| c.bridge_outdated));
+        // the user ran `spicetify apply` themselves
+        std::fs::write(&injected, maint::BRIDGE_JS).unwrap();
+        assert!(clear_outdated_if_current(&t.engine, &appdata));
+        let s = t.act("get_state", json!({})).unwrap();
+        assert_eq!(s["bridge_outdated"], false);
+        assert_eq!(s["bridge_warning"], "");
     }
 
     #[test]

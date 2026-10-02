@@ -21,7 +21,7 @@ use crate::lyrics::{offset_key, resolve_offset_ms, Line, Lyrics};
 use crate::state::{now_ms, Snapshot, Track};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -30,7 +30,11 @@ pub const PLAY_COMMIT_MS: i64 = 20_000;
 /// Lyric offsets are clamped to this (both ways) by the UI steppers.
 pub const OFFSET_LIMIT_MS: i64 = 5_000;
 pub const LRCLIB_EARLY: Duration = Duration::from_millis(2500);
-const PREFETCH_CAP: usize = 20;
+/// Lyrics prefetched for upcoming tracks kept at once (main.py PrefetchCache(5)).
+const PREFETCH_CAP: usize = 5;
+/// A position this close to the end, then this close to the start of the
+/// same track while playing, is the song starting over (repeat one): a new play.
+const RESTART_EDGE_MS: i64 = 3_000;
 
 /// What feature modules can react to (Engine::subscribe).
 #[derive(Clone, Debug)]
@@ -46,13 +50,35 @@ pub enum Event {
     ConfigChanged,
 }
 
+/// The play in progress. Listening time is wall-clock time while playing
+/// (main.py _get_listen_time), not position progress: the bridge may ping
+/// only once a minute when Spotify's timers are throttled, and a seek is not
+/// listening.
 #[derive(Default)]
 struct Play {
     uri: String,
     started_at: String,
-    listened_ms: i64,
+    /// Listening time banked before the current playing stretch.
+    banked_ms: i64,
+    /// Engine::mono_ms when the current playing stretch began.
+    since: Option<i64>,
     saved_ms: i64,
     id: Option<i64>,
+}
+
+impl Play {
+    fn listened(&self, now: i64) -> i64 {
+        self.banked_ms + self.since.map_or(0, |t| (now - t).max(0))
+    }
+    fn pause(&mut self, now: i64) {
+        self.banked_ms = self.listened(now);
+        self.since = None;
+    }
+    fn resume(&mut self, now: i64) {
+        if self.since.is_none() {
+            self.since = Some(now);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -63,6 +89,9 @@ struct Inner {
     prefetch: VecDeque<(String, Lyrics)>,
     lrclib_tried: HashSet<String>,
     pinned_uri: Option<String>,
+    /// The current track's beat grid (ms, sorted) and tempo from the bridge.
+    beats: Vec<i64>,
+    tempo: f64,
 }
 
 pub struct Engine {
@@ -72,12 +101,17 @@ pub struct Engine {
     pub lrclib_url: String,
     pub lrclib_enabled: AtomicBool,
     pub lrclib_early: Duration,
+    /// LRCLIB retry backoff step (3 s, 6 s); shortened in tests.
+    pub lrclib_backoff: Duration,
     on_change: Box<dyn Fn(&Snapshot) + Send + Sync>,
     events: broadcast::Sender<Event>,
     /// statusify.cfg, once the core feature hands it over (Engine::set_config).
     config: OnceLock<Arc<Config>>,
     /// State shared by the presence loop and the core feature.
     pub core: core_state::Shared,
+    /// Monotonic clock for listening time (tests move it with `advance`).
+    epoch: std::time::Instant,
+    skew_ms: AtomicI64,
 }
 
 /// The blacklist: newline-separated, case-insensitive substrings matched
@@ -117,11 +151,34 @@ impl Engine {
             lrclib_url: lrclib::URL.into(),
             lrclib_enabled: AtomicBool::new(true),
             lrclib_early: LRCLIB_EARLY,
+            lrclib_backoff: Duration::from_secs(3),
             on_change: Box::new(on_change),
             events: broadcast::channel(256).0,
             config: OnceLock::new(),
             core: core_state::Shared::default(),
+            epoch: std::time::Instant::now(),
+            skew_ms: AtomicI64::new(0),
         })
+    }
+
+    /// Monotonic ms for listening time. Tests run on a frozen clock that
+    /// only `advance` moves, so their arithmetic is exact.
+    fn mono_ms(&self) -> i64 {
+        let real = if cfg!(test) { 0 } else { self.epoch.elapsed().as_millis() as i64 };
+        real + self.skew_ms.load(Ordering::Relaxed)
+    }
+
+    /// Move the listening-time clock forward (tests).
+    #[cfg(test)]
+    pub fn advance(&self, ms: i64) {
+        self.skew_ms.fetch_add(ms, Ordering::Relaxed);
+    }
+
+    /// The current track's beat grid (ms) and tempo, as the bridge sent them.
+    #[allow(dead_code)] // for the nowplaying area (beat-synced visuals)
+    pub fn beats(&self) -> (Vec<i64>, f64) {
+        let g = self.inner.lock().unwrap();
+        (g.beats.clone(), g.tempo)
     }
 
     /// Hand over statusify.cfg; settings are read from it live from now on.
@@ -269,6 +326,8 @@ impl Engine {
             // The bridge went away: Spotify is not playing for us any more.
             if was && !g.snap.bridge_connected && g.snap.is_playing {
                 g.snap.is_playing = false;
+                let now = self.mono_ms();
+                g.play.pause(now);
                 self.finish_play(&mut g);
                 paused = true;
             }
@@ -302,8 +361,10 @@ impl Engine {
                 // transition only.
                 let mut g = self.inner.lock().unwrap();
                 if g.snap.is_playing {
-                    g.snap.is_playing = false;
                     self.maybe_commit(&mut g);
+                    g.snap.is_playing = false;
+                    let now = self.mono_ms();
+                    g.play.pause(now);
                     self.finish_play(&mut g);
                     drop(g);
                     self.emit(Event::Paused);
@@ -316,6 +377,7 @@ impl Engine {
             )),
             "lyrics" => self.on_lyrics(msg),
             "lyrics_prefetch" => self.on_prefetch(msg),
+            "beats" => self.on_beats(msg),
             "lyrics_debug" => {
                 let m = s(msg, "message");
                 if !m.is_empty() {
@@ -329,21 +391,33 @@ impl Engine {
     /// Write the listening time of the play in progress.
     fn finish_play(&self, g: &mut Inner) {
         if let (Some(id), Some(st)) = (g.play.id, self.store()) {
-            let _ = st.set_listened(id, g.play.listened_ms);
-            g.play.saved_ms = g.play.listened_ms;
+            let ms = g.play.listened(self.mono_ms());
+            if let Err(e) = st.set_listened(id, ms) {
+                crate::log(&format!("Could not save listening time: {e}"));
+            }
+            g.play.saved_ms = ms;
         }
+    }
+
+    /// Begin a candidate play of the current track (nothing is written yet).
+    fn start_play(&self, g: &mut Inner, uri: &str) {
+        let since = g.snap.is_playing.then(|| self.mono_ms());
+        g.play = Play { uri: uri.to_string(), started_at: now_iso(), since, ..Default::default() };
     }
 
     /// A track becomes a play (history row) only after PLAY_COMMIT_MS of
     /// real listening: opening on a paused song or skipping past one must
     /// not count.
     fn maybe_commit(&self, g: &mut Inner) {
-        if g.play.id.is_some() || g.play.listened_ms < PLAY_COMMIT_MS {
+        if g.play.id.is_some() || g.play.listened(self.mono_ms()) < PLAY_COMMIT_MS {
             return;
         }
         if let (Some(st), Some(t)) = (self.store(), &g.snap.track) {
             if t.uri == g.play.uri && !t.uri.is_empty() {
-                g.play.id = st.record_play(&t.uri, &t.artist, &t.title, &t.album_art, &g.play.started_at).ok();
+                match st.record_play(&t.uri, &t.artist, &t.title, &t.album_art, &g.play.started_at) {
+                    Ok(id) => g.play.id = Some(id),
+                    Err(e) => crate::log(&format!("Could not record play: {e}")),
+                }
             }
         }
     }
@@ -352,8 +426,15 @@ impl Engine {
         let uri = s(m, "track_uri");
         {
             let mut g = self.inner.lock().unwrap();
+            // The bridge repeats track_change for the song already playing on
+            // every reconnect and request_state: that is not a new song. Keep
+            // the interpolated position (a jump to 0 mid-song would make the
+            // presence re-plan from the intro) and the play in progress.
+            let same = !uri.is_empty() && g.snap.track.as_ref().is_some_and(|t| t.uri == uri);
             self.maybe_commit(&mut g); // the previous track, if it earned it
-            self.finish_play(&mut g);
+            if !same {
+                self.finish_play(&mut g);
+            }
             let (artist, title) = (s(m, "artist"), s(m, "title"));
             let blacklisted = is_blacklisted(&self.blacklist(), &artist, &title);
             let track = Track { uri: uri.clone(), artist, title, album: s(m, "album"), album_art: s(m, "album_art"), blacklisted };
@@ -366,12 +447,21 @@ impl Engine {
             self.core.with(|c| c.dropped_lines = 0);
             g.snap.track = Some(track);
             g.snap.duration_ms = i(m, "duration_ms").unwrap_or(0);
-            g.snap.position_ms = 0;
-            g.snap.position_at_ms = now_ms();
+            if !same {
+                g.snap.position_ms = 0;
+                g.snap.position_at_ms = now_ms();
+                g.last_pos_ms = None;
+            }
             g.snap.is_playing = true;
             g.snap.lyrics = Lyrics::none();
-            g.last_pos_ms = None;
-            g.play = Play { uri: uri.clone(), started_at: now_iso(), ..Default::default() };
+            g.beats.clear();
+            g.tempo = 0.0;
+            if same {
+                let now = self.mono_ms();
+                g.play.resume(now);
+            } else {
+                self.start_play(&mut g, &uri);
+            }
             g.pinned_uri = None;
 
             let pin = self.store.as_ref().and_then(|st| st.pinned(&uri));
@@ -398,11 +488,16 @@ impl Engine {
         let mut g = self.inner.lock().unwrap();
         let pos = i(m, "position_ms").unwrap_or(0);
         let playing = m.get("is_playing").and_then(|x| x.as_bool()).unwrap_or(true);
-        // Listening time: forward progress while playing, ignoring seeks.
-        if let Some(prev) = g.last_pos_ms {
-            let d = pos - prev;
-            if playing && (0..=5_000).contains(&d) {
-                g.play.listened_ms += d;
+        let now = self.mono_ms();
+        // The same song starting over (repeat one) is a new play.
+        let dur = i(m, "duration_ms").unwrap_or(g.snap.duration_ms);
+        let est = g.snap.estimated_position(now_ms());
+        if playing && g.snap.is_playing && dur > RESTART_EDGE_MS * 2 && est >= dur - RESTART_EDGE_MS && pos < RESTART_EDGE_MS {
+            if let Some(uri) = g.snap.track.as_ref().map(|t| t.uri.clone()) {
+                self.maybe_commit(&mut g);
+                self.finish_play(&mut g);
+                self.start_play(&mut g, &uri);
+                crate::log("Song started over  ·  counting a new play");
             }
         }
         g.last_pos_ms = Some(pos);
@@ -413,16 +508,24 @@ impl Engine {
         }
         let resumed = playing && !g.snap.is_playing;
         let paused = !playing && g.snap.is_playing;
-        g.snap.is_playing = playing;
-        self.maybe_commit(&mut g);
         if paused {
+            self.maybe_commit(&mut g);
+            g.play.pause(now);
             self.finish_play(&mut g);
+        }
+        g.snap.is_playing = playing;
+        if resumed {
+            g.play.resume(now);
+        }
+        if playing {
+            self.maybe_commit(&mut g);
         }
         // Keep listened_ms current, so a play cut short by quitting still counts.
         if let (Some(id), Some(st)) = (g.play.id, self.store()) {
-            if g.play.listened_ms - g.play.saved_ms >= 5_000 {
-                let _ = st.set_listened(id, g.play.listened_ms);
-                g.play.saved_ms = g.play.listened_ms;
+            let ms = g.play.listened(now);
+            if ms - g.play.saved_ms >= 5_000 {
+                let _ = st.set_listened(id, ms);
+                g.play.saved_ms = ms;
             }
         }
         drop(g);
@@ -444,17 +547,29 @@ impl Engine {
         {
             let mut g = self.inner.lock().unwrap();
             let cur = g.snap.track.as_ref().map(|t| t.uri.clone()).unwrap_or_default();
-            let ours = uri == cur || uri.is_empty();
+            let showing = !g.snap.lyrics.is_none();
+            if l.is_none() && showing && (uri == cur || uri.is_empty()) {
+                // Already showing cached/LRCLIB lyrics; a failed fetch keeps them.
+                crate::log(&format!("Lyrics ({})  ·  none  ·  keeping current lyrics", l.source));
+                return;
+            }
+            // Only this track's lyrics. A missing uri (bridges that predate
+            // the field) is accepted only while nothing is showing, so a late
+            // answer cannot replace lyrics already up.
+            let ours = (!uri.is_empty() && uri == cur) || (uri.is_empty() && !showing);
             if !ours || g.pinned_uri.as_deref() == Some(cur.as_str()) {
                 return; // a late answer for the previous song, or the user's pick stands
             }
             if l.is_none() {
-                if g.snap.lyrics.is_none() {
-                    crate::log("Lyrics: bridge found none");
-                    fetch = Some(cur);
-                } else {
-                    crate::log("Lyrics (none)  ·  keeping current lyrics");
+                // The bridge's verdict: no lyrics. Cached as "none" (never over
+                // real lyrics) for the History tab, then LRCLIB gets a try.
+                crate::log(&format!("Lyrics ({})  ·  none  ·  0 lines", l.source));
+                if let Some(st) = self.store() {
+                    if let Err(e) = core_state::save_none_lyrics(st, &cur, &l.source) {
+                        crate::log(&format!("Could not cache lyrics: {e}"));
+                    }
                 }
+                fetch = Some(cur);
             } else {
                 self.apply(&mut g, l);
             }
@@ -490,6 +605,18 @@ impl Engine {
         }
     }
 
+    fn on_beats(&self, m: &Value) {
+        let uri = s(m, "track_uri");
+        let mut g = self.inner.lock().unwrap();
+        let cur = g.snap.track.as_ref().map(|t| t.uri.clone()).unwrap_or_default();
+        if !uri.is_empty() && uri != cur {
+            return;
+        }
+        let (beats, tempo) = core_state::parse_beats(m);
+        g.beats = beats;
+        g.tempo = tempo;
+    }
+
     fn still_waiting(&self, uri: &str) -> bool {
         let g = self.inner.lock().unwrap();
         g.snap.track.as_ref().is_some_and(|t| t.uri == uri) && g.snap.lyrics.is_none()
@@ -508,8 +635,9 @@ impl Engine {
         });
     }
 
-    /// One LRCLIB lookup per track; a network failure is forgotten so a
-    /// later trigger (the bridge's "none") may retry it.
+    /// One LRCLIB lookup per track; a failed lookup (network, HTTP error,
+    /// bad JSON) is forgotten so a later trigger (the bridge's "none") may
+    /// retry it. Only a real answer with no usable match is final.
     pub fn fetch_lrclib(self: &Arc<Self>, uri: String) {
         if !self.lrclib_enabled.load(Ordering::Relaxed) || uri.is_empty() {
             return;
@@ -524,7 +652,7 @@ impl Engine {
         };
         let me = self.clone();
         tokio::spawn(async move {
-            match lrclib::fetch(&me.http, &me.lrclib_url, &artist, &title, dur).await {
+            match lrclib::fetch_with_backoff(&me.http, &me.lrclib_url, &artist, &title, dur, me.lrclib_backoff).await {
                 Ok(l) => {
                     if me.still_waiting(&uri) {
                         let mut g = me.inner.lock().unwrap();
@@ -534,7 +662,7 @@ impl Engine {
                     }
                 }
                 Err(lrclib::Error::NoMatch) => crate::log(&format!("LRCLIB: no match for {artist} — {title}")),
-                Err(lrclib::Error::Retryable(e)) => {
+                Err(lrclib::Error::Failed(e)) => {
                     crate::log(&format!("LRCLIB lookup failed: {e}"));
                     me.inner.lock().unwrap().lrclib_tried.remove(&uri);
                 }

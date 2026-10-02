@@ -289,10 +289,81 @@ impl BridgeHealth {
     }
 }
 
+// ── Bridge message helpers ────────────────────────────────────────
+
+/// A "beats" message's grid (sorted whole ms) and tempo; anything malformed
+/// gives no beats and tempo 0, as main.py does.
+pub fn parse_beats(m: &Value) -> (Vec<i64>, f64) {
+    let beats = match m.get("beats") {
+        None | Some(Value::Null) => Some(vec![]),
+        Some(Value::Array(a)) => a.iter().map(|b| b.as_f64().map(|f| f as i64)).collect::<Option<Vec<i64>>>(),
+        Some(_) => None,
+    };
+    let tempo = match m.get("tempo") {
+        None | Some(Value::Null) => Some(0.0),
+        Some(v) => v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())),
+    };
+    match (beats, tempo) {
+        (Some(mut b), Some(t)) => {
+            b.sort_unstable();
+            (b, t)
+        }
+        _ => (vec![], 0.0),
+    }
+}
+
+/// Cache a "no lyrics" verdict for `uri` (statusify_history.save_lyrics with
+/// mode "none"): written only when no real lyrics are cached, since a failed
+/// fetch today must not erase what an earlier fetch found.
+pub fn save_none_lyrics(st: &crate::db::Store, uri: &str, source: &str) -> rusqlite::Result<()> {
+    if uri.is_empty() {
+        return Ok(());
+    }
+    st.with_conn(|db| {
+        let mode: Option<String> = db
+            .query_row("SELECT mode FROM lyrics WHERE track_uri=?", [uri], |r| r.get(0))
+            .map(Some)
+            .or_else(|e| if e == rusqlite::Error::QueryReturnedNoRows { Ok(None) } else { Err(e) })?;
+        if mode.is_some_and(|m| m != "none") {
+            return Ok(());
+        }
+        db.execute(
+            "INSERT OR REPLACE INTO lyrics(track_uri, mode, synced, plain, source, fetched_at) VALUES (?,?,?,?,?,?)",
+            rusqlite::params![uri, "none", "[]", "[]", source, crate::db::now_iso()],
+        )?;
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn beats_are_parsed_like_python() {
+        assert_eq!(parse_beats(&json!({"beats": [500.7, 100, 300], "tempo": 120})), (vec![100, 300, 500], 120.0));
+        assert_eq!(parse_beats(&json!({"beats": null, "tempo": "98.5"})), (vec![], 98.5));
+        assert_eq!(parse_beats(&json!({"beats": [1, "x"], "tempo": 120})), (vec![], 0.0));
+        assert_eq!(parse_beats(&json!({"beats": [1], "tempo": "fast"})), (vec![], 0.0));
+    }
+
+    #[test]
+    fn none_verdict_is_cached_but_never_over_real_lyrics() {
+        let dir = std::env::temp_dir().join(format!("statusify-none-{}", crate::state::now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = crate::db::Store::open(&dir).unwrap();
+        save_none_lyrics(&st, "u1", "fallback").unwrap();
+        let mode = |u: &str| st.with_conn(|db| db.query_row("SELECT mode FROM lyrics WHERE track_uri=?", [u], |r| r.get::<_, String>(0)).ok());
+        assert_eq!(mode("u1").as_deref(), Some("none"));
+        assert!(st.cached("u1").is_none()); // a "none" row is not served as lyrics
+        let real = crate::lyrics::Lyrics { mode: "plain".into(), synced: vec![], plain: vec!["x".into()], source: "LRCLIB".into() };
+        st.save_lyrics("u2", &real).unwrap();
+        save_none_lyrics(&st, "u2", "fallback").unwrap();
+        assert_eq!(mode("u2").as_deref(), Some("plain"));
+        drop(st);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn play(uri: &str, pos: i64, playing: bool) -> PlayInfo {
         PlayInfo { uri: uri.into(), duration_ms: 200_000, position_ms: pos, is_playing: playing }

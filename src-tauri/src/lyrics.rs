@@ -104,7 +104,19 @@ pub fn pick_lrclib(results: &serde_json::Value, duration_ms: i64) -> Option<Lyri
         if !r.is_object() || r.get("instrumental").and_then(|v| v.as_bool()).unwrap_or(false) {
             continue;
         }
-        let Some(dur_s) = r.get("duration").and_then(|v| v.as_f64()) else { continue };
+        // float(r.get("duration") or 0): null/missing/false count as 0, a
+        // numeric string is parsed, anything else skips the result.
+        let dur_s = match r.get("duration") {
+            None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)) => 0.0,
+            Some(serde_json::Value::Bool(true)) => 1.0,
+            Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+            Some(serde_json::Value::String(t)) if t.is_empty() => 0.0,
+            Some(serde_json::Value::String(t)) => match t.trim().parse::<f64>() {
+                Ok(f) if f.is_finite() => f,
+                _ => continue,
+            },
+            Some(_) => continue,
+        };
         let diff = if duration_ms > 0 { (dur_s - duration_ms as f64 / 1000.0).abs() } else { 0.0 };
         if duration_ms > 0 && diff > LRCLIB_DURATION_TOLERANCE_S {
             continue;
@@ -282,6 +294,13 @@ mod tests {
         assert_eq!(got.mode, "synced");
         assert_eq!(got.synced[0].words, "right");
         assert!(pick_lrclib(&json!([{"duration": 200, "plainLyrics": "x"}]), 100_000).is_none());
+        // Python's float(duration or 0): null counts as 0 and a numeric
+        // string parses, so both are usable when the track length is unknown.
+        assert!(pick_lrclib(&json!([{"duration": null, "plainLyrics": "x"}]), 0).is_some());
+        assert!(pick_lrclib(&json!([{"duration": null, "plainLyrics": "x"}]), 100_000).is_none());
+        assert!(pick_lrclib(&json!([{"duration": "100.4", "plainLyrics": "x"}]), 100_000).is_some());
+        assert!(pick_lrclib(&json!([{"duration": "abc", "plainLyrics": "x"}]), 0).is_none());
+        assert!(pick_lrclib(&json!([{"duration": [1], "plainLyrics": "x"}]), 0).is_none());
     }
 
     #[test]

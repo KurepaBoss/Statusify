@@ -129,15 +129,24 @@ async fn prefetched_lyrics_are_used_on_track_start() {
     assert!(hits.load(Ordering::SeqCst) <= 1);
 }
 
+fn stored_engine(dir: &std::path::Path) -> Arc<Engine> {
+    let mut e = Engine::new(Some(Store::open(dir).unwrap()), |_| {});
+    Arc::get_mut(&mut e).unwrap().lrclib_enabled = AtomicBool::new(false);
+    e
+}
+
+fn pos(e: &Arc<Engine>, p: i64, playing: bool) {
+    e.handle(&json!({"type":"position","position_ms":p,"duration_ms":100000,"is_playing":playing}));
+}
+
 #[tokio::test]
 async fn plays_commit_after_twenty_seconds_listened() {
-    let dir = std::env::temp_dir().join(format!("statusify-rs-eng-{}", now_ms()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut e = Engine::new(Some(Store::open(&dir).unwrap()), |_| {});
-    Arc::get_mut(&mut e).unwrap().lrclib_enabled = AtomicBool::new(false);
+    let dir = tmpdir("commit");
+    let e = stored_engine(&dir);
     track(&e, "u1");
-    for p in (0..=25_000).step_by(1000) {
-        e.handle(&json!({"type":"position","position_ms":p,"duration_ms":100000,"is_playing":true}));
+    for p in (1000..=25_000).step_by(1000) {
+        e.advance(1000);
+        pos(&e, p, true);
         if p == 15_000 {
             assert!(e.recent_plays(5).is_empty());
         }
@@ -146,13 +155,97 @@ async fn plays_commit_after_twenty_seconds_listened() {
             assert_eq!(e.recent_plays(5)[0].listened_ms, 25_000);
         }
     }
-    // a seek forward must not count as listening
-    e.handle(&json!({"type":"position","position_ms":90_000,"is_playing":true}));
+    // a seek forward is not listening: only the wall-clock time counts
+    e.advance(500);
+    pos(&e, 90_000, true);
     track(&e, "u2");
     let plays = e.recent_plays(5);
     assert_eq!(plays.len(), 1);
     assert_eq!(plays[0].track_uri, "u1");
-    assert_eq!(plays[0].listened_ms, 25_000);
+    assert_eq!(plays[0].listened_ms, 25_500);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn rare_position_pings_still_count_listening_time() {
+    // Spotify minimised: the bridge pings about once a minute.
+    let dir = tmpdir("rare");
+    let e = stored_engine(&dir);
+    track(&e, "u1");
+    e.advance(60_000);
+    pos(&e, 60_000, true);
+    let plays = e.recent_plays(5);
+    assert_eq!(plays.len(), 1, "committed on the first ping after 20 s");
+    assert_eq!(plays[0].listened_ms, 60_000);
+    e.advance(30_000);
+    track(&e, "u2");
+    assert_eq!(e.recent_plays(5)[0].listened_ms, 90_000);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn paused_time_is_not_listening() {
+    let dir = tmpdir("paused");
+    let e = stored_engine(&dir);
+    track(&e, "u1");
+    e.advance(15_000);
+    pos(&e, 15_000, false); // paused at 15 s
+    e.advance(600_000); // ten minutes away
+    pos(&e, 15_000, true); // resumed
+    assert!(e.recent_plays(5).is_empty());
+    e.advance(6_000);
+    pos(&e, 21_000, true);
+    assert_eq!(e.recent_plays(5)[0].listened_ms, 21_000);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn opening_on_a_paused_song_is_not_a_play() {
+    let dir = tmpdir("openpaused");
+    let e = stored_engine(&dir);
+    track(&e, "u1");
+    pos(&e, 5_000, false);
+    e.advance(120_000);
+    pos(&e, 5_000, false);
+    track(&e, "u2");
+    assert!(e.recent_plays(5).is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn repeated_track_change_keeps_position_and_play() {
+    // The bridge re-sends track_change on reconnect / request_state.
+    let dir = tmpdir("same");
+    let e = stored_engine(&dir);
+    track(&e, "u1");
+    e.advance(30_000);
+    pos(&e, 30_000, true);
+    assert_eq!(e.recent_plays(5).len(), 1);
+    track(&e, "u1");
+    let s = e.snapshot();
+    assert!(s.position_ms >= 30_000, "position kept, not reset to 0");
+    e.advance(10_000);
+    pos(&e, 40_000, true);
+    track(&e, "u2");
+    let plays = e.recent_plays(5);
+    assert_eq!(plays.len(), 1, "no duplicate play");
+    assert_eq!(plays[0].listened_ms, 40_000);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_song_starting_over_is_a_new_play() {
+    let dir = tmpdir("repeat");
+    let e = stored_engine(&dir);
+    track(&e, "u1");
+    e.advance(99_000);
+    pos(&e, 99_000, true);
+    e.advance(1_500);
+    pos(&e, 500, true); // repeat one: back to the start
+    e.advance(25_000);
+    pos(&e, 25_500, true);
+    let plays = e.recent_plays(5);
+    assert_eq!(plays.len(), 2);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -165,25 +258,24 @@ fn tmpdir(tag: &str) -> std::path::PathBuf {
 #[tokio::test]
 async fn pause_saves_listening_time_and_history_switch_is_honoured() {
     let dir = tmpdir("pause");
-    let mut e = Engine::new(Some(Store::open(&dir).unwrap()), |_| {});
-    Arc::get_mut(&mut e).unwrap().lrclib_enabled = AtomicBool::new(false);
+    let e = stored_engine(&dir);
     std::fs::write(dir.join("statusify.cfg"), "[preferences]\nsave_history = true\n").unwrap();
     let cfg = Arc::new(crate::config::Config::open(&dir));
     e.set_config(cfg.clone());
     track(&e, "u1");
-    for p in (0..=22_000).step_by(1000) {
-        e.handle(&json!({"type":"position","position_ms":p,"is_playing":true}));
+    for p in (1000..=23_000).step_by(1000) {
+        e.advance(1000);
+        pos(&e, p, true);
     }
-    e.handle(&json!({"type":"position","position_ms":23_000,"is_playing":true}));
+    e.advance(400);
     e.handle(&json!({"type":"paused"}));
-    assert_eq!(e.recent_plays(5)[0].listened_ms, 23_000);
+    assert_eq!(e.recent_plays(5)[0].listened_ms, 23_400);
     // history off: nothing new is recorded
     cfg.set("preferences", "save_history", "false");
     e.config_changed();
     track(&e, "u2");
-    for p in (0..=25_000).step_by(1000) {
-        e.handle(&json!({"type":"position","position_ms":p,"is_playing":true}));
-    }
+    e.advance(25_000);
+    pos(&e, 25_000, true);
     track(&e, "u3");
     assert_eq!(e.recent_plays(5).len(), 1);
     let _ = std::fs::remove_dir_all(dir);
@@ -212,4 +304,89 @@ async fn blacklist_and_offsets_come_from_config() {
     assert_eq!(e.offset_ms(), -300);
     assert_eq!(e.offset_ms_for("spotify:track:other"), 120);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn uri_less_lyrics_never_replace_lyrics_already_showing() {
+    let e = engine("http://127.0.0.1:9/none");
+    e.lrclib_enabled.store(false, Ordering::SeqCst);
+    track(&e, "u1");
+    // an old bridge (no track_uri) while nothing shows: accepted
+    e.handle(&json!({"type":"lyrics","mode":"plain","plain":["first"]}));
+    assert_eq!(e.snapshot().lyrics.plain, vec!["first".to_string()]);
+    // a late URI-less answer must not replace them
+    e.handle(&json!({"type":"lyrics","mode":"plain","plain":["late"]}));
+    assert_eq!(e.snapshot().lyrics.plain, vec!["first".to_string()]);
+    // this track's own lyrics still do
+    e.handle(&json!({"type":"lyrics","track_uri":"u1","mode":"plain","plain":["real"]}));
+    assert_eq!(e.snapshot().lyrics.plain, vec!["real".to_string()]);
+}
+
+#[tokio::test]
+async fn bridge_none_verdict_is_cached_and_tries_lrclib() {
+    let (url, hits) = fake_lrclib(200, "[]").await;
+    let dir = tmpdir("none");
+    let mut e = Engine::new(Some(Store::open(&dir).unwrap()), |_| {});
+    let m = Arc::get_mut(&mut e).unwrap();
+    m.lrclib_url = url;
+    m.lrclib_early = Duration::from_secs(60);
+    track(&e, "u1");
+    e.handle(&json!({"type":"lyrics","track_uri":"u1","mode":"none"}));
+    settle(300).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let mode = e.store.as_ref().unwrap().with_conn(|db| {
+        db.query_row("SELECT mode FROM lyrics WHERE track_uri='u1'", [], |r| r.get::<_, String>(0)).ok()
+    });
+    assert_eq!(mode.as_deref(), Some("none"));
+    // an empty answer is final: no second lookup on another "none"
+    e.handle(&json!({"type":"lyrics","track_uri":"u1","mode":"none"}));
+    settle(200).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    drop(e);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn quick_engine(url: &str) -> Arc<Engine> {
+    let mut e = engine(url);
+    let m = Arc::get_mut(&mut e).unwrap();
+    m.lrclib_early = Duration::from_secs(60);
+    m.lrclib_backoff = Duration::from_millis(10);
+    e
+}
+
+#[tokio::test]
+async fn lrclib_client_errors_are_retryable_later() {
+    let (url, hits) = fake_lrclib(404, "{}").await;
+    let e = quick_engine(&url);
+    track(&e, "u1");
+    e.handle(&json!({"type":"lyrics","track_uri":"u1","mode":"none"}));
+    settle(300).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "a 4xx is not retried at once");
+    assert!(!e.tried("u1"), "but the track is forgotten so it may be looked up again");
+    e.handle(&json!({"type":"lyrics","track_uri":"u1","mode":"none"}));
+    settle(300).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn lrclib_bad_json_is_retried_then_forgotten() {
+    let (url, hits) = fake_lrclib(200, "not json").await;
+    let e = quick_engine(&url);
+    track(&e, "u1");
+    e.handle(&json!({"type":"lyrics","track_uri":"u1","mode":"none"}));
+    settle(500).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+    assert!(!e.tried("u1"));
+}
+
+#[tokio::test]
+async fn beats_follow_the_current_track() {
+    let e = engine("http://127.0.0.1:9/none");
+    track(&e, "u1");
+    e.handle(&json!({"type":"beats","track_uri":"u1","beats":[900, 300],"tempo":120}));
+    assert_eq!(e.beats(), (vec![300, 900], 120.0));
+    e.handle(&json!({"type":"beats","track_uri":"other","beats":[1],"tempo":60}));
+    assert_eq!(e.beats().0, vec![300, 900]);
+    track(&e, "u2");
+    assert_eq!(e.beats(), (vec![], 0.0));
 }

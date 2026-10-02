@@ -7,8 +7,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const RELEASES_URL: &str = "https://api.github.com/repos/KurepaBoss/Statusify/releases";
-/// The version update checks compare against.
-pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The version update checks compare against (and the LRCLIB User-Agent
+/// reports): the Statusify release this rewrite replaces (version.py), NOT
+/// the crate's 0.1.0, which would offer every 1.x/2.x release as an update.
+pub const APP_VERSION: &str = "2.2.0";
+/// Releases install silently only from an installer built for this rewrite.
+/// The Python app's Inno Setup "Statusify-Setup-<tag>.exe" would replace it
+/// with the Python app, so such a release opens its download page instead.
+pub const SETUP_PREFIX: &str = "Statusify-rs-Setup-";
 
 /// The bridge and the Spicetify setup script we ship (byte-exact copies).
 pub const BRIDGE_JS: &[u8] = include_bytes!("../resources/lyrics-bridge.js");
@@ -30,7 +36,7 @@ pub fn version_key(v: &str) -> Vec<u64> {
 /// exist: without a published checksum nothing can verify the download.
 pub fn setup_asset(release: &Value) -> Option<(String, String)> {
     let tag = release.get("tag_name").and_then(|t| t.as_str()).unwrap_or("").trim_start_matches('v');
-    let want = format!("Statusify-Setup-{tag}.exe");
+    let want = format!("{SETUP_PREFIX}{tag}.exe");
     let assets = release.get("assets").and_then(|a| a.as_array())?;
     let url = |name: &str| {
         assets
@@ -246,9 +252,11 @@ mod tests {
     fn update_found_with_changelog_and_installer() {
         let rel = json!([
             {"tag_name": "v2.4.0", "html_url": "https://x/2.4.0", "body": "- new\n\n- more",
-             "assets": [{"name": "Statusify-Setup-2.4.0.exe", "browser_download_url": "https://x/s.exe"},
-                        {"name": "Statusify-Setup-2.4.0.exe.sha256", "browser_download_url": "https://x/s.sha256"}]},
-            {"tag_name": "v2.3.0", "html_url": "https://x/2.3.0", "body": "fix", "assets": []},
+             "assets": [{"name": "Statusify-rs-Setup-2.4.0.exe", "browser_download_url": "https://x/s.exe"},
+                        {"name": "Statusify-rs-Setup-2.4.0.exe.sha256", "browser_download_url": "https://x/s.sha256"}]},
+            {"tag_name": "v2.3.0", "html_url": "https://x/2.3.0", "body": "fix",
+             "assets": [{"name": "Statusify-Setup-2.3.0.exe", "browser_download_url": "https://x/py.exe"},
+                        {"name": "Statusify-Setup-2.3.0.exe.sha256", "browser_download_url": "https://x/py.sha256"}]},
             {"tag_name": "v2.2.0", "body": "old"},
         ]);
         let u = find_update(&rel, "2.2.0").unwrap();
@@ -257,8 +265,14 @@ mod tests {
         assert_eq!(u["setup"]["sha256_url"], "https://x/s.sha256");
         assert_eq!(u["changelog"], "• v2.4.0\n  - new\n  - more\n\n• v2.3.0\n  fix");
         assert!(find_update(&rel, "2.4.0").is_none());
-        // no checksum published: no silent install
+        // the Python app's installer is never run silently over this app
         assert!(setup_asset(&rel[1]).is_none());
+        // no checksum published: no silent install
+        assert!(setup_asset(&json!({"tag_name": "v2.5.0", "assets": [
+            {"name": "Statusify-rs-Setup-2.5.0.exe", "browser_download_url": "https://x/s.exe"}]})).is_none());
+        // this build is 2.2.0, so the Python app's own releases up to it are no update
+        assert_eq!(APP_VERSION, "2.2.0");
+        assert!(find_update(&json!([{"tag_name": "v2.2.0"}, {"tag_name": "v1.2.0"}]), APP_VERSION).is_none());
     }
 
     #[tokio::test]
