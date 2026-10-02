@@ -124,6 +124,9 @@ pub fn normalize(def: &Def, value: &Value) -> Result<String, String> {
             if def.key == "translate_to" && !t.is_empty() && !LANGUAGES.iter().any(|(c, _)| *c == t) {
                 return Err(format!("translate_to: unknown language '{t}'"));
             }
+            if def.key == "lyric_font" {
+                return Ok(validate_font(&t, &fonts_cached()));
+            }
             Ok(if t.is_empty() { def.default.to_string() } else { t })
         }
         Kind::Color => {
@@ -136,6 +139,37 @@ pub fn normalize(def: &Def, value: &Value) -> Result<String, String> {
         }
         // Python: raw.replace("\n", "\\n") on the stripped text.
         Kind::Lines => Ok(text.replace("\r\n", "\n").trim().replace('\n', "\\n")),
+    }
+}
+
+/// The line Python logged when a setting flipped, if it logged one.
+pub fn toggle_log(key: &str, on: bool) -> Option<String> {
+    let word = if on { "enabled" } else { "disabled" };
+    Some(match key {
+        "animations" => format!("Smooth animations {word}"),
+        "show_paused_rpc" => format!("Paused RPC {word}"),
+        "save_history" => format!("Session history {word}"),
+        "always_on_top" => format!("Always on top {word}"),
+        _ => return None,
+    })
+}
+
+/// Store one validated setting, with the side effects Python's toggles had:
+/// the log line, and unlocking a hidden overlay switches it on.
+fn apply(ctx: &Arc<Ctx>, def: &Def, stored: &str) {
+    let was = ctx.config.get_bool(def.section, def.key, def.default == "true");
+    if def.key == "overlay_locked" {
+        crate::shell_window::set_overlay_locked(ctx, stored == "true");
+        return;
+    }
+    ctx.config.set(def.section, def.key, stored);
+    if matches!(def.kind, Kind::Bool) {
+        let now = stored == "true";
+        if now != was {
+            if let Some(line) = toggle_log(def.key, now) {
+                crate::log(&line);
+            }
+        }
     }
 }
 
@@ -154,6 +188,9 @@ fn read(ctx: &Ctx, def: &Def) -> Value {
         }
         Kind::Text => {
             let v = raw.map(|v| v.trim().to_string()).unwrap_or_default();
+            if def.key == "lyric_font" {
+                return json!(validate_font(&v, &fonts_cached()));
+            }
             json!(if v.is_empty() { def.default.to_string() } else { v })
         }
         Kind::Color => {
@@ -186,6 +223,21 @@ pub fn collapsed(cfg: &crate::config::Config) -> Vec<String> {
         .collect()
 }
 
+/// installed_fonts(), remembered for a minute: the settings are read on every
+/// change and the Fonts folder holds hundreds of files.
+fn fonts_cached() -> Vec<String> {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<String>)>> = std::sync::Mutex::new(None);
+    let mut c = CACHE.lock().unwrap();
+    if let Some((at, v)) = c.as_ref() {
+        if at.elapsed() < std::time::Duration::from_secs(60) {
+            return v.clone();
+        }
+    }
+    let v = installed_fonts();
+    *c = Some((std::time::Instant::now(), v.clone()));
+    v
+}
+
 /// Installed lyric fonts, the default first (statusify_textrender.available_families).
 pub fn installed_fonts() -> Vec<String> {
     let mut dirs = vec![std::path::PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| r"C:\Windows".into())).join("Fonts")];
@@ -215,13 +267,42 @@ pub fn fonts_from_files(files_lower: &[String]) -> Vec<String> {
     if has(&|f| f == "consola.ttf") {
         out.push("Consolas".into());
     }
-    if has(&|f| f.starts_with("lexend")) {
+    // The same file patterns as statusify_textrender.FAMILIES["..."]["regular"].
+    if has(&|f| glob_match("lexend-regular.*", f) || glob_match("lexend*wght*.ttf", f)) {
         out.push("Lexend".into());
     }
-    if has(&|f| f.starts_with("opendyslexic")) {
+    if has(&|f| glob_match("opendyslexic-regular.*", f) || glob_match("opendyslexic*regular.*", f)) {
         out.push("OpenDyslexic".into());
     }
     out
+}
+
+/// Shell-style match where `*` is any run of characters (both sides lowercase).
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut rest = name;
+    for (i, part) in parts.iter().enumerate() {
+        if i == 0 {
+            match rest.strip_prefix(part) {
+                Some(r) => rest = r,
+                None => return false,
+            }
+        } else if i == parts.len() - 1 {
+            return rest.ends_with(part) && rest.len() >= part.len();
+        } else {
+            match rest.find(part) {
+                Some(p) => rest = &rest[p + part.len()..],
+                None => return false,
+            }
+        }
+    }
+    rest.is_empty()
+}
+
+/// Python's lyric_font(): a name that is not an installed family is the default.
+pub fn validate_font(name: &str, installed: &[String]) -> String {
+    let n = name.trim();
+    installed.iter().find(|f| f.as_str() == n).cloned().unwrap_or_else(|| DEFAULT_FONT.to_string())
 }
 
 /// Last `n` lines of the log file as {ts, msg, tag}. Tags follow the Python
@@ -271,7 +352,7 @@ impl Feature for Settings {
                 let key = args.get("key").and_then(|k| k.as_str()).ok_or("settings.set: missing key")?;
                 let def = def(key).ok_or_else(|| format!("settings: unknown setting {key}"))?;
                 let stored = normalize(def, args.get("value").unwrap_or(&Value::Null))?;
-                ctx.config.set(def.section, def.key, &stored);
+                apply(ctx, def, &stored);
                 ctx.engine.config_changed();
                 Ok(read(ctx, def))
             }
@@ -284,7 +365,7 @@ impl Feature for Settings {
                     todo.push((def, normalize(def, v)?));
                 }
                 for (def, s) in &todo {
-                    ctx.config.set(def.section, def.key, s);
+                    apply(ctx, def, s);
                 }
                 ctx.engine.config_changed();
                 Ok(json!(true))
@@ -298,6 +379,8 @@ impl Feature for Settings {
                     list.push(id);
                 }
                 ctx.config.set("ui", "collapsed_sections", &list.join(","));
+                // Like every other write: other windows' copies of the settings catch up.
+                ctx.engine.config_changed();
                 Ok(json!(list))
             }
             "read_log" => {
@@ -369,6 +452,63 @@ mod tests {
         let files: Vec<String> = ["segoeui.ttf", "georgia.ttf", "lexend-regular.ttf", "readme.txt", "opendyslexic.txt"].iter().map(|s| s.to_string()).collect();
         assert_eq!(fonts_from_files(&files), vec!["Segoe UI", "Georgia", "Lexend"]);
         assert_eq!(fonts_from_files(&[]), vec!["Segoe UI"]);
+    }
+
+    #[test]
+    fn lexend_and_opendyslexic_need_the_exact_files_python_looks_for() {
+        let f = |names: &[&str]| fonts_from_files(&names.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        // Lexend-Bold alone is not the regular face; Lexend Deca is a different family.
+        assert_eq!(f(&["lexend-bold.ttf"]), vec!["Segoe UI"]);
+        assert_eq!(f(&["lexenddeca-regular.ttf"]), vec!["Segoe UI"]);
+        assert_eq!(f(&["lexend-regular.otf"]), vec!["Segoe UI", "Lexend"]);
+        assert_eq!(f(&["lexend[wght].ttf"]), vec!["Segoe UI", "Lexend"]);
+        assert_eq!(f(&["lexend-variable-wght.ttf"]), vec!["Segoe UI", "Lexend"]);
+        assert_eq!(f(&["lexend[wght].otf"]), vec!["Segoe UI"], "the variable pattern is .ttf only");
+        assert_eq!(f(&["opendyslexic-regular.otf"]), vec!["Segoe UI", "OpenDyslexic"]);
+        assert_eq!(f(&["opendyslexicalta-regular.otf"]), vec!["Segoe UI", "OpenDyslexic"]);
+        assert_eq!(f(&["opendyslexic-bold.otf"]), vec!["Segoe UI"]);
+    }
+
+    #[test]
+    fn glob_star_matches_runs() {
+        assert!(glob_match("a*c", "abc"));
+        assert!(glob_match("a*c", "ac"));
+        assert!(!glob_match("a*c", "ab"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("x.ttf", "x.ttf"));
+        assert!(!glob_match("x.ttf", "x.ttfa"));
+        assert!(glob_match("l*w*.ttf", "lwx.ttf"));
+        assert!(!glob_match("l*w*.ttf", "l.ttf"));
+    }
+
+    #[test]
+    fn unknown_lyric_font_falls_back_to_the_default() {
+        let installed: Vec<String> = ["Segoe UI", "Georgia"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(validate_font("Georgia", &installed), "Georgia");
+        assert_eq!(validate_font(" Georgia ", &installed), "Georgia");
+        assert_eq!(validate_font("Comic Neue", &installed), "Segoe UI");
+        assert_eq!(validate_font("", &installed), "Segoe UI");
+        assert_eq!(validate_font("georgia", &installed), "Segoe UI", "family names are exact, as in Python");
+        // And through the real entry point: garbage never gets stored.
+        assert_eq!(n("lyric_font", json!("Definitely Not A Font")).unwrap(), "Segoe UI");
+        assert_eq!(n("lyric_font", json!("")).unwrap(), "Segoe UI");
+    }
+
+    #[test]
+    fn toggle_log_lines_match_python() {
+        assert_eq!(toggle_log("animations", true).as_deref(), Some("Smooth animations enabled"));
+        assert_eq!(toggle_log("animations", false).as_deref(), Some("Smooth animations disabled"));
+        assert_eq!(toggle_log("show_paused_rpc", true).as_deref(), Some("Paused RPC enabled"));
+        assert_eq!(toggle_log("save_history", false).as_deref(), Some("Session history disabled"));
+        assert_eq!(toggle_log("always_on_top", true).as_deref(), Some("Always on top enabled"));
+        assert_eq!(toggle_log("dark_mode", true), None);
+    }
+
+    #[test]
+    fn percent_signs_survive_the_text_settings() {
+        // Stored verbatim; config.rs escapes them as %% in the file (see its tests).
+        assert_eq!(n("instrumental_text", json!("100% ♪")).unwrap(), "100% ♪");
+        assert_eq!(n("blacklist", json!("50% off\nfoo")).unwrap(), "50% off\\nfoo");
     }
 
     #[test]

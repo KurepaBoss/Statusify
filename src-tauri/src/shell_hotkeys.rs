@@ -133,6 +133,11 @@ pub fn parse_combo(combo: &str) -> Result<(Modifiers, Code), String> {
 
 /// The combo configured for a binding. A missing key means the default; a
 /// present-but-empty value means the user turned that hotkey off.
+///
+/// Deliberate divergence from Python: main.py reads skip/toggle/skip_instr with
+/// `_cfg_get(...) or default`, so clearing one only disabled it until the next
+/// launch. Here an empty value stays off, which is what the person asked for.
+/// (The overlay hotkey never had the `or default` in Python and behaves the same.)
 pub fn configured(ctx: &Ctx, name: &str) -> String {
     let Some((_, key, default)) = BINDINGS.iter().find(|b| b.0 == name) else { return String::new() };
     ctx.config.get("preferences", key).unwrap_or_else(|| (*default).to_string()).trim().to_string()
@@ -147,7 +152,8 @@ fn dispatch(ctx: &Arc<Ctx>, name: &str) {
     let r = match name {
         "skip" => {
             // Python sent {"type": "skip_track"}; the bridge understands it.
-            ctx.outbox.send(json!({"type": "skip_track"}));
+            let sent = ctx.outbox.send(json!({"type": "skip_track"}));
+            crate::log(if sent { "Hotkey: skip track" } else { "Hotkey: skip track - Spotify is not connected" });
             Ok(json!(null))
         }
         "toggle" => ctx.call("core", "toggle_rpc", json!({})),
@@ -211,7 +217,26 @@ pub fn apply(ctx: &Arc<Ctx>) -> HashMap<String, String> {
     for (name, why) in &failed {
         crate::log(&format!("Hotkey '{name}' not active: {why}"));
     }
+    // Python put this on the global error line; the page under Settings is not enough.
+    let current = ctx.engine.snapshot().note;
+    if let Some(note) = next_note(&current, &failed) {
+        ctx.engine.update(|s| s.note = note);
+    }
     failed
+}
+
+const NOTE_PREFIX: &str = "Hotkey not active: ";
+
+/// The error line after a registration round: the failures (in binding order),
+/// or None to leave it alone. A line we wrote earlier is cleared once every
+/// hotkey works; other messages are never touched.
+pub fn next_note(current: &str, failed: &HashMap<String, String>) -> Option<String> {
+    let mut why: Vec<&str> = BINDINGS.iter().filter_map(|b| failed.get(b.0).map(|s| s.as_str())).collect();
+    why.dedup();
+    if !why.is_empty() {
+        return Some(format!("{NOTE_PREFIX}{}", why.join("; ")));
+    }
+    current.starts_with(NOTE_PREFIX).then(String::new)
 }
 
 #[cfg(test)]
@@ -226,6 +251,23 @@ mod tests {
         let (m, c) = parse_combo("Ctrl + Alt + N").unwrap();
         assert_eq!(m, Modifiers::CONTROL | Modifiers::ALT);
         assert_eq!(c, Code::KeyN);
+    }
+
+    #[test]
+    fn hotkey_failures_reach_the_error_line() {
+        let mut failed = HashMap::new();
+        assert_eq!(next_note("", &failed), None);
+        failed.insert("toggle".to_string(), "'ctrl+alt+s' is already in use by another program".to_string());
+        failed.insert("skip".to_string(), "unknown key 'zz' in 'ctrl+zz'".to_string());
+        // Binding order (skip before toggle), not map order.
+        assert_eq!(
+            next_note("", &failed).as_deref(),
+            Some("Hotkey not active: unknown key 'zz' in 'ctrl+zz'; 'ctrl+alt+s' is already in use by another program")
+        );
+        // Fixed: our own line goes away, anyone else's stays.
+        let none = HashMap::new();
+        assert_eq!(next_note("Hotkey not active: x", &none).as_deref(), Some(""));
+        assert_eq!(next_note("Port 8765 is in use", &none), None);
     }
 
     #[test]

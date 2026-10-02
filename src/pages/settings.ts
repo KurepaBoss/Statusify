@@ -1,7 +1,7 @@
 // Settings page (owner: shell agent). Port of the Python app's Settings page:
 // grouped cards, one control per row, everything saves as you change it.
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { call, onSnapshot, type Snapshot } from "../api";
+import { call, onSnapshot, player, position, seek, type Snapshot } from "../api";
 import { getPrefs, initTheme, onPrefs, refreshPrefs, setPrefs, type Prefs } from "./settings_theme";
 import "./settings.css";
 
@@ -72,15 +72,6 @@ function dialog(title: string, body: Node[], buttons: DialogBtn[]): void {
   });
   document.body.append(back);
   (box.querySelector("input") ?? bar.querySelector<HTMLElement>(".primary"))?.focus();
-}
-
-function confirmDialog(title: string, text: string, ok: string): Promise<boolean> {
-  return new Promise((res) => {
-    dialog(title, [h("p", "set-dialog-text", text)], [
-      { text: "Not now", kind: "ghost", run: () => res(false) },
-      { text: ok, kind: "primary", run: () => res(true) },
-    ]);
-  });
 }
 
 // ── controls ─────────────────────────────────────────────────────
@@ -255,13 +246,22 @@ export function parseMinutes(text: string): number | null {
 // running timer reads as Custom.
 let sleepChoice: string | null = null;
 let sleepCustomOpen = false;
-function sleepKey(): string {
-  const label = String(core().sleep_label || "");
-  if (sleepCustomOpen) return "custom";
+let lastSleepLabel = "";
+/** Which segment is lit. core publishes sleep_value ("off" | "eos" | minutes), so a
+ *  timer started from the tray or the Lyrics page lights the right one too. */
+export function sleepSegment(value: unknown, label: string, custom: boolean, choice: string | null): string {
+  if (custom) return "custom";
+  if (typeof value === "string") {
+    if (value === "off" || value === "") return "off";
+    if (value === "eos") return "eos";
+    return ["15", "30", "60"].includes(value) ? value : "custom";
+  }
+  // Older core without sleep_value: infer from the label.
   if (!label) return "off";
-  if (/end of song/i.test(label)) return "eos";
-  return sleepChoice && ["15", "30", "60"].includes(sleepChoice) ? sleepChoice : "custom";
+  if (!/^\d+:\d{2}$/.test(label.trim())) return "eos"; // "End of song" and friends, not a countdown
+  return choice && ["15", "30", "60"].includes(choice) ? choice : "custom";
 }
+const sleepKey = () => sleepSegment(core().sleep_value, String(core().sleep_label || ""), sleepCustomOpen, sleepChoice);
 
 async function restartNow() {
   try {
@@ -311,17 +311,22 @@ function build(): HTMLElement {
       el.hidden = !(missing || shell.needs_restart === true);
       bannerText.textContent = missing
         ? "No Discord App ID yet, so your status is off. Add one under Discord below."
-        : "Discord App ID changed. Restart Statusify to use it.";
+        : "Discord App ID changed. Press Reconnect under Discord, or restart Statusify.";
       bannerBtn.hidden = missing;
     }),
   );
 
   // ── Lyrics ──
   const track = () => !!snap?.track;
+  // Python's _refresh_track_offset: "global (+N ms)" muted when the track has no
+  // offset of its own, else "+N ms" in the accent. core says which one it is.
+  const signed = (ms: number) => `${ms >= 0 ? "+" : ""}${ms}`;
+  const ownOffset = () => (typeof core().track_offset_is_song === "boolean" ? core().track_offset_is_song === true : Number(core().track_offset_ms ?? 0) !== 0);
   const offsetText = () => {
     if (!track()) return "No track";
     const ms = Number(core().track_offset_ms ?? 0);
-    return `${ms > 0 ? "+" : ""}${ms} ms`;
+    if (ownOffset()) return `${signed(ms)} ms`;
+    return `global (${signed(Number(core().global_delay_ms ?? ms))} ms)`;
   };
   const needTrack = (fn: () => Promise<unknown>) => async () => {
     if (!track()) return toast("No track playing, so there is no per-track offset to change");
@@ -347,7 +352,7 @@ function build(): HTMLElement {
       desc: "Shifts the timing of the song that's playing, like the Lyrics page's delay stepper. Shift-click that stepper to change the global delay instead.",
       ctl: group(
         btn("−250", needTrack(() => call("core", "nudge_track_offset", { delta_ms: -250 }))),
-        value(offsetText, 72, () => track() && Number(core().track_offset_ms ?? 0) !== 0),
+        value(offsetText, 96, () => track() && ownOffset()),
         btn("+250", needTrack(() => call("core", "nudge_track_offset", { delta_ms: 250 }))),
         btn("Reset", needTrack(() => call("core", "set_track_offset", { ms: null })), "ghost"),
       ),
@@ -492,7 +497,7 @@ function build(): HTMLElement {
     {
       title: "Sleep timer",
       desc: "Pause Spotify after a while, or when this song ends (Song). Forgotten when Statusify closes.",
-      ctl: value(() => String(core().sleep_label || "Off"), 72),
+      ctl: value(() => String(core().sleep_label || "Off"), 72, () => !!core().sleep_label),
     },
     { full: sleepSeg },
     { full: customRow },
@@ -506,8 +511,14 @@ function build(): HTMLElement {
     {
       title: "Launch when Windows starts",
       ctl: sw(() => !!shell.autostart, async (v) => {
+        const before = !!shell.autostart;
         shell.autostart = v;
-        shell.autostart = await call("shell", "set_autostart", { enabled: v });
+        try {
+          shell.autostart = await call("shell", "set_autostart", { enabled: v });
+        } catch (e) {
+          shell.autostart = before; // the change did not happen; show the truth
+          throw e;
+        }
       }),
     },
     { title: "Window position", desc: "Move the window back to the centre of the screen.", ctl: btn("Centre", () => void call("shell", "center_window").catch(fail)) },
@@ -545,9 +556,9 @@ function build(): HTMLElement {
       await call("shell", "reconnect_rpc");
       toast("Reconnecting to Discord…");
     } catch (e) {
-      if (!String(e).includes("restart_required")) return fail(e);
-      if (await confirmDialog("Reconnect to Discord", "Statusify can't reset the Discord connection on its own yet. Restart it to reconnect? Your status comes back within a few seconds.", "Restart")) await restartNow();
+      fail(e);
     }
+    void refreshShell();
   };
   const discord = card([
     {
@@ -570,7 +581,7 @@ function build(): HTMLElement {
         btn("Add…", addProfileDialog),
         btn("Switch to selected", () => {
           const p = selected();
-          if (p) void merge(call("shell", "switch_profile", { app_id: p.app_id })).then(() => toast("Profile saved. Restart Statusify to use it."));
+          if (p) void merge(call("shell", "switch_profile", { app_id: p.app_id })).then(() => toast(`Switched to ${p.name}. Reconnecting to Discord…`));
         }),
         h("span", "grow"),
         btn("Delete", () => {
@@ -718,25 +729,101 @@ function firstRunDialog() {
           err.textContent = String(e);
           return false;
         }
-        window.setTimeout(async () => {
-          if (await confirmDialog("Connect to Discord", "Saved. Statusify needs a quick restart to connect to Discord.", "Restart now")) await restartNow();
-        }, 50);
+        // The connection starts straight away; no restart needed.
+        window.setTimeout(() => toast("Saved. Connecting to Discord…"), 50);
       },
     },
   ]);
 }
 
-// In-app keys that belong to the shell: Ctrl+1..4 switch tabs, Ctrl+T is always on top.
+/** True while a key press belongs to a text field (or similar), not to the app. */
+function typing(e: KeyboardEvent): boolean {
+  const t = e.target as HTMLElement | null;
+  if (!t || !t.tagName) return false;
+  if (t.isContentEditable) return true;
+  if (t.tagName === "TEXTAREA" || t.tagName === "SELECT") return true;
+  if (t.tagName === "INPUT") return !["checkbox", "button", "submit", "color"].includes((t as HTMLInputElement).type);
+  return false;
+}
+
+/** Python's volume step: 5 %, kept on the 5 % grid. */
+export function volumeStep(v: number, dir: 1 | -1): number {
+  return Math.min(1, Math.max(0, Math.round((v + dir * 0.05) * 20) / 20));
+}
+
+/** Where a seek key lands: never past one second before the end (Python's _key_seek). */
+export function seekTarget(pos: number, delta: number, dur: number): number {
+  return Math.max(0, Math.min(dur - 1000, pos + delta));
+}
+
+// Window-scoped keys, ported from App._bind_shortcuts. They only fire while Statusify has
+// focus (the global hotkeys are separate), so plain keys are safe, but never while typing.
 function bindKeys() {
   const pages = ["now", "history", "stats", "settings"];
+  const tab = (id: string) => document.querySelector<HTMLElement>(`.tab[data-page="${id}"]`);
+  const quiet = (p: Promise<unknown>) => void p.catch(() => undefined);
   window.addEventListener("keydown", (e) => {
-    if (!e.ctrlKey || e.altKey || e.shiftKey || e.metaKey) return;
-    if (e.key >= "1" && e.key <= "4") {
-      e.preventDefault();
-      document.querySelector<HTMLElement>(`.tab[data-page="${pages[Number(e.key) - 1]}"]`)?.click();
-    } else if (e.key.toLowerCase() === "t") {
-      e.preventDefault();
+    if (e.defaultPrevented || e.isComposing) return;
+    const ctrl = e.ctrlKey && !e.altKey && !e.metaKey;
+    const plain = !e.ctrlKey && !e.altKey && !e.metaKey;
+    const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    const used = () => e.preventDefault();
+
+    if (ctrl && !e.shiftKey && key >= "1" && key <= "4") {
+      used();
+      tab(pages[Number(key) - 1])?.click();
+    } else if (ctrl && key === "t") {
+      used();
       void setPref("always_on_top", !P().always_on_top).catch(fail);
+    } else if (ctrl && key === "m") {
+      used();
+      quiet(call("windows", "toggle_mini"));
+    } else if (ctrl && key === "f") {
+      used();
+      tab("history")?.click();
+      window.setTimeout(() => {
+        const box = document.querySelector<HTMLInputElement>('#page-history input[type="search"]');
+        box?.focus();
+        box?.select();
+      }, 30);
+    } else if (e.key === "F11" && !e.ctrlKey && !e.altKey) {
+      used();
+      quiet(call("shell", "toggle_fullscreen"));
+    } else if (e.key === "Escape" && plain) {
+      // Dialogs and panels close themselves first; this only leaves fullscreen.
+      if (!document.querySelector(".set-modal")) quiet(call("shell", "exit_fullscreen"));
+    } else if (ctrl && key === "c") {
+      // Copy the current lyric, unless something is selected (then it is a normal copy).
+      const line = String(core().line ?? "").trim();
+      if (!typing(e) && !window.getSelection()?.toString() && line) {
+        used();
+        void navigator.clipboard?.writeText(line).catch(() => undefined);
+      }
+    } else if (typing(e)) {
+      return;
+    } else if (plain && key === " ") {
+      // A focused button keeps Space for itself (it clicks it).
+      if ((e.target as HTMLElement).closest?.("button, a, [role=switch], summary")) return;
+      used();
+      void player("toggle");
+    } else if (ctrl && key === "ArrowLeft") {
+      used();
+      void player("prev");
+    } else if (ctrl && key === "ArrowRight") {
+      used();
+      void player("next");
+    } else if (ctrl && (key === "ArrowUp" || key === "ArrowDown")) {
+      used();
+      const v = Number(snap?.extras?.player?.volume ?? 1);
+      quiet(call("nowplaying", "set_volume", { value: volumeStep(Number.isFinite(v) ? v : 1, key === "ArrowUp" ? 1 : -1) }));
+    } else if (ctrl && (key === "s" || key === "r" || key === "l")) {
+      used();
+      void player(key === "s" ? "shuffle" : key === "r" ? "repeat" : "like");
+    } else if (plain && (key === "ArrowLeft" || key === "ArrowRight")) {
+      // Seeking only makes sense on Now Playing.
+      if (document.body.dataset.page !== "now" || !snap || snap.duration_ms <= 0) return;
+      used();
+      void seek(seekTarget(position(snap), key === "ArrowLeft" ? -5000 : 5000, snap.duration_ms));
     }
   });
 }
@@ -757,6 +844,13 @@ export function mount(root: HTMLElement) {
     snap = s;
     // The shell pushes small facts on every change; mirror them without a round trip.
     if (s.extras?.shell) shell = { ...shell, ...s.extras.shell };
+    // The timer fired (or was cancelled elsewhere): Python closes Custom and forgets the choice.
+    const label = String(core().sleep_label || "");
+    if (lastSleepLabel && !label) {
+      sleepCustomOpen = false;
+      sleepChoice = null;
+    }
+    lastSleepLabel = label;
     syncAll();
   });
   call<{ code: string; name: string }[]>("settings", "languages").then((l) => (languages = l)).finally(syncAll).catch(() => undefined);

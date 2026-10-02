@@ -8,7 +8,8 @@
 //! Actions: get_state, set_autostart {enabled}, set_hotkeys {skip, toggle,
 //! skip_instr, overlay}, center_window, create_shortcut, add_profile {name,
 //! app_id}, delete_profile {name}, switch_profile {app_id}, set_app_id
-//! {app_id}, restart_app, reconnect_rpc, show_window, hide_to_tray, quit.
+//! {app_id} (both apply live, no restart), restart_app, reconnect_rpc, show_window,
+//! hide_to_tray, toggle_fullscreen, exit_fullscreen, quit.
 
 use super::{Ctx, Feature};
 use crate::{shell_hotkeys as hk, shell_tray::Tray, shell_window as win};
@@ -93,9 +94,11 @@ fn configured_app_id(ctx: &Ctx) -> Option<String> {
     std::fs::read_to_string(env_path(ctx)).ok().and_then(|t| env_get(&t, "DISCORD_APP_ID"))
 }
 
-/// The id this process started with.
+/// The id the Discord connection is using right now (not the process
+/// environment: dotenvy sets that once at launch and a live switch changes
+/// the connection, not the environment).
 fn running_app_id() -> Option<String> {
-    std::env::var("DISCORD_APP_ID").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    crate::running_app_id()
 }
 
 fn write_app_id(ctx: &Ctx, id: &str) -> Result<(), String> {
@@ -106,6 +109,81 @@ fn write_app_id(ctx: &Ctx, id: &str) -> Result<(), String> {
     crate::log(&format!("Discord App ID saved: {id}"));
     ctx.engine.config_changed();
     Ok(())
+}
+
+/// Python's _reconnect_rpc + the loop that follows it: drop the Discord pipe and
+/// connect again with the App ID in .env. This is also how a profile switch
+/// takes effect, with no restart. Returns the id in use.
+fn reconnect_discord(ctx: &Arc<Ctx>) -> Result<String, String> {
+    let id = configured_app_id(ctx).or_else(running_app_id).ok_or("No Discord App ID yet. Add one under Discord first.")?;
+    // A changed id needs a fresh connection; the same id can try the core
+    // feature's lighter pipe reset first (when it has one).
+    if running_app_id().as_deref() == Some(id.as_str()) {
+        match ctx.call("core", "reconnect_rpc", json!({})) {
+            Ok(_) => {
+                crate::log("Discord reconnect requested");
+                return Ok(id);
+            }
+            Err(e) if e.contains("unknown action") || e.contains("no feature") => {}
+            Err(e) => return Err(e),
+        }
+    }
+    crate::start_discord(&ctx.engine, &id);
+    crate::log(&format!("Discord reconnecting with App ID {id}"));
+    Ok(id)
+}
+
+// ── Start with Windows ───────────────────────────────────────────
+
+/// The Startup-folder shortcut the Python app creates
+/// (statusify_startup._startup_lnk_path), under the given %APPDATA%.
+pub fn legacy_startup_lnk_in(appdata: &std::path::Path) -> std::path::PathBuf {
+    appdata.join("Microsoft").join("Windows").join("Start Menu").join("Programs").join("Startup").join("Statusify.lnk")
+}
+
+fn legacy_startup_lnk() -> Option<std::path::PathBuf> {
+    std::env::var_os("APPDATA").map(|a| legacy_startup_lnk_in(std::path::Path::new(&a)))
+}
+
+/// Start with Windows is on when either launcher exists: this app's Run entry
+/// or the Python app's shortcut (which would start the old app at boot).
+pub fn startup_enabled(plugin_on: bool, legacy_lnk: bool) -> bool {
+    plugin_on || legacy_lnk
+}
+
+/// Delete the old shortcut so two launchers never fight over port 8765.
+/// Returns whether one was removed.
+pub fn remove_legacy_lnk(lnk: &std::path::Path) -> bool {
+    std::fs::remove_file(lnk).is_ok()
+}
+
+fn autostart_now(ctx: &Ctx) -> bool {
+    startup_enabled(ctx.app.autolaunch().is_enabled().unwrap_or(false), legacy_startup_lnk().is_some_and(|p| p.exists()))
+}
+
+/// Turn Start with Windows on or off, migrating away from the Python shortcut.
+fn set_autostart(ctx: &Ctx, on: bool) -> Result<bool, String> {
+    let al = ctx.app.autolaunch();
+    if on {
+        al.enable().map_err(|e| format!("Could not change start with Windows: {e}"))?;
+        // Enabling here replaces the Python app's launcher.
+        if legacy_startup_lnk().is_some_and(|p| remove_legacy_lnk(&p)) {
+            crate::log("Replaced the old Startup shortcut with this app's own entry");
+        }
+    } else {
+        // Nothing to remove is not an error (Python ignored FileNotFoundError too).
+        if al.is_enabled().unwrap_or(false) {
+            al.disable().map_err(|e| format!("Could not change start with Windows: {e}"))?;
+        }
+        if let Some(p) = legacy_startup_lnk() {
+            if p.exists() && !remove_legacy_lnk(&p) {
+                return Err("Could not remove the old Startup shortcut".into());
+            }
+        }
+    }
+    let now = autostart_now(ctx);
+    crate::log(&format!("Launch with Windows {}", if now { "enabled" } else { "disabled" }));
+    Ok(now)
 }
 
 // ── Desktop shortcut / restart ───────────────────────────────────
@@ -151,21 +229,29 @@ fn create_desktop_shortcut() -> Result<String, String> {
 fn relaunch(ctx: &Ctx) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     win::quit_prepare(ctx);
+    relaunch_command(&exe).spawn().map_err(|e| format!("Could not restart: {e}"))?;
+    crate::log("Restarting");
+    ctx.app.exit(0);
+    Ok(())
+}
+
+/// The command that starts the new copy. It must NOT inherit DISCORD_APP_ID:
+/// lib.rs loaded .env into this process's environment at launch, and dotenvy
+/// never overrides a variable that is already set, so a child that inherited
+/// it would run on the old App ID however .env has changed since.
+pub fn relaunch_command(exe: &std::path::Path) -> std::process::Command {
     #[cfg(windows)]
-    {
+    let mut c = {
         use std::os::windows::process::CommandExt;
         let mut c = std::process::Command::new("cmd.exe");
         c.raw_arg(format!("/C ping -n 3 127.0.0.1 >nul & start \"\" \"{}\"", exe.display()));
         c.creation_flags(0x0800_0000);
-        c.spawn().map_err(|e| format!("Could not restart: {e}"))?;
-    }
+        c
+    };
     #[cfg(not(windows))]
-    {
-        std::process::Command::new(&exe).spawn().map_err(|e| format!("Could not restart: {e}"))?;
-    }
-    crate::log("Restarting");
-    ctx.app.exit(0);
-    Ok(())
+    let mut c = std::process::Command::new(exe);
+    c.env_remove("DISCORD_APP_ID");
+    c
 }
 
 impl Inner {
@@ -217,7 +303,7 @@ impl Inner {
             "version": env!("CARGO_PKG_VERSION"),
             "data_dir": ctx.data_dir.to_string_lossy(),
             "tray": self.tray.exists(),
-            "autostart": ctx.app.autolaunch().is_enabled().unwrap_or(false),
+            "autostart": autostart_now(ctx),
             "hotkeys": hotkeys,
             "hotkey_defaults": defaults,
             "hotkey_errors": *self.errors.lock().unwrap(),
@@ -255,6 +341,7 @@ impl Feature for Shell {
                 let _ = w.show();
             }
         }
+        win::startup_handled();
         me.sync_hotkeys(ctx, true);
         me.push_state(ctx);
 
@@ -287,16 +374,10 @@ impl Feature for Shell {
             "get_state" => Ok(me.state(ctx)),
             "set_autostart" => {
                 let on = args.get("enabled").and_then(|v| v.as_bool()).ok_or("shell.set_autostart: missing enabled")?;
-                let al = ctx.app.autolaunch();
-                let r = if on { al.enable() } else { al.disable() };
-                if let Err(e) = r {
-                    crate::log(&format!("Startup change failed: {e}"));
-                    return Err(format!("Could not change start with Windows: {e}"));
-                }
-                let now = al.is_enabled().unwrap_or(on);
-                crate::log(&format!("Launch with Windows {}", if now { "enabled" } else { "disabled" }));
-                Ok(json!(now))
+                set_autostart(ctx, on).map(|now| json!(now)).inspect_err(|e| crate::log(&format!("Startup change failed: {e}")))
             }
+            "toggle_fullscreen" => Ok(json!(win::toggle_fullscreen(&ctx.app))),
+            "exit_fullscreen" => Ok(json!(win::exit_fullscreen(&ctx.app))),
             "set_hotkeys" => {
                 for (name, key, _) in hk::BINDINGS {
                     if let Some(v) = s(name) {
@@ -332,16 +413,17 @@ impl Feature for Shell {
                     return Err("App ID must be a long numeric ID (e.g. 1480612100416999474)".into());
                 }
                 write_app_id(ctx, &id)?;
+                // Takes effect now: no restart (Python needed Switch, then Reconnect).
+                reconnect_discord(ctx)?;
                 me.push_state(ctx);
                 Ok(me.state(ctx))
             }
             "restart_app" => relaunch(ctx).map(|_| json!(true)),
-            "reconnect_rpc" => match ctx.call("core", "reconnect_rpc", json!({})) {
-                Ok(v) => Ok(v),
-                // Nothing can drop the Discord pipe yet; the page offers a restart instead.
-                Err(e) if e.contains("unknown action") || e.contains("no feature") => Err("restart_required".into()),
-                Err(e) => Err(e),
-            },
+            "reconnect_rpc" => {
+                let r = reconnect_discord(ctx).map(|id| json!({"app_id": id}));
+                me.push_state(ctx);
+                r
+            }
             "show_window" => {
                 win::show_main(&ctx.app);
                 Ok(json!(true))
@@ -392,6 +474,29 @@ mod tests {
         assert!(check_profile("a[1]", id).unwrap_err().contains("cannot contain"));
         assert!(check_profile("x", "12345").unwrap_err().contains("long numeric"));
         assert!(check_profile("x", "14806121004169994ab").unwrap_err().contains("long numeric"));
+    }
+
+    #[test]
+    fn relaunched_copy_does_not_inherit_the_old_app_id() {
+        let c = relaunch_command(std::path::Path::new(r"C:\x\statusify.exe"));
+        // env_remove registers (key, None): the child gets the variable stripped.
+        assert!(c.get_envs().any(|(k, v)| k == "DISCORD_APP_ID" && v.is_none()), "{:?}", c.get_envs().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn legacy_startup_shortcut_is_found_and_removed() {
+        let root = std::env::temp_dir().join(format!("statusify-startup-{}", crate::state::now_ms()));
+        let lnk = legacy_startup_lnk_in(&root);
+        assert!(lnk.ends_with(r"Microsoft\Windows\Start Menu\Programs\Startup\Statusify.lnk") || lnk.ends_with("Startup/Statusify.lnk"));
+        std::fs::create_dir_all(lnk.parent().unwrap()).unwrap();
+        std::fs::write(&lnk, b"x").unwrap();
+        assert!(startup_enabled(false, lnk.exists()), "the Python shortcut counts as enabled");
+        assert!(!startup_enabled(false, false));
+        assert!(startup_enabled(true, false));
+        assert!(remove_legacy_lnk(&lnk));
+        assert!(!lnk.exists());
+        assert!(!remove_legacy_lnk(&lnk), "already gone is not a success");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

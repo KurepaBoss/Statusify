@@ -5,6 +5,7 @@
 // backend emits it after any statusify.cfg change, from any window or the
 // tray) and writes the result onto <html>:
 //   data-theme="dark|light"        data-motion="on|off"      data-quality="auto|high|low"
+//   data-tint="on|off"            data-cover="on|off"  (cover mode: album colours on and dark theme)
 //   --accent, --accent-fg          (user accent, or the cover's when "Colours from the album art" is on)
 //   --lyric-font, --lyric-boost    (lyric font family, size bump in px)
 // Pages can also call onPrefs(cb) / getPrefs() for the raw values.
@@ -57,7 +58,14 @@ function paint() {
   const accent = effectiveAccent(p, palette);
   root.style.setProperty("--accent", accent);
   root.style.setProperty("--accent-fg", accentFg(accent));
-  if (palette && isHex(palette.tint)) root.style.setProperty("--tint", palette.tint);
+  // Cover mode, as in Python (_cover_mode): album colours on AND the dark theme.
+  // Light theme or album colours off is the flat palette, so the blurred cover
+  // backdrop (styles.css #backdrop) hides; settings.css reads data-cover.
+  const tinted = p.album_tint !== false;
+  root.dataset.tint = tinted ? "on" : "off";
+  root.dataset.cover = tinted && p.dark_mode !== false ? "on" : "off";
+  if (tinted && palette && isHex(palette.tint)) root.style.setProperty("--tint", palette.tint);
+  else root.style.removeProperty("--tint");
   const font = String(p.lyric_font || "Segoe UI").replace(/["\\]/g, "");
   root.style.setProperty("--lyric-font", `"${font}", "Segoe UI", system-ui, sans-serif`);
   root.style.setProperty("--lyric-boost", `${Number(p.lyric_font_boost) || 0}px`);

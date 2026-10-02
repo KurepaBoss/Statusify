@@ -16,9 +16,13 @@
   --warn: #a15c00;
   color-scheme: light;
 }
-:root[data-theme="light"] #backdrop { filter: blur(48px) saturate(1.2) brightness(1.25) opacity(0.55); }
+/* Cover mode (Python: ALBUM_TINT and dark mode and a cover): only then does the blurred cover show.
+   Light theme, or "Colours from the album art" off, is the flat palette. */
+:root[data-cover="off"] #backdrop { opacity: 0 !important; }
+:root[data-cover="off"] #shade,
+:root[data-cover="off"] body:not([data-page="now"]) #shade { background: transparent; }
 :root[data-theme="light"] #shade,
-:root[data-theme="light"] body:not([data-page="now"]) #shade { background: rgba(255, 255, 255, 0.55); }
+:root[data-theme="light"] body:not([data-page="now"]) #shade { background: transparent; }
 :root[data-theme="light"] .tab:hover { background: rgba(0, 0, 0, 0.06); }
 :root[data-theme="light"] .tab.on { background: rgba(0, 0, 0, 0.1); }
 /* Motion off: every transition and animation snaps. */

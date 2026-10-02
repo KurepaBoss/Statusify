@@ -61,15 +61,51 @@ pub fn tray_tooltip(title: &str, artist: &str, lyric: &str, playing: bool, limit
     head
 }
 
+/// The lyric offset in force for a track: its own [offsets] entry, else the
+/// global delay (statusify_lyrics.resolve_offset_ms).
+fn lyric_offset_ms(ctx: &Ctx, uri: &str) -> i64 {
+    let global = ctx.config.get_i64("preferences", "lyric_delay_ms", 0);
+    let key = uri.rsplit(':').next().unwrap_or("");
+    if key.is_empty() {
+        return global;
+    }
+    match ctx.config.get("offsets", key).map(|v| v.trim().to_string()) {
+        Some(v) if !v.is_empty() => v.parse::<i64>().unwrap_or(global),
+        _ => global,
+    }
+}
+
+/// The line the tooltip shows: the sung line (offset applied; interpolated
+/// across the track for plain lyrics, as select_line does), else what the
+/// presence shows when there is nothing to sing (instrumental text, ...).
+pub fn tooltip_lyric(lyrics: &crate::lyrics::Lyrics, pos_ms: i64, duration_ms: i64, discord_line: &str) -> String {
+    match lyrics.mode.as_str() {
+        "synced" if !lyrics.synced.is_empty() => {
+            crate::lyrics::current_index(&lyrics.synced, pos_ms).map(|i| lyrics.synced[i].words.clone()).unwrap_or_default()
+        }
+        "plain" if !lyrics.plain.is_empty() && duration_ms > 0 => {
+            let ratio = (pos_ms as f64 / duration_ms as f64).clamp(0.0, 1.0);
+            let i = ((ratio * lyrics.plain.len() as f64) as usize).min(lyrics.plain.len() - 1);
+            lyrics.plain[i].clone()
+        }
+        "synced" | "plain" => String::new(),
+        _ => discord_line.to_string(),
+    }
+}
+
 /// What the tray shows right now, derived from the engine snapshot.
 fn tooltip_now(ctx: &Ctx) -> String {
     let s = ctx.engine.snapshot();
     let Some(t) = &s.track else { return tray_tooltip("", "", "", false, 127) };
-    let pos = s.estimated_position(crate::state::now_ms());
-    let lyric = match s.lyrics.mode.as_str() {
-        "synced" => crate::lyrics::current_index(&s.lyrics.synced, pos).map(|i| s.lyrics.synced[i].words.clone()).unwrap_or_default(),
-        _ => String::new(),
-    };
+    let pos = s.estimated_position(crate::state::now_ms()) + lyric_offset_ms(ctx, &t.uri);
+    let core = s.extras.get("core");
+    let text = |k: &str| core.and_then(|c| c.get(k)).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    // Instrumental, blacklisted or lyric-less: whatever the presence loop shows.
+    let mut idle = text("discord_line");
+    if idle.is_empty() && core.and_then(|c| c.get("in_instrumental")).and_then(|v| v.as_bool()).unwrap_or(false) {
+        idle = ctx.config.get_or("preferences", "instrumental_text", crate::features::settings::INSTRUMENTAL_DEFAULT);
+    }
+    let lyric = tooltip_lyric(&s.lyrics, pos, s.duration_ms, &idle);
     tray_tooltip(&t.title, &t.artist, &lyric, s.is_playing, 127)
 }
 
@@ -108,10 +144,12 @@ pub fn toggle_always_on_top(ctx: &Arc<Ctx>) {
     ctx.engine.config_changed();
 }
 
+/// Flip the overlay lock (unlocking a hidden overlay also switches it on).
 pub fn toggle_overlay_lock(ctx: &Arc<Ctx>) {
-    let locked = ctx.config.get_bool("window", "overlay_locked", true);
-    ctx.config.set("window", "overlay_locked", if locked { "false" } else { "true" });
-    ctx.engine.config_changed();
+    blocking(ctx, |c| {
+        let locked = c.config.get_bool("window", "overlay_locked", true);
+        shell_window::set_overlay_locked(c, !locked);
+    });
 }
 
 fn on_menu(ctx: &Arc<Ctx>, id: &str) {
@@ -121,20 +159,23 @@ fn on_menu(ctx: &Arc<Ctx>, id: &str) {
         "playpause" => player(ctx, "toggle"),
         "next" => player(ctx, "next"),
         "prev" => player(ctx, "prev"),
-        "mini" => blocking(ctx, |c| log_err("mini player", c.call("windows", "toggle_mini", json!({})))),
+        "mini" => blocking(ctx, |c| log_err(c, "mini player", c.call("windows", "toggle_mini", json!({})))),
         "topmost" => toggle_always_on_top(ctx),
-        "overlay" => blocking(ctx, |c| log_err("overlay", c.call("windows", "toggle_overlay", json!({})))),
+        "overlay" => blocking(ctx, |c| log_err(c, "overlay", c.call("windows", "toggle_overlay", json!({})))),
         "lock" => toggle_overlay_lock(ctx),
-        "rpc" => blocking(ctx, |c| log_err("toggle RPC", c.call("core", "toggle_rpc", json!({})))),
-        "reconnect" => blocking(ctx, |c| log_err("reconnect RPC", c.call("shell", "reconnect_rpc", json!({})))),
+        "rpc" => blocking(ctx, |c| log_err(c, "toggle RPC", c.call("core", "toggle_rpc", json!({})))),
+        "reconnect" => blocking(ctx, |c| log_err(c, "reconnect RPC", c.call("shell", "reconnect_rpc", json!({})))),
         "quit" => shell_window::quit(ctx),
         _ => {}
     }
 }
 
-fn log_err(what: &str, r: Result<Value, String>) {
+/// A failed tray action is logged and shown on the app's error line, so the
+/// person who clicked it is told (the tray itself has nowhere to say it).
+fn log_err(ctx: &Arc<Ctx>, what: &str, r: Result<Value, String>) {
     if let Err(e) = r {
         crate::log(&format!("Tray: {what} failed: {e}"));
+        ctx.engine.update(|s| s.note = format!("{what}: {e}"));
     }
 }
 
@@ -277,6 +318,41 @@ mod tests {
         assert_eq!(tray_tooltip("Song", "", "♪", true, 127), "Song");
         assert_eq!(tray_tooltip("Song", "Band", "• • •", true, 127), "Song — Band");
         assert_eq!(tray_tooltip("  Song \n x", "Band", "  a   b ", true, 127), "Song x — Band\n♪ a b");
+    }
+
+    fn lyr(mode: &str) -> crate::lyrics::Lyrics {
+        use crate::lyrics::{Line, Lyrics};
+        let line = |t, w: &str| Line { start_ms: t, words: w.into() };
+        Lyrics {
+            mode: mode.into(),
+            synced: if mode == "synced" { vec![line(1000, "one"), line(5000, "two")] } else { vec![] },
+            plain: if mode == "plain" { vec!["a".into(), "b".into(), "c".into(), "d".into()] } else { vec![] },
+            source: String::new(),
+        }
+    }
+
+    #[test]
+    fn tooltip_lyric_follows_the_offset_position() {
+        let l = lyr("synced");
+        assert_eq!(tooltip_lyric(&l, 500, 10_000, ""), "");
+        assert_eq!(tooltip_lyric(&l, 1000, 10_000, ""), "one");
+        // The same playback moment with a +4000 ms offset lands on the next line.
+        assert_eq!(tooltip_lyric(&l, 2000 + 3000, 10_000, ""), "two");
+    }
+
+    #[test]
+    fn tooltip_lyric_plain_instrumental_and_blacklisted() {
+        let p = lyr("plain");
+        assert_eq!(tooltip_lyric(&p, 0, 8000, ""), "a");
+        assert_eq!(tooltip_lyric(&p, 4000, 8000, ""), "c");
+        assert_eq!(tooltip_lyric(&p, 99_000, 8000, ""), "d");
+        assert_eq!(tooltip_lyric(&p, 0, 0, ""), "", "plain needs a duration");
+        // No lyrics: whatever the presence shows (instrumental text, blacklist note).
+        let none = crate::lyrics::Lyrics::none();
+        assert_eq!(tooltip_lyric(&none, 0, 1000, "🎵 ─ 🎵"), "🎵 ─ 🎵");
+        assert_eq!(tray_tooltip("Song", "Band", &tooltip_lyric(&none, 0, 1000, "🎵 ─ 🎵"), true, 127), "Song — Band\n♪ 🎵 ─ 🎵");
+        // A synced song's own silence never shows the idle text.
+        assert_eq!(tooltip_lyric(&lyr("synced"), 0, 1000, "idle"), "");
     }
 
     #[test]
