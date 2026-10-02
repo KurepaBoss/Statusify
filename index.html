@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Statusify</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div id="backdrop"></div>
+    <div id="shade"></div>
+    <main>
+      <header>
+        <img id="cover" alt="" />
+        <div class="meta">
+          <div id="title">Waiting for Spotify…</div>
+          <div id="artist"></div>
+          <div id="source"></div>
+        </div>
+      </header>
+      <section id="lyrics" aria-live="polite"><div id="sheet"></div></section>
+      <div id="progress"><div id="bar"></div></div>
+      <footer>
+        <div class="transport">
+          <button data-act="prev" title="Previous">⏮</button>
+          <button data-act="toggle" title="Play / pause">⏯</button>
+          <button data-act="next" title="Next">⏭</button>
+        </div>
+        <div class="status">
+          <span id="st-bridge" class="pill">Spotify</span>
+          <span id="st-discord" class="pill">Discord</span>
+        </div>
+      </footer>
+      <div id="note"></div>
+      <details id="history"><summary>Recent plays</summary><ol id="plays"></ol></details>
+    </main>
+  </body>
+</html>
