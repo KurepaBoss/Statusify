@@ -220,3 +220,78 @@ test("seek fraction clamps", () => {
   assert.equal(L.seekFrac(-5, 0, 100), 0);
   assert.equal(L.seekFrac(500, 0, 100), 1);
 });
+
+// ── Page switcher ──
+const ORDER = ["now", "history", "stats", "settings"];
+
+test("a slide brings the target in from its side of the tab order and sends the rest away", () => {
+  assert.deepEqual(L.slidePlan({ now: 0 }, "stats", ORDER), { now: [0, -1], stats: [1, 0] });
+  assert.deepEqual(L.slidePlan({ stats: 0 }, "history", ORDER), { stats: [0, 1], history: [-1, 0] });
+});
+
+test("a click mid-slide carries on like a strip instead of jumping", () => {
+  // now -> history is half done; history -> settings picks up from there.
+  const p = L.slidePlan({ now: -0.5, history: 0.5 }, "settings", ORDER);
+  assert.deepEqual(p.now, [-0.5, -1]);
+  assert.deepEqual(p.history, [0.5, -1]);
+  assert.deepEqual(p.settings, [1.5, 0]); // beside the nearest page on its side
+  // retargeting back to a page that is still on screen starts from where it is
+  assert.deepEqual(L.slidePlan({ now: -0.5, history: 0.5 }, "now", ORDER), { history: [0.5, 1], now: [-0.5, 0] });
+});
+
+test("visibility is the share of a page on screen", () => {
+  assert.equal(L.visibility(0), 1);
+  assert.equal(L.visibility(-0.25), 0.75);
+  assert.equal(L.visibility(1.4), 0);
+});
+
+test("a drag pulls the neighbour on its side; the ends have none", () => {
+  assert.equal(L.dragNeighbour(ORDER, "history", -40), "stats");
+  assert.equal(L.dragNeighbour(ORDER, "history", 40), "now");
+  assert.equal(L.dragNeighbour(ORDER, "now", 40), null);
+  assert.equal(L.dragNeighbour(ORDER, "settings", -40), null);
+});
+
+test("a drag switches past 60 px or when flicked the same way", () => {
+  assert.equal(L.dragSwitches(-70, 0, true), true);
+  assert.equal(L.dragSwitches(-30, 0, true), false);
+  assert.equal(L.dragSwitches(-30, -1200, true), true);
+  assert.equal(L.dragSwitches(-30, 1200, true), false); // thrown back
+  assert.equal(L.dragSwitches(-200, -2000, false), false);
+});
+
+// ── Volume ──
+test("wheel ticks before Spotify answers all count", () => {
+  // The page keeps its own value, so ten ticks from 50 % reach 100 %, not 55 %.
+  let v = 0.5;
+  for (let i = 0; i < 10; i++) v = L.stepVolume(v, 1);
+  assert.equal(v, 1);
+  for (let i = 0; i < 30; i++) v = L.stepVolume(v, -1);
+  assert.equal(v, 0);
+  assert.equal(L.stepVolume(0.15, 1), 0.2); // no float drift off the 5 % grid
+  assert.equal(L.stepVolume(0.7, 1), 0.75);
+});
+
+// ── Status row ──
+test("the rate limit counts down and disappears", () => {
+  assert.equal(L.rateLimitLabel(10_000, 0), "Rate limited \u00b7 10s");
+  assert.equal(L.rateLimitLabel(10_000, 6_400), "Rate limited \u00b7 4s");
+  assert.equal(L.rateLimitLabel(10_000, 10_000), "");
+  assert.equal(L.rateLimitLabel(null, 5), "");
+  assert.equal(L.rateLimitLabel(undefined, 5), "");
+});
+
+test("dropped lines and the rate limit share the right side", () => {
+  assert.equal(L.statusRight(0, ""), "");
+  assert.equal(L.statusRight(1, ""), "1 line dropped");
+  assert.equal(L.statusRight(3, "Rate limited \u00b7 9s"), "3 lines dropped \u00b7 Rate limited \u00b7 9s");
+  assert.equal(L.statusRight(0, "Rate limited \u00b7 9s"), "Rate limited \u00b7 9s");
+});
+
+test("a long save path keeps its end", () => {
+  assert.equal(L.shortPath("C:\a\b.png"), "C:\a\b.png");
+  const p = "C:\Users\Someone\Pictures\Statusify\A very long artist - A very long title (2).png";
+  const s = L.shortPath(p);
+  assert.equal(s.length, 52);
+  assert.ok(s.startsWith("\u2026") && p.endsWith(s.slice(1)));
+});

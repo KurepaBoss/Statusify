@@ -221,3 +221,53 @@ fn filenames_are_made_safe() {
     assert_eq!(clean_filename(" - .. "), "");
     assert_eq!(clean_filename(&"x".repeat(300)).len(), 100);
 }
+
+#[test]
+fn saved_images_never_overwrite_an_earlier_one() {
+    let d = tmp("uniq");
+    assert_eq!(unique_png(&d, "A - T"), d.join("A - T.png"));
+    std::fs::write(d.join("A - T.png"), b"x").unwrap();
+    assert_eq!(unique_png(&d, "A - T"), d.join("A - T (2).png"));
+    std::fs::write(d.join("A - T (2).png"), b"x").unwrap();
+    assert_eq!(unique_png(&d, "A - T"), d.join("A - T (3).png"));
+    std::fs::remove_dir_all(d).ok();
+}
+
+#[tokio::test]
+async fn cached_lyrics_get_their_word_timing_back_from_the_sidecar_and_history() {
+    use crate::lyrics::{Line, Lyrics};
+    let d = tmp("timing");
+    let st = State::new(&d);
+    let e = engine();
+    track(&st, &e, "u1", "");
+    let raw = json!([
+        {"startMs": 1000, "words": "hello there", "endMs": 2500, "syl": [[1000, 1500, "hello"], [1500, 2400, " there"]]},
+        {"startMs": 4000, "words": "second", "endMs": 5000}
+    ]);
+    // 1. cached lyrics show first, no timing yet
+    e.set_lyrics(Lyrics {
+        mode: "synced".into(),
+        synced: vec![Line { start_ms: 1000, words: "hello there".into() }, Line { start_ms: 4000, words: "second".into() }],
+        plain: vec![],
+        source: "cache".into(),
+    });
+    st.on_lyrics(&e);
+    assert!(e.snapshot().extras["np_timing"]["lines"].is_null());
+    // 2. the bridge's message arrives later: timing appears without a LyricsChanged
+    send(&st, &e, json!({"type":"lyrics","track_uri":"u1","mode":"synced","synced": raw, "source":"Spicy"}));
+    let lines = e.snapshot().extras["np_timing"]["lines"].clone();
+    assert_eq!(lines[0]["endMs"], 2500);
+    assert!(lines[0]["syl"].is_array());
+    // 3. a fresh run (new State, no raw messages) finds it in the sidecar
+    let st2 = State::new(&d);
+    let e2 = engine();
+    track(&st2, &e2, "u1", "");
+    e2.set_lyrics(e.snapshot().lyrics.clone());
+    st2.on_lyrics(&e2);
+    assert_eq!(e2.snapshot().extras["np_timing"]["lines"][0]["endMs"], 2500);
+    // 4. other lyrics for the same track (a pinned search result) do not match
+    e2.set_lyrics(Lyrics { mode: "synced".into(), synced: vec![Line { start_ms: 1, words: "other".into() }], plain: vec![], source: "LRCLIB".into() });
+    st2.on_lyrics(&e2);
+    assert!(e2.snapshot().extras["np_timing"]["lines"].is_null());
+    std::fs::remove_dir_all(d).ok();
+}

@@ -3,6 +3,12 @@
 // the water (five soft blobs of the cover's colours on slow Lissajous paths)
 // flowing faintly over it. Every page shows it; the Lyrics page brighter.
 //
+// Brightness follows Python's cover mode (album tint on, dark theme, a cover
+// loaded): only then are the picture darkened (vignette, #shade). Without it the
+// Lyrics page shows the water as it is, melting into the window colour at its
+// edges, and the other pages are flat. All of it is CSS keyed off #backdrop.cover
+// and body[data-page] (styles.css).
+//
 // Everything that moves is a CSS animation of transform on a composited
 // layer, and the cover is a 96 px canvas texture the GPU scales up, so a
 // frame costs the compositor nothing but the blend (the Python version
@@ -11,8 +17,8 @@
 
 export type BdColors = { base: string; blobs: string[] };
 
-const NEUTRAL_DARK: BdColors = { base: "#121216", blobs: ["#1d1d25", "#18181f", "#1b1f1d", "#1d1d25", "#15151b"] };
-const NEUTRAL_LIGHT: BdColors = { base: "#e9ebf0", blobs: ["#dfe2e9", "#e4e7ed", "#dde5e0", "#dfe2e9", "#e7e9ef"] };
+const NEUTRAL_DARK: BdColors = { base: "#0b0d10", blobs: ["#1d1d25", "#18181f", "#1b1f1d", "#1d1d25", "#15151b"] };
+const NEUTRAL_LIGHT: BdColors = { base: "#f4f6f8", blobs: ["#dfe2e9", "#e4e7ed", "#dde5e0", "#dfe2e9", "#e7e9ef"] };
 
 /** Quiet water of the theme's own surfaces with a trace of the accent. */
 export function neutralColors(dark: boolean, accent?: string): BdColors {
@@ -73,6 +79,8 @@ export class Backdrop {
     this.water = mk("bd-water");
     this.buildBlobs();
     mk("bd-vig");
+    mk("bd-edge");
+    mk("bd-flat");
     this.beat = mk("bd-beat");
   }
 
@@ -187,4 +195,25 @@ export function backdrop(): Backdrop | null {
     if (el) shared = new Backdrop(el);
   }
   return shared;
+}
+
+/** The surface/text tokens `extras.palette.tokens` carries (statusify_colors.tinted_palette). */
+export type Surfaces = Partial<Record<"BG" | "BG2" | "BG3" | "BG4" | "TEXT" | "TEXT2" | "MUTED" | "BORDER", string>>;
+
+const SURFACE_VARS: [keyof Surfaces, string][] = [
+  ["BG", "--bg"], ["BG2", "--bg2"], ["BG3", "--bg3"], ["BG4", "--bg4"],
+  ["TEXT", "--text"], ["TEXT2", "--text2"], ["MUTED", "--muted"], ["BORDER", "--border"],
+];
+let surfaceKey = "";
+
+/** Tint the whole window from the cover; null goes back to the theme's own colours. */
+export function applySurfaces(t: Surfaces | null | undefined, root: HTMLElement = document.documentElement) {
+  const ok = !!t && SURFACE_VARS.every(([k]) => /^#[0-9a-f]{6}$/i.test(t[k] ?? ""));
+  const key = ok ? SURFACE_VARS.map(([k]) => t![k]).join() : "";
+  if (key === surfaceKey) return;
+  surfaceKey = key;
+  for (const [k, v] of SURFACE_VARS) {
+    if (ok) root.style.setProperty(v, t![k]!);
+    else root.style.removeProperty(v);
+  }
 }

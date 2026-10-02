@@ -19,6 +19,8 @@ pub mod np_art;
 pub mod np_colors;
 #[path = "../np_extras.rs"]
 pub mod np_extras;
+#[path = "../np_timing.rs"]
+pub mod np_timing;
 #[path = "../np_translate.rs"]
 pub mod np_translate;
 
@@ -46,6 +48,7 @@ pub const SETTABLE: [&str; 8] = [
 pub struct State {
     player: Mutex<Player>,
     art: ArtCache,
+    timing: np_timing::TimingStore,
     http: reqwest::Client,
     results: Mutex<Vec<Value>>,
     search_gen: AtomicU64,
@@ -63,6 +66,7 @@ impl State {
         Arc::new(State {
             player: Mutex::new(Player::default()),
             art: ArtCache::new(data_dir),
+            timing: np_timing::TimingStore::new(data_dir),
             http: crate::lrclib::client(),
             results: Mutex::new(vec![]),
             search_gen: AtomicU64::new(0),
@@ -120,13 +124,19 @@ impl State {
                 if uri.is_empty() {
                     return;
                 }
-                let mut raw = self.raw.lock().unwrap();
-                raw.retain(|(u, _)| *u != uri);
-                if np_extras::lyrics_from_raw(m, "Spicy").is_some() {
-                    raw.push((uri, m.clone()));
+                {
+                    let mut raw = self.raw.lock().unwrap();
+                    raw.retain(|(u, _)| *u != uri);
+                    if np_extras::lyrics_from_raw(m, "Spicy").is_some() {
+                        raw.push((uri.clone(), m.clone()));
+                    }
+                    while raw.len() > RAW_CAP {
+                        raw.remove(0);
+                    }
                 }
-                while raw.len() > RAW_CAP {
-                    raw.remove(0);
+                // Cached lyrics may already be showing: their timing arrives now.
+                if uri == Self::cur_uri(engine) {
+                    self.sync_timing(engine);
                 }
             }
             _ => {}
@@ -160,11 +170,22 @@ impl State {
         let s = engine.snapshot();
         let Some(t) = &s.track else { return self.push(engine, "np_timing", Value::Null) };
         let lines = if s.lyrics.mode == "synced" {
-            let raw = self.raw.lock().unwrap();
-            raw.iter()
-                .rev()
-                .find(|(u, _)| *u == t.uri)
-                .and_then(|(_, m)| np_extras::timing_from_raw(m.get("synced")?, &s.lyrics.synced))
+            // The bridge's own message first, then what an earlier run (or the
+            // Python app) kept: lyrics loaded from history.db have no timing.
+            let live = {
+                let raw = self.raw.lock().unwrap();
+                raw.iter().rev().find(|(u, _)| *u == t.uri).and_then(|(_, m)| m.get("synced").cloned())
+            };
+            let from_live = live.as_ref().and_then(|r| {
+                let l = np_extras::timing_from_raw(r, &s.lyrics.synced);
+                if l.is_some() {
+                    self.timing.save(&t.uri, r);
+                }
+                l
+            });
+            from_live.or_else(|| {
+                self.timing.lookup(&t.uri).iter().find_map(|r| np_extras::timing_from_raw(r, &s.lyrics.synced))
+            })
         } else {
             None
         };
@@ -295,6 +316,29 @@ impl NowPlaying {
     }
 }
 
+/// The Save dialog lives in tauri-plugin-dialog; register it here when the
+/// app shell has not (lib.rs is not ours), so "Share as image" can always ask.
+fn ensure_dialog(app: &tauri::AppHandle) {
+    use tauri::Manager;
+    if app.try_state::<tauri_plugin_dialog::Dialog<tauri::Wry>>().is_none() {
+        if let Err(e) = app.plugin(tauri_plugin_dialog::init()) {
+            crate::log(&format!("Save dialog unavailable: {e}"));
+        }
+    }
+}
+
+/// `name.png` in `dir`, or `name (2).png`, `name (3).png` … when that exists: an earlier save of
+/// the same song is never overwritten silently.
+pub fn unique_png(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let mut p = dir.join(format!("{name}.png"));
+    let mut n = 2;
+    while p.exists() {
+        p = dir.join(format!("{name} ({n}).png"));
+        n += 1;
+    }
+    p
+}
+
 fn push_np(st: &State, ctx: &Ctx) {
     let uri = State::cur_uri(&ctx.engine);
     st.push(&ctx.engine, "np", np_json(&ctx.config, &uri, ctx.engine.is_pinned()));
@@ -318,6 +362,7 @@ impl Feature for NowPlaying {
         st.push(&ctx.engine, "queue", json!([]));
         push_np(&st, ctx);
         apply_topmost(ctx);
+        ensure_dialog(&ctx.app);
         let ctx = ctx.clone();
         let mut rx = ctx.engine.subscribe();
         tokio::spawn(async move {
@@ -444,6 +489,34 @@ impl Feature for NowPlaying {
                 let img = tauri::async_runtime::block_on(st.art.fetch(&url, size));
                 Ok(img.and_then(|i| np_art::data_uri(&i)).map_or(Value::Null, Value::String))
             }
+            // The Save dialog of "Share as image", defaulting to "Artist - Title.png".
+            // {path} when a file was picked, {cancelled: true} when it was dismissed.
+            "pick_save_path" => {
+                use tauri::Manager;
+                use tauri_plugin_dialog::DialogExt;
+                ensure_dialog(&ctx.app);
+                let name = clean_filename(arg_str(&a, "name"));
+                let mut b = ctx
+                    .app
+                    .dialog()
+                    .file()
+                    .set_title("Save lyric image")
+                    .set_file_name(format!("{}.png", if name.is_empty() { "lyric" } else { &name }))
+                    .add_filter("PNG image", &["png"]);
+                if let Some(w) = ctx.app.get_webview_window("main") {
+                    b = b.set_parent(&w);
+                }
+                match b.blocking_save_file() {
+                    Some(fp) => {
+                        let mut p = fp.into_path().map_err(|e| e.to_string())?;
+                        if p.extension().is_none() {
+                            p.set_extension("png");
+                        }
+                        Ok(json!({"path": p.to_string_lossy()}))
+                    }
+                    None => Ok(json!({"cancelled": true})),
+                }
+            }
             // Writes a PNG: to `path` when given (a Save dialog's pick), else
             // Pictures\Statusify\<name>.png. Returns the path written.
             "save_image" => {
@@ -463,7 +536,7 @@ impl Feature for NowPlaying {
                         let name = clean_filename(arg_str(&a, "name"));
                         let dir = home.join("Pictures").join("Statusify");
                         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                        dir.join(format!("{}.png", if name.is_empty() { "lyric" } else { &name }))
+                        unique_png(&dir, if name.is_empty() { "lyric" } else { &name })
                     }
                     p => std::path::PathBuf::from(p),
                 };

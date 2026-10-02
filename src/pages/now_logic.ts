@@ -366,3 +366,74 @@ export function fitActions(order: string[], widths: Record<string, number>, avai
   }
   return { shown: order.filter((k) => keep.has(k)), overflow: ["mini", "overlay", "top", "copy"].filter((k) => order.includes(k) && !keep.has(k)) };
 }
+
+// ── Page switcher: sliding and dragging (statusify_ui_backdrop) ──
+
+export const SLIDE_MS = 420;
+export const DRAG_START_PX = 12; // a press becomes a drag only past this, so clicks still click
+export const DRAG_SWITCH_PX = 60; // released past this, the drag goes to the next page
+export const FLICK_PX_PER_S = 900; // ... or thrown at least this fast
+
+/** Where every page starts and ends for a slide to `target`, in page widths.
+ *  `positions` is {page: x} of the pages on screen now (one page at 0 when nothing
+ *  moves). The target comes in beside the pages already there, on its side of the
+ *  tab order, so a click mid-slide carries on like a strip instead of jumping;
+ *  everything else leaves towards its own side. */
+export function slidePlan(positions: Record<string, number>, target: string, order: string[]): Record<string, [number, number]> {
+  const at = (p: string) => order.indexOf(p);
+  const plan: Record<string, [number, number]> = {};
+  for (const [p, x] of Object.entries(positions)) {
+    if (p !== target) plan[p] = [x, at(p) < at(target) ? -1 : 1];
+  }
+  const ps = Object.entries(positions);
+  let start: number;
+  if (target in positions) start = positions[target];
+  else if (!ps.length) start = 0;
+  else {
+    const right = ps.filter(([p]) => at(p) < at(target)).map(([, x]) => x);
+    const left = ps.filter(([p]) => at(p) > at(target)).map(([, x]) => x);
+    start = right.length ? Math.max(...right) + 1 : Math.min(...left) - 1;
+  }
+  plan[target] = [start, 0];
+  return plan;
+}
+
+/** Share of a page at offset x (page widths) that is on screen (0..1). */
+export const visibility = (x: number) => Math.max(0, 1 - Math.abs(x));
+
+/** The page a drag of `dx` pixels pulls in (a drag left pulls the next one); null at the ends. */
+export function dragNeighbour(order: string[], page: string, dx: number): string | null {
+  const i = order.indexOf(page) + (dx < 0 ? 1 : -1);
+  return i >= 0 && i < order.length ? order[i] : null;
+}
+
+/** Does a drag that ended at `dx` px with speed `v` px/s switch to the neighbour? */
+export function dragSwitches(dx: number, v: number, hasNeighbour: boolean): boolean {
+  if (!hasNeighbour) return false;
+  const flick = Math.abs(v) >= FLICK_PX_PER_S && v < 0 === dx < 0;
+  return Math.abs(dx) >= DRAG_SWITCH_PX || flick;
+}
+
+// ── Volume: steps that keep adding up before Spotify answers ──
+
+/** One wheel / Ctrl+Up-Down step (5 %), on the grid so floating point never drifts. */
+export const stepVolume = (cur: number, n: number): number => clamp(Math.round((cur + n * 0.05) * 20) / 20);
+
+// ── Status row ──
+
+/** "Rate limited · 12s" while the presence planner holds a line back, else "". */
+export function rateLimitLabel(untilMs: number | null | undefined, nowMs: number): string {
+  const rem = (Number(untilMs) || 0) - nowMs;
+  return rem > 0 ? `Rate limited · ${Math.round(rem / 1000)}s` : "";
+}
+
+/** The right-hand status text: dropped lines and the rate limit, joined like Python's. */
+export function statusRight(dropped: number, rl: string): string {
+  const d = dropped > 0 ? `${dropped} line${dropped !== 1 ? "s" : ""} dropped` : "";
+  return [d, rl].filter(Boolean).join(" · ");
+}
+
+/** A path short enough for a toast: the end of it matters. */
+export function shortPath(p: string, max = 52): string {
+  return p.length <= max ? p : "…" + p.slice(p.length - (max - 1));
+}

@@ -7,9 +7,10 @@
 
 import "./now.css";
 import { call, onSnapshot, position, seek, type Snapshot } from "../api";
-import { backdrop, neutralColors } from "./now_fx";
+import { applySurfaces, backdrop, neutralColors } from "./now_fx";
 import { icon } from "./now_icons";
 import * as L from "./now_logic";
+import { startNav } from "./now_nav";
 import { Panels, Toast, type MenuItem, type QueueItem } from "./now_panels";
 import { Sheet, type RowSpec } from "./now_sheet";
 import { blobToBase64, copyImage, renderShareImage } from "./now_share";
@@ -99,7 +100,9 @@ let posOv: { base: number; at: number; until: number } | null = null;
 let frozen: { pos: number; at: number; until: number } | null = null;
 let localErr = "";
 let errTimer = 0;
+let rlTimer = 0;
 let prevVol = 0.5;
+let volOv: { v: number; until: number } | null = null; // volume asked for, not yet confirmed
 let fs = false;
 let chromeT = 0;
 let ema = 16.7;
@@ -153,10 +156,17 @@ function applyTheme() {
   np.style.setProperty("--accc", L.mixAccent(rgb, fg).join(" "));
   html.style.setProperty("--accent", accent);
 
+  // The window itself takes the cover's hue (statusify_colors.tinted_palette).
+  const tokens = pv ? (isDark ? pv.tokens : pv.light?.tokens) ?? null : null;
+  applySurfaces(tokens);
+  const bg2 = tokens ? L.parseHex(tokens.BG2) : null;
+  if (bg2) np.style.setProperty("--bgc", bg2.join(" ")); else np.style.removeProperty("--bgc");
+
   const bd = backdrop();
   if (!bd) return;
-  // Cover mode: the cover itself behind the water (dark theme, album tint on).
-  const coverMode = tint && isDark && !!art;
+  // Cover mode (main._cover_mode): dark theme, album tint on, a cover loaded.
+  // Only then is the picture darkened; without it the water shows as it is.
+  const coverMode = tint && isDark && !!art && !!pv;
   bd.setCover(coverMode ? art : null);
   bd.setCoverMode(coverMode);
   if (pv) bd.setColors(isDark ? { base: pv.base, blobs: pv.blobs } : { base: pv.light.base, blobs: pv.light.blobs });
@@ -379,7 +389,7 @@ function renderFooter(s: Snapshot) {
   rp.classList.toggle("on", Number(p.repeat) > 0);
   rp.classList.toggle("one", Number(p.repeat) === 2);
   q(".q").classList.toggle("on", panels?.open === "queue");
-  const v = Number(p.volume ?? 1);
+  const v = curVolume();
   const vg = v <= 0.001 ? "vol0" : v < 0.5 ? "vol1" : "vol2";
   const vgEl = q(".vg");
   if (vgEl.dataset.g !== vg) { vgEl.dataset.g = vg; vgEl.innerHTML = icon(vg); }
@@ -405,14 +415,23 @@ function renderFooter(s: Snapshot) {
     elSleep.innerHTML = sleep ? `${icon("moon")}<span></span>` : "";
     if (sleep) elSleep.lastElementChild!.textContent = sleep;
   }
-  const dropped = Number(ex("core")?.dropped_lines ?? 0);
-  setText(elWarn, dropped ? `${dropped} line${dropped !== 1 ? "s" : ""} dropped` : "");
+  renderRight();
 
   const err = localErr || s.note || "";
   setText(elErr, err);
   const fixable = !!err && /bridge|spicetify|repair|update/i.test(err) && !localErr;
   elErr.classList.toggle("click", fixable);
   elErr.title = fixable ? "Click to repair" : "";
+}
+
+/** Right of the status row: dropped lines, and "Rate limited · Ns" counting down
+ *  (every 500 ms, like Python's _start_rl_countdown) while the planner holds a line back. */
+function renderRight() {
+  const core = ex("core");
+  const rl = L.rateLimitLabel(core?.rate_limited_until_ms, Date.now());
+  setText(elWarn, L.statusRight(Number(core?.dropped_lines ?? 0), rl));
+  if (rl && !rlTimer) rlTimer = window.setInterval(renderRight, 500);
+  else if (!rl && rlTimer) { window.clearInterval(rlTimer); rlTimer = 0; }
 }
 
 function showError(msg: string) {
@@ -456,16 +475,31 @@ async function seekTo(ms: number): Promise<boolean> {
   return true;
 }
 
+/** The volume as the page shows it: what was just asked for until Spotify says so,
+ *  so wheel ticks arriving before the answer add up instead of all starting from
+ *  the same base (Python read state.volume, which set_volume updated at once). */
+function curVolume(): number {
+  if (volOv && Date.now() < volOv.until) return volOv.v;
+  return Number(ex("player")?.volume ?? 1);
+}
+
 async function volume(v: number) {
   v = L.clamp(Math.round(v * 20) / 20);
-  const ok = await call<boolean>("nowplaying", "set_volume", { value: v }).catch(() => false);
-  if (!ok) return toast.show("Spotify isn't connected");
+  const prev = volOv;
+  volOv = { v, until: Date.now() + 1500 };
+  if (snap) renderFooter(snap);
   if (v > 0) prevVol = v;
   toast.show(v > 0 ? `Volume ${Math.round(v * 100)}%` : "Muted", v);
+  const ok = await call<boolean>("nowplaying", "set_volume", { value: v }).catch(() => false);
+  if (!ok) {
+    if (volOv?.v === v) volOv = prev && Date.now() < prev.until ? prev : null;
+    if (snap) renderFooter(snap);
+    toast.show("Spotify isn't connected");
+  }
 }
-const volumeStep = (n: number) => volume(Number(ex("player")?.volume ?? 1) + n * 0.05);
+const volumeStep = (n: number) => volume(L.stepVolume(curVolume(), n));
 function toggleMute() {
-  const v = Number(ex("player")?.volume ?? 1);
+  const v = curVolume();
   if (v > 0.001) { prevVol = v; void volume(0); } else void volume(prevVol > 0.001 ? prevVol : 0.5);
 }
 
@@ -512,14 +546,11 @@ async function shareLine(i: number, save: boolean) {
   if (!line || !t) return;
   let path = "";
   if (save) {
-    try {
-      const { save: pick } = await import("@tauri-apps/plugin-dialog");
-      const p = await pick({ title: "Save lyric image", defaultPath: `${L.safeName(t.artist, t.title)}.png`, filters: [{ name: "PNG image", extensions: ["png"] }] });
-      if (!p) return;
-      path = p;
-    } catch {
-      path = ""; // no dialog available: Pictures\Statusify
-    }
+    // Always ask where, like Python's Save dialog ("Artist - Title.png" to start with).
+    const r = await call<{ path?: string; cancelled?: boolean }>("nowplaying", "pick_save_path", { name: L.safeName(t.artist, t.title) }).catch(() => null);
+    if (r?.cancelled) return;
+    if (r?.path) path = r.path;
+    else toast.show("No Save dialog here, saving to Pictures\Statusify");
   }
   try {
     const art = t.album_art ? await call<string | null>("nowplaying", "art", { url: t.album_art, size: 640 }).catch(() => null) : null;
@@ -535,8 +566,8 @@ async function shareLine(i: number, save: boolean) {
       toast.show((await copyImage(blob)) ? "Image copied" : "Couldn't copy the image");
       return;
     }
-    await call("nowplaying", "save_image", { path, name: L.safeName(t.artist, t.title), data: await blobToBase64(blob) });
-    toast.show("Image saved");
+    const saved = await call<string>("nowplaying", "save_image", { path, name: L.safeName(t.artist, t.title), data: await blobToBase64(blob) });
+    toast.show(`Image saved to ${L.shortPath(String(saved))}`);
   } catch (e) {
     console.warn("lyric image failed", e);
     toast.show(save ? "Couldn't save the image" : "Couldn't make the image");
@@ -714,6 +745,7 @@ function render(s: Snapshot) {
   if (!np) return;
   if ((s.track?.uri ?? "") !== trackUri) { posOv = null; frozen = null; playOv = null; }
   if (playOv && s.is_playing === playOv.playing) playOv = null;
+  if (volOv && Math.abs(Number(s.extras?.player?.volume) - volOv.v) < 0.005) volOv = null;
   applyTheme();
   applyFont();
   renderHeader(s);
@@ -841,7 +873,7 @@ function wireWheel() {
     }, { passive: false });
   }
   elVol.addEventListener("pointerenter", () => {
-    const v = Number(ex("player")?.volume ?? 1);
+    const v = curVolume();
     toast.show((v > 0.001 ? `Volume ${Math.round(v * 100)}%` : "Muted") + "  ·  scroll to change, click to mute", v);
   });
 }
@@ -912,6 +944,7 @@ export function mount(root: HTMLElement) {
     chromeT = nowS();
     if (np.classList.contains("idle")) np.classList.remove("idle");
   });
+  startNav();
   wireSeek();
   wireWheel();
   wireDelay();
