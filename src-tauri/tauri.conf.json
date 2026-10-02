@@ -17,8 +17,9 @@
         "title": "Statusify",
         "width": 520,
         "height": 720,
-        "minWidth": 380,
-        "minHeight": 480
+        "minWidth": 460,
+        "minHeight": 580,
+        "visible": false
       }
     ],
     "security": {

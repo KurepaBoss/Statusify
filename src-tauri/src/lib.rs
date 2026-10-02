@@ -7,6 +7,9 @@ mod features;
 mod lrclib;
 mod lyrics;
 mod presence;
+mod shell_hotkeys;
+mod shell_tray;
+mod shell_window;
 mod state;
 
 use engine::Engine;
@@ -37,6 +40,43 @@ pub fn data_dir() -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The Discord connection and presence loop, and the App ID they were started
+/// with. Restarting them is how an App ID switch and "Reconnect" take effect
+/// without restarting the app.
+static DISCORD: Mutex<Option<(String, Vec<tauri::async_runtime::JoinHandle<()>>)>> = Mutex::new(None);
+
+/// The Discord App ID the connection is using right now.
+pub fn running_app_id() -> Option<String> {
+    DISCORD.lock().unwrap().as_ref().map(|(id, _)| id.clone())
+}
+
+/// (Re)start the Discord connection with `id`, dropping any previous one.
+pub fn start_discord(engine: &Arc<Engine>, id: &str) {
+    let mut slot = DISCORD.lock().unwrap();
+    if let Some((_, old)) = slot.take() {
+        for h in old {
+            h.abort();
+        }
+        engine.update(|s| s.discord_user = None);
+    }
+    let (tx, rx) = mpsc::unbounded_channel();
+    let e = engine.clone();
+    let conn = tauri::async_runtime::spawn(discord::run(id.to_string(), rx, move |st| match st {
+        discord::Status::Connected(u) => {
+            log(&format!("RPC handshake OK  ·  {u}"));
+            e.update(|s| s.discord_user = Some(u));
+        }
+        discord::Status::Disconnected => e.update(|s| s.discord_user = None),
+    }));
+    let presence = tauri::async_runtime::spawn(presence::run_loop(engine.clone(), tx));
+    *slot = Some((id.to_string(), vec![conn, presence]));
+    engine.update(|s| {
+        if s.note.starts_with("No DISCORD_APP_ID") {
+            s.note.clear();
+        }
+    });
 }
 
 struct App {
@@ -90,6 +130,11 @@ pub fn run() {
     log(&format!("Statusify-rs {} · data in {}", env!("CARGO_PKG_VERSION"), dir.display()));
 
     tauri::Builder::default()
+        // Shell plugins (single-instance first: a second launch only focuses the first).
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| shell_window::show_main(app)))
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -127,27 +172,26 @@ pub fn run() {
             });
 
             match std::env::var("DISCORD_APP_ID").ok().filter(|s| !s.trim().is_empty()) {
-                Some(id) => {
-                    let (tx, rx) = mpsc::unbounded_channel();
-                    let e = engine.clone();
-                    tauri::async_runtime::spawn(discord::run(id, rx, move |st| match st {
-                        discord::Status::Connected(u) => {
-                            log(&format!("RPC handshake OK  ·  {u}"));
-                            e.update(|s| s.discord_user = Some(u));
-                        }
-                        discord::Status::Disconnected => e.update(|s| s.discord_user = None),
-                    }));
-                    tauri::async_runtime::spawn(presence::run_loop(engine.clone(), tx));
-                }
+                Some(id) => start_discord(&engine, id.trim()),
                 None => engine.update(|s| s.note = "No DISCORD_APP_ID in .env — presence is off".into()),
             }
 
-            let c = ctx.clone();
+            // The shell starts first and on its own task: it shows the window and
+            // the tray, so a slow or panicking feature can never leave the app with
+            // neither. The window is also force-shown if the shell never got there.
+            let (c, shell_feats): (_, Vec<_>) = (ctx.clone(), feats.iter().filter(|f| f.name() == "shell").cloned().collect());
             tauri::async_runtime::spawn(async move {
-                for f in feats {
+                for f in shell_feats {
                     f.start(&c);
                 }
             });
+            let c = ctx.clone();
+            tauri::async_runtime::spawn(async move {
+                for f in feats.into_iter().filter(|f| f.name() != "shell") {
+                    f.start(&c);
+                }
+            });
+            shell_window::show_fallback(&ctx);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![snapshot, recent_plays, player, seek, call])
