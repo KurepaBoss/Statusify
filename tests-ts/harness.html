@@ -1,0 +1,118 @@
+<!doctype html>
+<!-- Dev harness for the Lyrics page: the real UI with a mocked Tauri backend and a
+     simulated player. Run `npx vite` and open /tests-ts/harness.html. Not shipped. -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Statusify harness</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script>
+      window.__npDebug = true;
+      (() => {
+        const cbs = {};
+        let cbId = 1;
+        const listeners = {};
+        const art = (a, b) => "data:image/svg+xml;utf8," + encodeURIComponent(
+          `<svg xmlns="http://www.w3.org/2000/svg" width="300" height="300"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${a}"/><stop offset="1" stop-color="${b}"/></linearGradient></defs><rect width="300" height="300" fill="url(#g)"/><circle cx="210" cy="90" r="60" fill="#ffd166"/><rect x="0" y="210" width="300" height="90" fill="#06223b"/></svg>`);
+        const COVERS = { a: art("#1b6ca8", "#0d2a4a"), b: art("#c0392b", "#4a0d2a"), c: art("#27ae60", "#0d4a2a") };
+        const mk = (n, t0, step, words, extra) => Array.from({ length: n }, (_, i) => ({ startMs: t0 + i * step, words: words[i % words.length], ...(extra ? extra(i) : {}) }));
+        const WORDS = ["We were running through the midnight rain", "Every light was turning into blue", "I can hear the ocean in your name", "Hold me closer till the morning comes", "", "And the city sings along tonight", "Nothing left to lose and nowhere to be", "Dancing in the silver of the moon", "안녕하세요 사랑해", "Carry me home, carry me home"];
+        const syl = (i, t0, text, step) => {
+          const ws = text.split(" ");
+          const d = (step - 600) / Math.max(1, ws.length);
+          return { endMs: t0 + step - 400, syl: ws.map((w, k) => [Math.round(t0 + k * d), Math.round(t0 + (k + 1) * d), w]) };
+        };
+        const STEP = 4200, T0 = 6000;
+        const synced = mk(30, T0, STEP, WORDS);
+        synced.splice(14, 0, { startMs: T0 + 14 * STEP, words: "A very long line that keeps going and going so that it has to wrap onto a second row of the sheet", });
+        synced.forEach((l, i, a) => { if (i > 14) l.startMs = T0 + i * STEP + (i === 20 ? 14000 : 0); });
+        const timing = synced.map((l, i) => (l.words && i % 2 === 0 ? syl(i, l.startMs, l.words, STEP) : null));
+        const uri = "spotify:track:harness1";
+        const snap = {
+          track: { uri, artist: "The Harness", title: "Midnight Rain (Live at the Mock Arena)", album: "Mocks", album_art: COVERS.a, blacklisted: false },
+          position_ms: 0, position_at_ms: Date.now(), duration_ms: 200000, is_playing: true,
+          lyrics: { mode: "synced", synced, plain: [], source: "Spicy" },
+          bridge_connected: true, discord_user: "tester", note: "",
+          extras: {
+            np: { animations: true, render_quality: "auto", album_tint: true, dark_mode: true, accent: "#1db954", lyric_font: "", lyric_font_boost: 0, beat_react: true, lyric_subline: "off", translate_to: "auto", always_on_top: false, lyric_delay_ms: 0, pinned: false, song_offset: false },
+            core: { rpc_enabled: true, track_offset_ms: 0, sleep_label: "", sleep_remaining_s: 0, in_instrumental: false, dropped_lines: 0, update_available: false },
+            windows: { mini: false, overlay: false },
+            player: { volume: 0.65, shuffle: false, repeat: 0, liked: false },
+            queue: [
+              { uri: "spotify:track:q1", uid: "u1", title: "Second Wind", artist: "The Harness", album_art: COVERS.b, duration_ms: 215000 },
+              { uri: "spotify:track:q2", uid: "u2", title: "Glass Harbour", artist: "Some Band", album_art: COVERS.c, duration_ms: 188000 },
+            ],
+            palette: { uri, art: COVERS.a, accent: "#6fb3ff", tint: "#3a78c8", tokens: null, colors: ["#1b6ca8", "#0d2a4a", "#ffd166", "#06223b"], base: "#0b2a44", blobs: ["#1d5f95", "#2b4f86", "#3a6aa0", "#20406a", "#1a5a8a"],
+              light: { accent: "#1d5fb0", tokens: null, base: "#d8e6f4", blobs: ["#c0d6ee", "#b8cdea", "#cddff2", "#bcd2ec", "#c9dcf1"] } },
+            np_timing: { uri, n: synced.length, start0: synced[0].startMs, startN: synced[synced.length - 1].startMs, lines: timing },
+            beats: { uri, tempo: 120, beats: Array.from({ length: 400 }, (_, i) => 6000 + i * 500) },
+          },
+        };
+        window.__snap = snap;
+        const emit = () => { snap.position_at_ms = Date.now(); const h = listeners.snapshot; if (h) cbs[h]({ event: "snapshot", id: 1, payload: JSON.parse(JSON.stringify(snap)) }); };
+        window.__emit = emit;
+        window.__set = (patch) => { Object.assign(snap, patch); emit(); };
+        window.__extra = (k, v) => { snap.extras[k] = v; emit(); };
+        window.__covers = COVERS;
+        window.__calls = [];
+        let pos0 = 0, at0 = Date.now();
+        setInterval(() => { if (snap.is_playing) { snap.position_ms = pos0 + (Date.now() - at0); } emit(); }, 500);
+        window.__seekTo = (ms) => { pos0 = ms; at0 = Date.now(); snap.position_ms = ms; emit(); };
+        const handleCall = ({ feature, action, args }) => {
+          window.__calls.push([feature, action, args]);
+          if (feature === "nowplaying") {
+            if (action === "player_cmd") {
+              if (args.action === "toggle") { snap.is_playing = !snap.is_playing; pos0 = snap.position_ms; at0 = Date.now(); }
+              if (args.action === "shuffle") snap.extras.player.shuffle = !snap.extras.player.shuffle;
+              if (args.action === "repeat") snap.extras.player.repeat = (snap.extras.player.repeat + 1) % 3;
+              if (args.action === "like") snap.extras.player.liked = !snap.extras.player.liked;
+              emit(); return true;
+            }
+            if (action === "set_volume") { snap.extras.player.volume = args.value; emit(); return true; }
+            if (action === "lyric_search") return { status: "3 results · pick the right one", results: [
+              { track: "Midnight Rain", artist: "The Harness", album: "Mocks", duration: 200, synced: true },
+              { track: "Midnight Rain (Acoustic)", artist: "The Harness", album: "", duration: 231, synced: false },
+              { track: "Midnight Rain", artist: "Cover Band", album: "Tributes", duration: 199, synced: true }] };
+            if (action === "pin_result") { snap.extras.np.pinned = true; emit(); return { ok: true, mode: "synced" }; }
+            if (action === "unpin") { snap.extras.np.pinned = false; emit(); return { had: true, restored: true }; }
+            if (action === "toggle_topmost") { snap.extras.np.always_on_top = !snap.extras.np.always_on_top; emit(); return snap.extras.np.always_on_top; }
+            if (action === "set_fullscreen") return args.on;
+            if (action === "art") return args.url;
+            if (action === "save_image") return "C:/mock/lyric.png";
+            return true;
+          }
+          if (feature === "core") {
+            if (action === "nudge_track_offset") { snap.extras.core.track_offset_ms += args.delta_ms; snap.extras.np.song_offset = true; emit(); return true; }
+            if (action === "toggle_rpc") { snap.extras.core.rpc_enabled = !snap.extras.core.rpc_enabled; emit(); return true; }
+            if (action === "set_track_offset") { snap.extras.core.track_offset_ms = 0; snap.extras.np.song_offset = false; emit(); return true; }
+          }
+          if (feature === "windows" && action === "toggle_overlay") { snap.extras.windows.overlay = !snap.extras.windows.overlay; emit(); return true; }
+          return null;
+        };
+        window.__TAURI_INTERNALS__ = {
+          transformCallback: (cb) => { const id = cbId++; cbs[id] = cb; return id; },
+          unregisterCallback: (id) => { delete cbs[id]; },
+          convertFileSrc: (p) => p,
+          invoke: async (cmd, args) => {
+            if (cmd === "snapshot") return JSON.parse(JSON.stringify(snap));
+            if (cmd === "plugin:event|listen") { listeners[args.event] = args.handler; return 1; }
+            if (cmd === "plugin:event|unlisten") return null;
+            if (cmd === "call") return handleCall(args);
+            if (cmd === "player") return true;
+            if (cmd === "seek") { window.__seekTo(args.positionMs); return true; }
+            if (cmd === "recent_plays") return [];
+            return null;
+          },
+        };
+        window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
+      })();
+    </script>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div id="backdrop"></div>
+    <div id="shade"></div>
+    <nav id="tabs"></nav>
+    <div id="pages"></div>
+  </body>
+</html>

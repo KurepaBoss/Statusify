@@ -11,7 +11,7 @@
 //!
 //! Actions: get_state, player_cmd, set_volume, queue_pick, lyric_search,
 //! pin_result, unpin, art, save_image, set_pref, nudge_global_delay,
-//! toggle_topmost.
+//! toggle_topmost, set_fullscreen, is_fullscreen, fonts.
 
 #[path = "../np_art.rs"]
 pub mod np_art;
@@ -497,6 +497,22 @@ impl Feature for NowPlaying {
                 ctx.config.set("preferences", "lyric_delay_ms", &v.to_string());
                 ctx.engine.config_changed();
                 Ok(json!(v))
+            }
+            // Whole-screen lyrics: the window itself goes fullscreen (restored on exit).
+            "set_fullscreen" => {
+                use tauri::Manager;
+                let on = a.get("on").and_then(|v| v.as_bool()).ok_or("on required")?;
+                let w = ctx.app.get_webview_window("main").ok_or("no main window")?;
+                w.set_fullscreen(on).map_err(|e| e.to_string())?;
+                crate::log(&format!("Full screen lyrics {}", if on { "on" } else { "off" }));
+                Ok(json!(on))
+            }
+            // Lyric font families installed here, the default first.
+            "fonts" => Ok(json!(np_extras::installed_fonts(&np_extras::font_dirs()))),
+            "is_fullscreen" => {
+                use tauri::Manager;
+                let w = ctx.app.get_webview_window("main").ok_or("no main window")?;
+                Ok(json!(w.is_fullscreen().map_err(|e| e.to_string())?))
             }
             "toggle_topmost" => {
                 let on = !ctx.config.get_bool("preferences", "always_on_top", false);

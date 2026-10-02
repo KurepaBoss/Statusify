@@ -225,6 +225,62 @@ pub async fn search(client: &reqwest::Client, base: &str, text: &str, artist: &s
     res
 }
 
+// ── Lyric fonts ──────────────────────────────────────────────────
+
+/// The lyric font the app starts with (Python's DEFAULT_FAMILY).
+pub const DEFAULT_FONT: &str = "Segoe UI";
+
+/// Families the user can choose, with the file patterns of their regular
+/// weight (statusify_textrender.FAMILIES). "Segoe UI Variable" is left out:
+/// at lyric sizes it is indistinguishable from the default.
+const FAMILIES: [(&str, &[&str]); 5] = [
+    ("Bahnschrift", &["bahnschrift.ttf"]),
+    ("Georgia", &["georgia.ttf"]),
+    ("Consolas", &["consola.ttf"]),
+    ("Lexend", &["Lexend-Regular.*", "Lexend*wght*.ttf"]),
+    ("OpenDyslexic", &["OpenDyslexic-Regular.*", "OpenDyslexic*Regular.*"]),
+];
+
+/// `*` wildcard match of a file name, case-insensitively.
+fn wild(pattern: &str, name: &str) -> bool {
+    let (p, n): (Vec<char>, Vec<char>) = (pattern.to_lowercase().chars().collect(), name.to_lowercase().chars().collect());
+    fn go(p: &[char], n: &[char]) -> bool {
+        match p.first() {
+            None => n.is_empty(),
+            Some('*') => (0..=n.len()).any(|k| go(&p[1..], &n[k..])),
+            Some(c) => n.first() == Some(c) && go(&p[1..], &n[1..]),
+        }
+    }
+    go(&p, &n)
+}
+
+/// The default first, then each family whose font file is in one of `dirs`
+/// (the system Fonts folder and the per-user one).
+pub fn installed_fonts(dirs: &[std::path::PathBuf]) -> Vec<String> {
+    let files: Vec<String> = dirs
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flat_map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .filter(|n| [".ttf", ".otf", ".ttc"].iter().any(|x| n.to_lowercase().ends_with(x)))
+        .collect();
+    let mut out = vec![DEFAULT_FONT.to_string()];
+    for (name, pats) in FAMILIES {
+        if pats.iter().any(|p| files.iter().any(|f| wild(p, f))) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+pub fn font_dirs() -> Vec<std::path::PathBuf> {
+    let win = std::env::var_os("WINDIR").map(std::path::PathBuf::from).unwrap_or_else(|| "C:/Windows".into());
+    let mut v = vec![win.join("Fonts")];
+    if let Some(l) = std::env::var_os("LOCALAPPDATA") {
+        v.push(std::path::PathBuf::from(l).join("Microsoft").join("Windows").join("Fonts"));
+    }
+    v
+}
+
 // ── Lyrics from raw bridge messages ──────────────────────────────
 
 /// A `lyrics` / `lyrics_prefetch` message as Lyrics (for the pin stash).
@@ -403,6 +459,21 @@ mod tests {
         // nothing timed -> None
         let plain = json!([{"startMs": 1000, "words": "hello world"}, {"startMs": 5000, "words": "bye"}]);
         assert!(timing_from_raw(&plain, &sheet).is_none());
+    }
+
+    #[test]
+    fn fonts_are_found_by_file_pattern() {
+        let d = std::env::temp_dir().join(format!("sfy-fonts-{}", crate::state::now_ms()));
+        std::fs::create_dir_all(&d).unwrap();
+        assert_eq!(installed_fonts(&[d.clone()]), vec!["Segoe UI"]);
+        for f in ["GEORGIA.TTF", "Lexend[wght].ttf", "notes.txt", "consola.ttf.bak"] {
+            std::fs::write(d.join(f), b"x").unwrap();
+        }
+        assert_eq!(installed_fonts(&[d.clone(), "/no/such/dir".into()]), vec!["Segoe UI", "Georgia", "Lexend"]);
+        assert!(wild("Lexend*wght*.ttf", "lexend[wght].TTF"));
+        assert!(!wild("a*b", "acd"));
+        assert!(wild("OpenDyslexic-Regular.*", "OpenDyslexic-Regular.otf"));
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]
