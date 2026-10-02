@@ -103,3 +103,4 @@
 @media (prefers-reduced-motion: reduce) {
   .st-rrow, .st-tip { transition: none !important; }
 }
+.st-off-note { font-size: 13px; color: var(--dim); margin: 0; }

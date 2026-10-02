@@ -23,7 +23,15 @@ export type Row = {
   lines: number;
 };
 type Group = { day: string; label: string; summary: string; entries: Row[] };
-type ListResp = { query: string; groups: Group[]; more: boolean; count: number; caption: string; latest_id: number };
+type ListResp = {
+  query: string;
+  groups: Group[];
+  more: boolean;
+  count: number;
+  caption: string;
+  latest_id: number;
+  current_id: number;
+};
 type Detail = Row & {
   mode: string;
   synced: { startMs: number; words: string }[];
@@ -96,12 +104,15 @@ export async function copyText(text: string, done = "Copied") {
 export const copyName = (r: { artist: string; title: string }) =>
   copyText(`${r.artist} — ${r.title}`.replace(/^ — | — $/g, ""), "Copied");
 
-/** The play that is playing right now: the newest one, for the playing track. */
-export function isNow(r: { id: number; track_uri: string; played_at: string }, latestId: number | null, s: Snapshot | null) {
-  if (!s?.track || latestId == null || r.id !== latestId || s.track.uri !== r.track_uri) return false;
-  const t = Date.parse(r.played_at);
-  return Number.isNaN(t) || Date.now() - t < (s.duration_ms || 0) + 600_000;
+/** The play that is playing right now: the backend knows its id (committed
+ *  after 20 s listened, cleared when the track changes), as Python's
+ *  _current_play did. 0 / null = none committed yet. */
+export function isNow(r: { id: number }, currentId: number | null | undefined) {
+  return !!currentId && r.id === currentId;
 }
+
+/** Same rule the backend enforces before handing a URI to the OS. */
+export const isSpotifyUri = (uri: string) => /^spotify:[A-Za-z0-9:_%+.-]+$/.test(uri);
 
 const fmtTs = (ms: number) => {
   const s = Math.floor((ms || 0) / 1000);
@@ -141,7 +152,7 @@ async function load(opts: { toTop?: boolean } = {}) {
 
 function updateWhen() {
   for (const { row, when } of nowEls) {
-    const now = isNow(row, data?.latest_id ?? null, snap);
+    const now = isNow(row, data?.current_id);
     when.textContent = now ? "Now playing" : row.hm;
     when.classList.toggle("now", now);
   }
@@ -330,7 +341,7 @@ function buildSheet() {
       }),
     );
   }
-  if (d.track_uri.startsWith("spotify:")) {
+  if (isSpotifyUri(d.track_uri)) {
     acts.append(
       btn("Open in Spotify", "ghost", () => {
         call("history", "open_spotify", { uri: d.track_uri }).catch((e) => toast(String(e)));
@@ -453,11 +464,24 @@ function scheduleReload(ms: number) {
       call<ListResp>("history", "list", { query: "", limit: 1 })
         .then((r) => {
           caption.textContent = r.caption;
-          if (data) data.latest_id = r.latest_id;
+          if (data) {
+            data.latest_id = r.latest_id;
+            data.current_id = r.current_id;
+            updateWhen();
+          }
         })
         .catch(() => {});
     } else void load();
   }, ms);
+}
+
+/** Show the History tab, close any open lyrics sheet and focus (and select)
+ *  the main search box. Bound to Ctrl+F; a shell hotkey may call it too. */
+export function focusSearch() {
+  if (!visible) document.querySelector<HTMLElement>('.tab[data-page="history"]')?.click();
+  closeSheet(false);
+  q.focus();
+  q.select();
 }
 
 /** Filter the History page by `text` (used by Stats' "Recently played"). */
@@ -503,20 +527,24 @@ export function mount(rootEl: HTMLElement) {
   }
 
   document.addEventListener("keydown", (e) => {
-    if (!visible) return;
-    if (e.key === "Escape" && closeSheet()) {
+    // Ctrl+F works from every tab: go to History, close the lyrics sheet and
+    // focus the main search (as Python's _focus_history_search did).
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "f") {
       e.preventDefault();
-    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+      focusSearch();
+    } else if (visible && e.key === "Escape" && closeSheet()) {
       e.preventDefault();
-      const f = openId !== null ? lyQuery : q;
-      f?.focus();
-      f?.select();
     }
   });
 
+  let lastUri: string | undefined;
   onSnapshot((s) => {
     snap = s;
+    const changed = s.track?.uri !== lastUri;
+    lastUri = s.track?.uri;
     if (!visible) return;
+    // A new song is not "Now playing" as a play until it is committed (20 s in).
+    if (changed && data) scheduleReload(300);
     updateWhen();
     highlightActive();
   });

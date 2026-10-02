@@ -12,7 +12,8 @@
 //!   recent {limit}                 "Recently played"
 //!   session                        songs / listening time this session
 //!   fetch_art {url}                a cover as a data: URL (for the Wrapped canvas)
-//!   save_wrapped {png, year, month}  save the rendered Wrapped PNG
+//!   pick_wrapped_path {year, month}  ask where to save the Wrapped PNG (before rendering)
+//!   save_wrapped {png, year, month}  write the rendered Wrapped PNG to the picked path
 //!   on_quit                        for the shell: honour "Remember history = off"
 //!
 //! The app event "history_changed" ({count, latest_id}) fires when a play was
@@ -40,10 +41,16 @@ const PAGE: i64 = 60;
 const RECENT_PAGE: i64 = 30;
 const HEAT_MAX_WEEKS: i64 = 53;
 const MAX_ART_BYTES: usize = 8 * 1024 * 1024;
+/// "Show more" has no ceiling of its own (Python's limit grew unbounded);
+/// this only keeps a bogus argument from asking for an absurd allocation.
+const MAX_LIMIT: i64 = 1_000_000;
 
 #[derive(Default)]
 pub struct History {
     session: Arc<Mutex<session::Session>>,
+    /// Where the user chose to save the Wrapped image (set by pick_wrapped_path,
+    /// consumed by save_wrapped), so the renderer never names a path itself.
+    picked: Mutex<Option<std::path::PathBuf>>,
 }
 
 fn now() -> NaiveDateTime {
@@ -105,6 +112,7 @@ fn list_json(st: &Store, query: &str, limit: i64, now: NaiveDateTime) -> Result<
         "count": count,
         "caption": fmt::plays_caption(count, st.first_played().as_deref(), now.date()),
         "latest_id": st.fingerprint().1,
+        "current_id": st.current_play(),
     }))
 }
 
@@ -159,6 +167,7 @@ fn stats_json(st: &Store, ym: (i32, u32), recent_n: i64, now: NaiveDateTime) -> 
         "month": month_json(st, ym.0, ym.1)?,
         "top": {"all": top_all, "30": top_30},
         "latest": latest.map(|p| json!({"id": p.id, "track_uri": p.track_uri, "played_at": p.played_at})),
+        "current_id": st.current_play(),
     }))
 }
 
@@ -173,9 +182,29 @@ fn sync_enabled(ctx: &Ctx) {
     }
 }
 
+/// With "Remember history" off: delete what is on record (on quit, and again
+/// at startup in case the app was killed before it could).
+fn wipe_if_off(ctx: &Ctx) {
+    if history_on(ctx) {
+        return;
+    }
+    if let Some(st) = ctx.engine.store.as_ref() {
+        if st.count() == 0 {
+            return;
+        }
+        match st.clear() {
+            Ok(()) => crate::log("History deleted (history disabled)"),
+            Err(e) => crate::log(&format!("Could not delete history: {e}")),
+        }
+    }
+}
+
 fn announce(ctx: &Ctx, st: &Store) {
     let (count, latest_id) = st.fingerprint();
-    let _ = ctx.app.emit("history_changed", json!({"count": count, "latest_id": latest_id}));
+    let _ = ctx.app.emit(
+        "history_changed",
+        json!({"count": count, "latest_id": latest_id, "current_id": st.current_play()}),
+    );
 }
 
 /// Fetch a cover for the Wrapped canvas as a data: URL, so drawing it never
@@ -217,9 +246,34 @@ fn fetch_art(url: &str) -> Result<String, String> {
     })
 }
 
-/// Where to save the Wrapped PNG: the save dialog when the dialog plugin is
-/// running, else <data dir>/exports. None = the user cancelled.
+/// The dialog plugin is registered here (not in lib.rs) so this area stays
+/// self-contained; a no-op if the shell already registered it.
+fn ensure_dialog(app: &tauri::AppHandle) {
+    if app.try_state::<tauri_plugin_dialog::Dialog<tauri::Wry>>().is_none() {
+        if let Err(e) = app.plugin(tauri_plugin_dialog::init()) {
+            crate::log(&format!("Dialog plugin unavailable: {e}"));
+        }
+    }
+}
+
+/// `dir/name`, or `dir/name (2)` and so on when that file exists, so the
+/// no-dialog fallback never silently overwrites an earlier export.
+fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) => (s, format!(".{e}")),
+        None => (name, String::new()),
+    };
+    (2..10_000).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|p| !p.exists()).unwrap_or(first)
+}
+
+/// Where to save the Wrapped PNG: the save dialog, else <data dir>/exports
+/// (never overwriting). None = the user cancelled.
 fn pick_png_path(ctx: &Ctx, name: &str) -> Option<std::path::PathBuf> {
+    ensure_dialog(&ctx.app);
     if ctx.app.try_state::<tauri_plugin_dialog::Dialog<tauri::Wry>>().is_some() {
         use tauri_plugin_dialog::DialogExt;
         return ctx
@@ -234,14 +288,34 @@ fn pick_png_path(ctx: &Ctx, name: &str) -> Option<std::path::PathBuf> {
     }
     let dir = ctx.data_dir.join("exports");
     let _ = std::fs::create_dir_all(&dir);
-    Some(dir.join(name))
+    Some(unique_path(&dir, name))
 }
 
 fn is_png(bytes: &[u8]) -> bool {
     bytes.len() >= 8 && &bytes[..8] == b"\x89PNG\r\n\x1a\n" && bytes.len() <= 40 * 1024 * 1024
 }
 
-fn save_wrapped(ctx: &Ctx, a: &Value) -> Result<Value, String> {
+fn wrapped_name(a: &Value) -> String {
+    let (y, m) = (arg_i64(a, "year").unwrap_or(0) as i32, arg_i64(a, "month").unwrap_or(0) as u32);
+    format!("Statusify Wrapped {}.png", fmt::month_name(y, m).trim())
+}
+
+/// Step 1 of saving: ask where (the save dialog), before any rendering.
+fn pick_wrapped_path(h: &History, ctx: &Ctx, a: &Value) -> Result<Value, String> {
+    let Some(mut path) = pick_png_path(ctx, &wrapped_name(a)) else {
+        *h.picked.lock().unwrap() = None;
+        return Ok(json!({"cancelled": true}));
+    };
+    if path.extension().is_none() {
+        path.set_extension("png");
+    }
+    let shown = path.display().to_string();
+    *h.picked.lock().unwrap() = Some(path);
+    Ok(json!({"path": shown}))
+}
+
+/// Step 2: write the rendered PNG to the picked path (or ask now if none).
+fn save_wrapped(h: &History, ctx: &Ctx, a: &Value) -> Result<Value, String> {
     use base64::Engine as _;
     let b64 = arg_str(a, "png");
     let bytes = base64::engine::general_purpose::STANDARD
@@ -250,22 +324,28 @@ fn save_wrapped(ctx: &Ctx, a: &Value) -> Result<Value, String> {
     if !is_png(&bytes) {
         return Err("not a PNG image".into());
     }
-    let (y, m) = (arg_i64(a, "year").unwrap_or(0) as i32, arg_i64(a, "month").unwrap_or(0) as u32);
-    let name = format!("Statusify Wrapped {}.png", fmt::month_name(y, m).trim());
-    let Some(mut path) = pick_png_path(ctx, &name) else {
-        return Ok(json!({"cancelled": true}));
+    let picked = h.picked.lock().unwrap().take();
+    let path = match picked {
+        Some(p) => p,
+        None => {
+            let Some(mut p) = pick_png_path(ctx, &wrapped_name(a)) else {
+                return Ok(json!({"cancelled": true}));
+            };
+            if p.extension().is_none() {
+                p.set_extension("png");
+            }
+            p
+        }
     };
-    if path.extension().is_none() {
-        path.set_extension("png");
-    }
     std::fs::write(&path, bytes).map_err(|e| format!("Couldn't save the image: {e}"))?;
     crate::log(&format!("Wrapped image saved  ·  {}", path.display()));
     Ok(json!({"path": path.display().to_string()}))
 }
 
-/// Only a plain spotify: URI ever reaches the OS (no shell involved).
+/// Only a plain spotify: URI ever reaches the OS (no shell involved). Local
+/// files (spotify:local:Artist:Album:Title:123) carry %-escapes, '+' and '.'.
 fn valid_spotify_uri(uri: &str) -> bool {
-    uri.starts_with("spotify:") && uri.chars().all(|c| c.is_ascii_alphanumeric() || ":_-".contains(c))
+    uri.starts_with("spotify:") && uri.chars().all(|c| c.is_ascii_alphanumeric() || ":_-%+.".contains(c))
 }
 
 fn open_spotify(ctx: &Ctx, uri: &str) -> Result<Value, String> {
@@ -288,7 +368,11 @@ impl Feature for History {
     }
 
     fn start(&self, ctx: &Arc<Ctx>) {
+        ensure_dialog(&ctx.app);
         sync_enabled(ctx);
+        // "Remember history" off means nothing is kept: if the last quit never
+        // ran on_quit (crash, kill), honour it now.
+        wipe_if_off(ctx);
         if let Some(st) = &ctx.engine.store {
             let legacy = ctx.data_dir.join("history.json");
             if legacy.exists() {
@@ -304,11 +388,17 @@ impl Feature for History {
         tokio::spawn(async move {
             let mut rx = ctx.engine.subscribe();
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(1500));
-            let mut last = ctx.engine.store.as_ref().map(|s| s.fingerprint());
+            let mut last = ctx.engine.store.as_ref().map(|s| s.change_token());
             loop {
                 tokio::select! {
                     ev = rx.recv() => match ev {
                         Ok(Event::Bridge(m)) => session.lock().unwrap().on_bridge(&m),
+                        // A new song is not "playing now" as a play until it is committed.
+                        Ok(Event::TrackChanged) => {
+                            if let Some(st) = &ctx.engine.store {
+                                st.clear_current();
+                            }
+                        }
                         Ok(Event::ConfigChanged) => sync_enabled(&ctx),
                         Ok(_) | Err(RecvError::Lagged(_)) => {}
                         Err(RecvError::Closed) => break,
@@ -317,7 +407,7 @@ impl Feature for History {
                         // The engine commits plays; this notices (one cheap query)
                         // and tells the open pages so they refresh.
                         let c = ctx.clone();
-                        let fp = tokio::task::spawn_blocking(move || c.engine.store.as_ref().map(|s| s.fingerprint()))
+                        let fp = tokio::task::spawn_blocking(move || c.engine.store.as_ref().map(|s| s.change_token()))
                             .await
                             .ok()
                             .flatten();
@@ -338,7 +428,7 @@ impl Feature for History {
         let store = || ctx.engine.store.as_ref().ok_or_else(|| "history.db is unavailable".to_string());
         match action {
             "list" => {
-                let limit = arg_i64(&a, "limit").unwrap_or(PAGE).clamp(1, 5000);
+                let limit = arg_i64(&a, "limit").unwrap_or(PAGE).clamp(1, MAX_LIMIT);
                 list_json(store()?, arg_str(&a, "query"), limit, now())
             }
             "entry" => {
@@ -399,7 +489,7 @@ impl Feature for History {
                     arg_i64(&a, "year").map(|y| y as i32).unwrap_or(n.year()),
                     arg_i64(&a, "month").map(|m| m.clamp(1, 12) as u32).unwrap_or(n.month()),
                 );
-                stats_json(st, ym, arg_i64(&a, "recent_n").unwrap_or(RECENT_PAGE).clamp(1, 5000), n)
+                stats_json(st, ym, arg_i64(&a, "recent_n").unwrap_or(RECENT_PAGE).clamp(1, MAX_LIMIT), n)
             }
             "month" => {
                 let st = store()?;
@@ -409,7 +499,7 @@ impl Feature for History {
             }
             "recent" => {
                 let st = store()?;
-                let n = arg_i64(&a, "limit").unwrap_or(RECENT_PAGE).clamp(1, 5000);
+                let n = arg_i64(&a, "limit").unwrap_or(RECENT_PAGE).clamp(1, MAX_LIMIT);
                 let t = now();
                 let plays = st.recent_plays_page(n, 0).map_err(|e| e.to_string())?;
                 Ok(json!({"recent": plays.iter().map(|p| play_json(p, t)).collect::<Vec<_>>(), "recent_n": n}))
@@ -419,18 +509,12 @@ impl Feature for History {
                 Ok(json!({"songs": s.songs, "listened_ms": s.listened_ms}))
             }
             "fetch_art" => fetch_art(arg_str(&a, "url")).map(Value::String),
-            "save_wrapped" => save_wrapped(ctx, &a),
+            "pick_wrapped_path" => pick_wrapped_path(self, ctx, &a),
+            "save_wrapped" => save_wrapped(self, ctx, &a),
             "on_quit" => {
                 // With "Remember history" off, what is on record goes when the
                 // app quits, as the setting promises.
-                if let Some(st) = ctx.engine.store.as_ref() {
-                    if !history_on(ctx) {
-                        match st.clear() {
-                            Ok(()) => crate::log("History deleted (history disabled)"),
-                            Err(e) => crate::log(&format!("Could not delete history: {e}")),
-                        }
-                    }
-                }
+                wipe_if_off(ctx);
                 Ok(json!({"ok": true}))
             }
             _ => Err(format!("history: unknown action {action}")),
@@ -508,6 +592,42 @@ mod tests {
         assert!(!valid_spotify_uri("spotify:track:x & calc"));
         assert!(!valid_spotify_uri("https://example.com"));
         assert!(!valid_spotify_uri(""));
+    }
+
+    #[test]
+    fn local_file_uris_are_allowed_but_not_shell_metacharacters() {
+        assert!(valid_spotify_uri("spotify:local:Some+Artist:Album%20Name:Title.v2:215"));
+        assert!(!valid_spotify_uri("spotify:local:a b"));
+        assert!(!valid_spotify_uri("spotify:track:x\"&calc"));
+        assert!(!valid_spotify_uri("spotify:track:x;y"));
+    }
+
+    #[test]
+    fn list_reports_current_play_and_goes_past_5000() {
+        let (st, d) = store();
+        let n = dt(2026, 9, 23, 20, 0);
+        let id = st.record_play("u", "A", "T", "", &iso(dt(2026, 9, 23, 19, 0))).unwrap();
+        assert_eq!(list_json(&st, "", 60, n).unwrap()["current_id"], id);
+        st.clear_current();
+        assert_eq!(list_json(&st, "", 60, n).unwrap()["current_id"], 0);
+        assert!(MAX_LIMIT > 5000);
+        // "more" is judged against the limit actually asked for, however large.
+        assert_eq!(list_json(&st, "", 6000, n).unwrap()["more"], false);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn unique_path_never_overwrites() {
+        let d = std::env::temp_dir().join(format!("statusify-uniq-{}", crate::state::now_ms()));
+        std::fs::create_dir_all(&d).unwrap();
+        let a = unique_path(&d, "Statusify Wrapped May 2026.png");
+        std::fs::write(&a, b"x").unwrap();
+        let b = unique_path(&d, "Statusify Wrapped May 2026.png");
+        assert_ne!(a, b);
+        assert!(b.file_name().unwrap().to_string_lossy().ends_with("May 2026 (2).png"));
+        std::fs::write(&b, b"x").unwrap();
+        assert!(unique_path(&d, "Statusify Wrapped May 2026.png").to_string_lossy().ends_with("(3).png"));
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]

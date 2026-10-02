@@ -137,8 +137,11 @@ export function renderWrapped(s: Summary, accent: string, art: CanvasImageSource
   const song = s.top_song;
   const title = song ? song.title : "—";
   const all = wrapText(title, tw, measure("bold", 54));
+  // At most three lines; a line that is still too wide (one very long word)
+  // is cut with an ellipsis rather than running off the card.
   const lines = all.slice(0, 3);
-  if (all.length > 3) lines[2] = ellipsize(lines[2] + "…", tw, measure("bold", 54));
+  if (all.length > 3) lines[2] += "…";
+  for (let i = 0; i < lines.length; i++) lines[i] = ellipsize(lines[i], tw, measure("bold", 54));
   for (const ln of lines) {
     text(ln, tx, ty, "bold", 54, white);
     ty += lineH(54) - 4;

@@ -40,6 +40,7 @@ type Data = {
   month: Summary;
   top: { all: Top[]; "30": Top[] };
   latest: { id: number; track_uri: string; played_at: string } | null;
+  current_id: number;
 };
 
 let root: HTMLElement;
@@ -171,7 +172,11 @@ function overviewCard(card: HTMLElement) {
   g.append(t1, t2);
   card.append(g);
   const d = data;
-  if (!d || d.off) return;
+  if (d?.off) {
+    card.append(el("hr", "st-hr"), el("p", "st-off-note", 'History is off. Turn on "Remember history" for long-term stats.'));
+    return;
+  }
+  if (!d) return;
   card.append(el("hr", "st-hr"));
   const g2 = el("div", "st-tiles");
   g2.append(
@@ -331,46 +336,57 @@ async function makeWrapped(): Promise<HTMLCanvasElement | null> {
   return renderWrapped(s, accent, art);
 }
 
-async function withWrapped(job: (c: HTMLCanvasElement, s: Summary) => Promise<void>) {
-  if (wrappedBusy || !data?.month?.plays) return;
+/** Save: ask where first (as Python did), then render and write, so nothing
+ *  is rendered for a cancelled dialog and the path is the user's choice. */
+async function saveWrapped() {
+  const s = data?.month;
+  if (wrappedBusy || !s?.plays) return;
   wrappedBusy = true;
   try {
+    const pick = await call<{ path?: string; cancelled?: boolean }>("history", "pick_wrapped_path", {
+      year: s.year,
+      month: s.month,
+    });
+    if (pick.cancelled) return;
+    flash("Rendering…");
     const c = await makeWrapped();
     if (!c) return;
-    await job(c, data.month);
+    const r = await call<{ path?: string; cancelled?: boolean }>("history", "save_wrapped", {
+      png: await canvasToPngBase64(c),
+      year: s.year,
+      month: s.month,
+    });
+    if (r.cancelled) return;
+    flash("Saved");
+    if (r.path) toast(`Saved to ${r.path}`);
   } catch (e) {
-    console.error("Wrapped failed", e);
-    flash("Couldn't render the image");
+    console.error("Could not save Wrapped image", e);
+    flash("Couldn't save the image");
   } finally {
     wrappedBusy = false;
   }
 }
 
-const saveWrapped = () =>
-  withWrapped(async (c, s) => {
-    try {
-      const r = await call<{ path?: string; cancelled?: boolean }>("history", "save_wrapped", {
-        png: await canvasToPngBase64(c),
-        year: s.year,
-        month: s.month,
-      });
-      if (!r.cancelled) flash("Saved");
-    } catch (e) {
-      console.error("Could not save Wrapped image", e);
-      flash("Couldn't save the image");
-    }
-  });
-
-const copyWrapped = () =>
-  withWrapped(async (c) => {
-    try {
-      await navigator.clipboard.write([new ClipboardItem({ "image/png": canvasToBlob(c) })]);
-      flash("Copied");
-    } catch (e) {
-      console.error("Could not copy Wrapped image", e);
-      flash("Couldn't copy the image");
-    }
-  });
+/** Copy: the ClipboardItem is built synchronously inside the click with a
+ *  Promise<Blob>, so a slow cover fetch can't outlive the user gesture. */
+async function copyWrapped() {
+  if (wrappedBusy || !data?.month?.plays) return;
+  wrappedBusy = true;
+  try {
+    const blob = makeWrapped().then((c) => {
+      if (!c) throw new Error("nothing to render");
+      return canvasToBlob(c);
+    });
+    flash("Rendering…");
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+    flash("Copied");
+  } catch (e) {
+    console.error("Could not copy Wrapped image", e);
+    flash("Couldn't copy the image");
+  } finally {
+    wrappedBusy = false;
+  }
+}
 
 function wrappedCard(card: HTMLElement) {
   const d = data!;
@@ -471,9 +487,9 @@ function goTab(id: string) {
 }
 
 function updateNow() {
-  const latest = data?.latest?.id ?? null;
+  const current = data?.current_id ?? 0;
   for (const { play, el: e } of nowEls) {
-    const now = isNow(play, latest, snap);
+    const now = isNow(play, current);
     e.textContent = now ? "Now playing" : play.dur;
     e.classList.toggle("now", now);
   }
@@ -527,10 +543,10 @@ function recentCard(card: HTMLElement) {
 }
 
 // ── Page ──
-function emptyCard(card: HTMLElement, title: string, body: string, action?: [string, () => void]) {
+function emptyCard(card: HTMLElement, title: string, body: string, action?: [string, () => void, string?]) {
   const e = el("div", "st-empty");
   e.append(el("div", "st-empty-note", "♫"), el("div", "st-empty-title", title), el("div", "st-empty-body", body));
-  if (action) e.append(btn(action[0], "secondary", action[1]));
+  if (action) e.append(btn(action[0], action[2] ?? "secondary", action[1]));
   card.append(e);
 }
 
@@ -558,6 +574,7 @@ function render() {
     emptyCard(c, "History is off", 'Turn on "Remember history" in Settings and your listening stats will build up here.', [
       "Open Settings",
       () => goTab("settings"),
+      "primary",
     ]);
     wrap.append(s);
   } else if (d && !d.all.plays) {
@@ -587,7 +604,11 @@ export function mount(rootEl: HTMLElement) {
   onSnapshot((s) => {
     const changed = s.track?.uri !== snap?.track?.uri;
     snap = s;
-    if (visible && changed) updateNow();
+    // The old play stops being "Now playing" as soon as the track changes.
+    if (visible && changed) {
+      dirty = true;
+      window.setTimeout(() => void refresh(true), 400);
+    }
   });
   // A play was committed (or history cleared): refresh now if the page is
   // open, otherwise remember that the next visit needs fresh data.

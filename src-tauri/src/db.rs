@@ -5,7 +5,7 @@ use crate::lyrics::{Line, Lyrics};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
 
 const SCHEMA: &str = "
@@ -52,6 +52,12 @@ pub struct Store {
     /// The "Remember history" setting (preferences/save_history). When off,
     /// nothing new is recorded or cached; reads keep working.
     enabled: AtomicBool,
+    /// Plays made while history was off: shown at the top of the History list
+    /// for this session, never written to disk. Their ids are negative.
+    session: Mutex<Vec<Play>>,
+    /// Id of the play that is playing right now (0 = none yet): set when a play
+    /// is committed, cleared when the track changes.
+    current: AtomicI64,
 }
 
 /// One play for the History list: no lyric bodies, just what the row shows.
@@ -185,7 +191,12 @@ impl Store {
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.execute_batch(SCHEMA)?;
         db.pragma_update(None, "synchronous", "NORMAL")?;
-        Ok(Store { db: Mutex::new(db), enabled: AtomicBool::new(true) })
+        Ok(Store {
+            db: Mutex::new(db),
+            enabled: AtomicBool::new(true),
+            session: Mutex::new(Vec::new()),
+            current: AtomicI64::new(0),
+        })
     }
 
     pub fn set_enabled(&self, on: bool) {
@@ -196,20 +207,52 @@ impl Store {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// Record one play; an Err when history is off, so callers record nothing.
+    /// Record one play. With history off it is kept in memory only (negative
+    /// id) so this session's plays still show in the History list; nothing
+    /// reaches the disk.
     pub fn record_play(&self, uri: &str, artist: &str, title: &str, art: &str, played_at: &str) -> rusqlite::Result<i64> {
-        if !self.enabled() {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        let db = self.db.lock().unwrap();
-        db.execute(
-            "INSERT INTO plays(track_uri, artist, title, album_art, played_at) VALUES (?,?,?,?,?)",
-            params![uri, artist, title, art, played_at],
-        )?;
-        Ok(db.last_insert_rowid())
+        let id = if self.enabled() {
+            let db = self.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO plays(track_uri, artist, title, album_art, played_at) VALUES (?,?,?,?,?)",
+                params![uri, artist, title, art, played_at],
+            )?;
+            db.last_insert_rowid()
+        } else {
+            let mut s = self.session.lock().unwrap();
+            let id = -(s.len() as i64) - 1;
+            s.push(Play {
+                id,
+                track_uri: uri.into(),
+                artist: artist.into(),
+                title: title.into(),
+                album_art: art.into(),
+                played_at: played_at.into(),
+                listened_ms: 0,
+            });
+            id
+        };
+        self.current.store(id, Ordering::Relaxed);
+        Ok(id)
+    }
+
+    /// The play playing right now (0 = none committed yet for this track).
+    pub fn current_play(&self) -> i64 {
+        self.current.load(Ordering::Relaxed)
+    }
+
+    /// A new track started: its play is not committed yet.
+    pub fn clear_current(&self) {
+        self.current.store(0, Ordering::Relaxed);
     }
 
     pub fn set_listened(&self, id: i64, ms: i64) -> rusqlite::Result<()> {
+        if id < 0 {
+            if let Some(p) = self.session.lock().unwrap().iter_mut().find(|p| p.id == id) {
+                p.listened_ms = ms;
+            }
+            return Ok(());
+        }
         self.db.lock().unwrap().execute("UPDATE plays SET listened_ms=? WHERE id=?", params![ms, id])?;
         Ok(())
     }
@@ -260,6 +303,7 @@ impl Store {
         self.read("lyrics", uri)
     }
 
+    #[allow(dead_code)] // used by Engine::pin_lyrics once the lyric-search UI calls it
     pub fn set_pin(&self, uri: &str, l: &Lyrics) -> rusqlite::Result<()> {
         self.db.lock().unwrap().execute(
             "INSERT OR REPLACE INTO lyric_pins(track_uri, mode, synced, plain, source, pinned_at)
@@ -282,6 +326,7 @@ impl Store {
     }
 
     /// Raw connection for feature modules with their own queries.
+    #[allow(dead_code)]
     pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> T) -> T {
         f(&self.db.lock().unwrap())
     }
@@ -295,13 +340,35 @@ impl Store {
         self.db.lock().unwrap().query_row("SELECT COUNT(*) FROM plays", [], |r| r.get(0)).unwrap_or(0)
     }
 
-    /// (play count, newest play id): the cheap fingerprint the UI refresh watches.
+    /// (play count incl. this session's unsaved plays, newest play id).
     pub fn fingerprint(&self) -> (i64, i64) {
-        self.db
+        let (n, max): (i64, i64) = self
+            .db
             .lock()
             .unwrap()
             .query_row("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM plays", [], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap_or((0, 0))
+            .unwrap_or((0, 0));
+        (n + self.session.lock().unwrap().len() as i64, max)
+    }
+
+    /// What the History/Stats pages show changed: a play was added or removed,
+    /// or lyrics were cached/pinned (a late verdict updates the badge of a
+    /// play that was committed before its lyrics arrived).
+    pub fn change_token(&self) -> (i64, i64, String) {
+        let (n, max) = self.fingerprint();
+        let stamp: String = self
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE((SELECT MAX(fetched_at) FROM lyrics), '') || '|' ||
+                        COALESCE((SELECT MAX(pinned_at) FROM lyric_pins), '') || '|' ||
+                        (SELECT COUNT(*) FROM lyrics) || '|' || (SELECT COUNT(*) FROM lyric_pins)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_default();
+        (n, max, stamp)
     }
 
     pub fn first_played(&self) -> Option<String> {
@@ -310,10 +377,43 @@ impl Store {
 
     /// Newest `limit` plays, newest first (id order), for the History list.
     pub fn entries(&self, limit: i64) -> rusqlite::Result<Vec<Entry>> {
-        let db = self.db.lock().unwrap();
-        let mut st = db.prepare(&entry_sql("ORDER BY p.id DESC LIMIT ?"))?;
-        let rows = st.query_map([limit], entry_row)?;
-        rows.collect()
+        let mut out = self.session_entries("");
+        out.truncate(limit.max(0) as usize);
+        let rest = limit - out.len() as i64;
+        if rest > 0 {
+            let db = self.db.lock().unwrap();
+            let mut st = db.prepare(&entry_sql("ORDER BY p.id DESC LIMIT ?"))?;
+            let rows = st.query_map([rest], entry_row)?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// This session's unsaved plays (history off) whose title or artist
+    /// contains `needle` (empty = all), newest first, as History rows.
+    fn session_entries(&self, needle: &str) -> Vec<Entry> {
+        let needle = needle.trim().to_lowercase();
+        self.session
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .filter(|p| needle.is_empty() || p.title.to_lowercase().contains(&needle) || p.artist.to_lowercase().contains(&needle))
+            .map(|p| Entry {
+                id: p.id,
+                track_uri: p.track_uri.clone(),
+                artist: p.artist.clone(),
+                title: p.title.clone(),
+                album_art: p.album_art.clone(),
+                played_at: p.played_at.clone(),
+                listened_ms: p.listened_ms,
+                mode: "none".into(),
+                synced_n: 0,
+                plain_n: 0,
+            })
+            .collect()
     }
 
     /// Plays whose title, artist or lyrics contain `query` (case-insensitive),
@@ -325,14 +425,26 @@ impl Store {
                 OR lower({EFF_SYNCED}) LIKE ?1 ESCAPE '\\' OR lower({EFF_PLAIN}) LIKE ?1 ESCAPE '\\'
              ORDER BY p.id DESC LIMIT ?2"
         );
-        let db = self.db.lock().unwrap();
-        let mut st = db.prepare(&entry_sql(&tail))?;
-        let rows = st.query_map(params![q, limit], entry_row)?;
-        rows.collect()
+        let mut out = self.session_entries(query);
+        out.truncate(limit.max(0) as usize);
+        let rest = limit - out.len() as i64;
+        if rest > 0 {
+            let db = self.db.lock().unwrap();
+            let mut st = db.prepare(&entry_sql(&tail))?;
+            let rows = st.query_map(params![q, rest], entry_row)?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        Ok(out)
     }
 
     /// One play with its lyrics (the user's pin if any, else the cache).
     pub fn entry(&self, id: i64) -> Option<FullEntry> {
+        if id < 0 {
+            let e = self.session_entries("").into_iter().find(|e| e.id == id)?;
+            return Some(FullEntry { entry: e, synced: vec![], plain: vec![] });
+        }
         let db = self.db.lock().unwrap();
         let sql = format!(
             "SELECT p.id, p.track_uri, p.artist, p.title, p.album_art, p.played_at, p.listened_ms,
@@ -893,12 +1005,64 @@ mod tests {
         let s = Store::open(&d).unwrap();
         s.save_lyrics("u1", &synced()).unwrap();
         s.set_enabled(false);
-        assert!(s.record_play("u2", "A", "T", "", "2026-09-01T10:00:00").is_err());
+        assert!(s.record_play("u2", "A", "T", "", "2026-09-01T10:00:00").unwrap() < 0);
         s.save_lyrics("u2", &synced()).unwrap();
         assert!(s.cached("u1").is_some() && s.cached("u2").is_none());
         assert_eq!(s.count(), 0);
         s.set_enabled(true);
         assert!(s.record_play("u2", "A", "T", "", "2026-09-01T10:00:00").is_ok());
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn session_plays_show_in_the_list_while_history_is_off_but_never_persist() {
+        let d = tmp();
+        let s = Store::open(&d).unwrap();
+        s.record_play("u0", "Old", "Saved", "", "2026-09-01T09:00:00").unwrap();
+        let fp0 = s.fingerprint();
+        s.set_enabled(false);
+        let a = s.record_play("u1", "Band", "First", "", "2026-09-01T10:00:00").unwrap();
+        let b = s.record_play("u2", "Band", "Second", "", "2026-09-01T10:05:00").unwrap();
+        assert!(a < 0 && b < 0 && a != b);
+        assert_ne!(s.fingerprint(), fp0, "the pages must see a new play");
+        s.set_listened(b, 90_000).unwrap();
+        let es = s.entries(10).unwrap();
+        assert_eq!(es.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(), ["Second", "First", "Saved"]);
+        assert_eq!(es[0].listened_ms, 90_000);
+        assert_eq!(s.entries(2).unwrap().len(), 2);
+        assert_eq!(s.search("first", 10).unwrap().len(), 1);
+        assert_eq!(s.entry(b).unwrap().entry.title, "Second");
+        assert_eq!(s.count(), 1, "only the saved play is on record");
+        assert_eq!(s.recent_plays(10).unwrap().len(), 1);
+        drop(s);
+        let s2 = Store::open(&d).unwrap();
+        assert_eq!(s2.count(), 1);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn current_play_follows_commits_and_track_changes() {
+        let d = tmp();
+        let s = Store::open(&d).unwrap();
+        assert_eq!(s.current_play(), 0);
+        let a = s.record_play("u", "A", "T", "", "2026-09-01T10:00:00").unwrap();
+        assert_eq!(s.current_play(), a);
+        s.clear_current(); // the same song starts again, not yet committed
+        assert_eq!(s.current_play(), 0);
+        let b = s.record_play("u", "A", "T", "", "2026-09-01T10:04:00").unwrap();
+        assert_eq!(s.current_play(), b);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn change_token_moves_when_lyrics_arrive_late() {
+        let d = tmp();
+        let s = Store::open(&d).unwrap();
+        s.record_play("u1", "A", "T", "", "2026-09-01T10:00:00").unwrap();
+        let t0 = s.change_token();
+        assert_eq!(s.change_token(), t0, "stable while nothing changes");
+        s.save_lyrics("u1", &synced()).unwrap();
+        assert_ne!(s.change_token(), t0);
         let _ = std::fs::remove_dir_all(d);
     }
 
