@@ -2,8 +2,30 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Statusify mini</title>
+    <link rel="stylesheet" href="/src/mini.css" />
     <script type="module" src="/src/mini.ts" defer></script>
   </head>
-  <body><div id="app"></div></body>
+  <body>
+    <div id="pill">
+      <div class="bg"></div>
+      <div class="sheen"></div>
+      <div id="cover"><span>&#9834;</span><img alt="" /></div>
+      <div id="txt">
+        <div id="track"><b></b><span></span></div>
+        <div id="lyric"></div>
+      </div>
+      <button class="ctl" id="prev" title="Previous" aria-label="Previous">
+        <svg viewBox="0 0 16 16"><polygon points="3.6,3.8 3.6,12.2 10.4,8" /><rect x="10.6" y="3.8" width="1.8" height="8.4" rx="0.6" /></svg>
+      </button>
+      <button class="ctl" id="next" title="Next" aria-label="Next">
+        <svg viewBox="0 0 16 16"><polygon points="3.6,3.8 3.6,12.2 10.4,8" /><rect x="10.6" y="3.8" width="1.8" height="8.4" rx="0.6" /></svg>
+      </button>
+      <button class="ctl" id="toggle" title="Play / pause" aria-label="Play / pause">
+        <svg viewBox="0 0 16 16"><polygon id="g-play" points="5.8,4.2 5.8,11.8 12.2,8" /><g id="g-pause"><rect x="5" y="4.4" width="2.1" height="7.2" rx="0.7" /><rect x="8.9" y="4.4" width="2.1" height="7.2" rx="0.7" /></g></svg>
+      </button>
+      <div class="rim"></div>
+    </div>
+  </body>
 </html>
