@@ -40,19 +40,28 @@ fn open_pipe(prefix: &str) -> Option<NamedPipeClient> {
 /// Presence updates for the connection task: Some(activity) or None to clear.
 pub type Update = Option<Value>;
 
+/// Drop the current pipe and re-handshake (Discord restarted, or a game
+/// grabbed the IPC pipe and left the presence dead).
+pub static RECONNECT: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+pub fn request_reconnect() {
+    RECONNECT.notify_waiters();
+}
+
 pub enum Status {
     Connected(String),
     Disconnected,
 }
 
 /// Keep a connection to Discord alive forever, sending the newest update.
-/// After a reconnect the last update is re-sent so the profile catches up.
+/// Nothing is replayed after a reconnect: the presence loop starts over
+/// (fresh rate ledger, empty screen) the moment it sees the connection, and
+/// a stale replay would spend a frame the ledger never saw.
 pub async fn run(app_id: String, rx: mpsc::UnboundedReceiver<Update>, status: impl Fn(Status) + Send + 'static) {
     run_on(PIPE_PREFIX, app_id, rx, status).await
 }
 
 pub async fn run_on(prefix: &str, app_id: String, mut rx: mpsc::UnboundedReceiver<Update>, status: impl Fn(Status) + Send + 'static) {
-    let mut last: Update = None;
     let mut nonce: u64 = 0;
     loop {
         if let Some(pipe) = open_pipe(prefix) {
@@ -77,7 +86,7 @@ pub async fn run_on(prefix: &str, app_id: String, mut rx: mpsc::UnboundedReceive
                             }
                         }
                     });
-                    let mut pending = last.clone().map(Some);
+                    let mut pending: Option<Update> = None;
                     loop {
                         if let Some(act) = pending.take() {
                             nonce += 1;
@@ -93,12 +102,15 @@ pub async fn run_on(prefix: &str, app_id: String, mut rx: mpsc::UnboundedReceive
                                 Some(mut u) => {
                                     // Only the newest update matters.
                                     while let Ok(n) = rx.try_recv() { u = n; }
-                                    last = u.clone();
                                     pending = Some(u);
                                 }
                                 None => return,
                             },
                             _ = &mut reader => break,
+                            _ = RECONNECT.notified() => {
+                                crate::log("Reconnect requested — re-handshaking");
+                                break;
+                            }
                         }
                     }
                     reader.abort();
@@ -107,13 +119,15 @@ pub async fn run_on(prefix: &str, app_id: String, mut rx: mpsc::UnboundedReceive
                 _ => {}
             }
         }
-        // Not running / not connected: absorb updates so `last` stays current.
+        // Not running / not connected: drop updates meanwhile; retry in 5 s
+        // (sooner when a reconnect is asked for).
         let wait = tokio::time::sleep(Duration::from_secs(5));
         tokio::pin!(wait);
         loop {
             tokio::select! {
                 _ = &mut wait => break,
-                u = rx.recv() => match u { Some(u) => last = u, None => return },
+                _ = RECONNECT.notified() => break,
+                u = rx.recv() => if u.is_none() { return },
             }
         }
     }

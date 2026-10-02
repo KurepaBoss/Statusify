@@ -6,18 +6,29 @@
 //! starts with nothing to show, not only after the bridge's "none" verdict —
 //! when Spotify's lyrics endpoint hangs the bridge takes ~60 s to give up.
 
+// The core area's modules live beside the engine (lib.rs is shared).
+#[path = "core_maint.rs"]
+pub mod maint;
+#[path = "core_plan.rs"]
+pub mod plan;
+#[path = "core_state.rs"]
+pub mod core_state;
+
+use crate::config::Config;
 use crate::db::{now_iso, Store};
 use crate::lrclib;
-use crate::lyrics::{Line, Lyrics};
+use crate::lyrics::{offset_key, resolve_offset_ms, Line, Lyrics};
 use crate::state::{now_ms, Snapshot, Track};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
 pub const PLAY_COMMIT_MS: i64 = 20_000;
+/// Lyric offsets are clamped to this (both ways) by the UI steppers.
+pub const OFFSET_LIMIT_MS: i64 = 5_000;
 pub const LRCLIB_EARLY: Duration = Duration::from_millis(2500);
 const PREFETCH_CAP: usize = 20;
 
@@ -26,7 +37,7 @@ const PREFETCH_CAP: usize = 20;
 pub enum Event {
     /// Every raw message from the Spicetify bridge, before the engine acts
     /// on it (queue, player_state, beats, ... are only seen this way).
-    Bridge(Value),
+    Bridge(#[allow(dead_code)] Value),
     TrackChanged,
     LyricsChanged,
     Paused,
@@ -63,6 +74,24 @@ pub struct Engine {
     pub lrclib_early: Duration,
     on_change: Box<dyn Fn(&Snapshot) + Send + Sync>,
     events: broadcast::Sender<Event>,
+    /// statusify.cfg, once the core feature hands it over (Engine::set_config).
+    config: OnceLock<Arc<Config>>,
+    /// State shared by the presence loop and the core feature.
+    pub core: core_state::Shared,
+}
+
+/// The blacklist: newline-separated, case-insensitive substrings matched
+/// against "artist title". Python stores the newlines as a literal "\n".
+pub fn parse_blacklist(raw: &str) -> Vec<String> {
+    raw.replace("\\n", "\n").lines().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty()).collect()
+}
+
+pub fn is_blacklisted(terms: &[String], artist: &str, title: &str) -> bool {
+    if terms.is_empty() {
+        return false;
+    }
+    let hay = format!("{artist} {title}").to_lowercase();
+    terms.iter().any(|t| hay.contains(t.as_str()))
 }
 
 fn s(v: &Value, k: &str) -> String {
@@ -90,12 +119,81 @@ impl Engine {
             lrclib_early: LRCLIB_EARLY,
             on_change: Box::new(on_change),
             events: broadcast::channel(256).0,
+            config: OnceLock::new(),
+            core: core_state::Shared::default(),
         })
+    }
+
+    /// Hand over statusify.cfg; settings are read from it live from now on.
+    pub fn set_config(&self, c: Arc<Config>) {
+        let _ = self.config.set(c);
+        self.refresh_config();
+    }
+
+    pub fn config(&self) -> Option<&Arc<Config>> {
+        self.config.get()
     }
 
     /// Call after writing statusify.cfg so every feature re-reads it.
     pub fn config_changed(&self) {
+        self.refresh_config();
         self.emit(Event::ConfigChanged);
+    }
+
+    /// Settings the engine keeps as state: the LRCLIB switch and whether the
+    /// current track is blacklisted (an edited blacklist applies at once).
+    fn refresh_config(&self) {
+        let Some(c) = self.config() else { return };
+        self.lrclib_enabled.store(c.get_bool("preferences", "lrclib_fallback", true), Ordering::Relaxed);
+        let terms = self.blacklist();
+        let mut g = self.inner.lock().unwrap();
+        let Some(t) = g.snap.track.as_mut() else { return };
+        let b = is_blacklisted(&terms, &t.artist, &t.title);
+        if b != t.blacklisted {
+            t.blacklisted = b;
+            crate::log(&format!(
+                "{}  ·  {} — {}",
+                if b { "Blacklisted — RPC suppressed" } else { "No longer blacklisted" },
+                t.artist,
+                t.title
+            ));
+            drop(g);
+            self.changed();
+        }
+    }
+
+    pub fn blacklist(&self) -> Vec<String> {
+        self.config().map(|c| parse_blacklist(&c.get_or("preferences", "blacklist", ""))).unwrap_or_default()
+    }
+
+    /// The global lyric delay (preferences.lyric_delay_ms).
+    pub fn global_delay_ms(&self) -> i64 {
+        self.config().map_or(0, |c| c.get_i64("preferences", "lyric_delay_ms", 0))
+    }
+
+    /// The per-track offset for `uri` ([offsets] section), else the global.
+    pub fn offset_ms_for(&self, uri: &str) -> i64 {
+        let global = self.global_delay_ms();
+        if uri.is_empty() {
+            return global;
+        }
+        let raw = self.config().and_then(|c| c.get("offsets", &offset_key(uri)));
+        resolve_offset_ms(raw.as_deref(), global)
+    }
+
+    /// The effective lyric offset for the current track.
+    pub fn offset_ms(&self) -> i64 {
+        let uri = self.inner.lock().unwrap().snap.track.as_ref().map(|t| t.uri.clone()).unwrap_or_default();
+        self.offset_ms_for(&uri)
+    }
+
+    /// preferences.save_history: off means no plays recorded, no lyric cache.
+    pub fn history_enabled(&self) -> bool {
+        self.config().is_none_or(|c| c.get_bool("preferences", "save_history", true))
+    }
+
+    fn store(&self) -> Option<&Store> {
+        self.store.as_ref().filter(|_| self.history_enabled())
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -113,6 +211,7 @@ impl Engine {
         });
     }
 
+    #[allow(dead_code)] // contract API for the nowplaying feature
     /// Lyrics from somewhere other than the bridge (search, translation
     /// source switch, ...) for the current track.
     pub fn set_lyrics(&self, l: Lyrics) {
@@ -122,6 +221,7 @@ impl Engine {
         self.changed();
     }
 
+    #[allow(dead_code)] // contract API for the nowplaying feature
     /// The user's choice for the current track: stored in lyric_pins and
     /// preferred over every source from now on.
     pub fn pin_lyrics(&self, l: Lyrics) {
@@ -136,6 +236,7 @@ impl Engine {
         self.changed();
     }
 
+    #[allow(dead_code)] // contract API for the nowplaying feature
     pub fn clear_pin(&self) {
         let mut g = self.inner.lock().unwrap();
         if let (Some(st), Some(t)) = (&self.store, &g.snap.track) {
@@ -144,6 +245,7 @@ impl Engine {
         g.pinned_uri = None;
     }
 
+    #[allow(dead_code)] // contract API for the nowplaying feature
     pub fn is_pinned(&self) -> bool {
         let g = self.inner.lock().unwrap();
         g.snap.track.as_ref().is_some_and(|t| g.pinned_uri.as_deref() == Some(t.uri.as_str()))
@@ -159,13 +261,27 @@ impl Engine {
     }
 
     pub fn update(&self, f: impl FnOnce(&mut Snapshot)) {
-        f(&mut self.inner.lock().unwrap().snap);
+        let mut paused = false;
+        {
+            let mut g = self.inner.lock().unwrap();
+            let was = g.snap.bridge_connected;
+            f(&mut g.snap);
+            // The bridge went away: Spotify is not playing for us any more.
+            if was && !g.snap.bridge_connected && g.snap.is_playing {
+                g.snap.is_playing = false;
+                self.finish_play(&mut g);
+                paused = true;
+            }
+        }
+        if paused {
+            self.emit(Event::Paused);
+        }
         self.changed();
     }
 
     fn apply(&self, g: &mut Inner, l: Lyrics) {
         crate::log(&format!("Lyrics ({})  ·  {}  ·  {} lines", l.source, l.mode, l.line_count()));
-        if let (Some(st), Some(t)) = (&self.store, &g.snap.track) {
+        if let (Some(st), Some(t)) = (self.store(), &g.snap.track) {
             if l.source != "cache" && !l.source.contains("chosen") {
                 let _ = st.save_lyrics(&t.uri, &l);
             }
@@ -182,24 +298,53 @@ impl Engine {
             "track_change" => self.on_track(msg),
             "position" => self.on_position(msg),
             "paused" => {
+                // Older bridges repeat "paused" every 500 ms: act on the
+                // transition only.
                 let mut g = self.inner.lock().unwrap();
                 if g.snap.is_playing {
                     g.snap.is_playing = false;
+                    self.maybe_commit(&mut g);
+                    self.finish_play(&mut g);
                     drop(g);
                     self.emit(Event::Paused);
                     self.changed();
                 }
             }
+            "hello" => crate::log(&format!(
+                "Lyrics bridge v{} connected",
+                msg.get("version").and_then(|v| v.as_str()).unwrap_or("?")
+            )),
             "lyrics" => self.on_lyrics(msg),
             "lyrics_prefetch" => self.on_prefetch(msg),
-            "lyrics_debug" => crate::log(&format!("[Bridge] {}", s(msg, "message"))),
+            "lyrics_debug" => {
+                let m = s(msg, "message");
+                if !m.is_empty() {
+                    crate::log(&format!("[Bridge] {m}"));
+                }
+            }
             _ => {}
         }
     }
 
+    /// Write the listening time of the play in progress.
     fn finish_play(&self, g: &mut Inner) {
-        if let (Some(id), Some(st)) = (g.play.id, &self.store) {
+        if let (Some(id), Some(st)) = (g.play.id, self.store()) {
             let _ = st.set_listened(id, g.play.listened_ms);
+            g.play.saved_ms = g.play.listened_ms;
+        }
+    }
+
+    /// A track becomes a play (history row) only after PLAY_COMMIT_MS of
+    /// real listening: opening on a paused song or skipping past one must
+    /// not count.
+    fn maybe_commit(&self, g: &mut Inner) {
+        if g.play.id.is_some() || g.play.listened_ms < PLAY_COMMIT_MS {
+            return;
+        }
+        if let (Some(st), Some(t)) = (self.store(), &g.snap.track) {
+            if t.uri == g.play.uri && !t.uri.is_empty() {
+                g.play.id = st.record_play(&t.uri, &t.artist, &t.title, &t.album_art, &g.play.started_at).ok();
+            }
         }
     }
 
@@ -207,16 +352,18 @@ impl Engine {
         let uri = s(m, "track_uri");
         {
             let mut g = self.inner.lock().unwrap();
+            self.maybe_commit(&mut g); // the previous track, if it earned it
             self.finish_play(&mut g);
-            let track = Track {
-                uri: uri.clone(),
-                artist: s(m, "artist"),
-                title: s(m, "title"),
-                album: s(m, "album"),
-                album_art: s(m, "album_art"),
-                blacklisted: false,
-            };
-            crate::log(&format!("Now playing  ·  {} — {}", track.artist, track.title));
+            let (artist, title) = (s(m, "artist"), s(m, "title"));
+            let blacklisted = is_blacklisted(&self.blacklist(), &artist, &title);
+            let track = Track { uri: uri.clone(), artist, title, album: s(m, "album"), album_art: s(m, "album_art"), blacklisted };
+            if blacklisted {
+                crate::log(&format!("Blacklisted — RPC suppressed  ·  {} — {}", track.artist, track.title));
+            } else {
+                crate::log(&format!("Now playing  ·  {} — {}", track.artist, track.title));
+            }
+            // The per-song dropped-line counter starts over.
+            self.core.with(|c| c.dropped_lines = 0);
             g.snap.track = Some(track);
             g.snap.duration_ms = i(m, "duration_ms").unwrap_or(0);
             g.snap.position_ms = 0;
@@ -265,16 +412,14 @@ impl Engine {
             g.snap.duration_ms = d;
         }
         let resumed = playing && !g.snap.is_playing;
+        let paused = !playing && g.snap.is_playing;
         g.snap.is_playing = playing;
-        if g.play.id.is_none() && g.play.listened_ms >= PLAY_COMMIT_MS {
-            if let (Some(st), Some(t)) = (&self.store, &g.snap.track) {
-                if t.uri == g.play.uri {
-                    g.play.id = st.record_play(&t.uri, &t.artist, &t.title, &t.album_art, &g.play.started_at).ok();
-                }
-            }
+        self.maybe_commit(&mut g);
+        if paused {
+            self.finish_play(&mut g);
         }
         // Keep listened_ms current, so a play cut short by quitting still counts.
-        if let (Some(id), Some(st)) = (g.play.id, &self.store) {
+        if let (Some(id), Some(st)) = (g.play.id, self.store()) {
             if g.play.listened_ms - g.play.saved_ms >= 5_000 {
                 let _ = st.set_listened(id, g.play.listened_ms);
                 g.play.saved_ms = g.play.listened_ms;
@@ -284,11 +429,16 @@ impl Engine {
         if resumed {
             self.emit(Event::Resumed);
         }
+        if paused {
+            self.emit(Event::Paused);
+        }
         self.changed();
     }
 
     fn on_lyrics(self: &Arc<Self>, m: &Value) {
-        let l = lyrics_from(m, "Spicy");
+        let synced = m.get("synced").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty());
+        let mode = m.get("mode").or(m.get("lyrics_mode")).and_then(|x| x.as_str()).unwrap_or("none");
+        let l = lyrics_from(m, if mode == "synced" && synced { "Spicy" } else { "fallback" });
         let uri = s(m, "track_uri");
         let mut fetch = None;
         {

@@ -139,6 +139,106 @@ pub fn current_index(synced: &[Line], pos_ms: i64) -> Option<usize> {
     n.checked_sub(1)
 }
 
+
+/// Config-safe [offsets] option name for a track URI: the base62 id after the
+/// last ':'. ':' is a configparser delimiter, so the raw URI can never
+/// round-trip through statusify.cfg (Python 3.13 refuses to write it; older
+/// versions parse it back as the option "spotify").
+pub fn offset_key(uri: &str) -> String {
+    uri.rsplit(':').next().unwrap_or("").to_string()
+}
+
+/// A stored per-track offset against the global delay: "" / None means no
+/// override; a value that will not parse falls back to the global, so a
+/// hand-edited statusify.cfg cannot break playback.
+pub fn resolve_offset_ms(raw: Option<&str>, global_ms: i64) -> i64 {
+    match raw {
+        None | Some("") => global_ms,
+        Some(r) => r.trim().parse::<i64>().unwrap_or(global_ms),
+    }
+}
+
+/// (current, next) line for `pos_ms`, which must already include the lyric
+/// offset. Synced: the last line whose start has been reached, and the next
+/// line with different words. Plain: linear interpolation over the track.
+pub fn select_line(l: &Lyrics, pos_ms: i64, duration_ms: i64) -> (String, String) {
+    if l.mode == "synced" && !l.synced.is_empty() {
+        let Some(idx) = current_index(&l.synced, pos_ms) else { return (String::new(), String::new()) };
+        let cur = l.synced[idx].words.clone();
+        let nxt = l.synced[idx + 1..].iter().find(|e| e.words != cur).map(|e| e.words.clone()).unwrap_or_default();
+        return (cur, nxt);
+    }
+    if l.mode == "plain" && !l.plain.is_empty() && duration_ms > 0 {
+        let ratio = (pos_ms as f64 / duration_ms as f64).clamp(0.0, 1.0);
+        let n = l.plain.len();
+        let i = ((ratio * n as f64) as usize).min(n - 1);
+        return (l.plain[i].clone(), l.plain[(i + 1).min(n - 1)].clone());
+    }
+    (String::new(), String::new())
+}
+
+/// An instrumental stretch: the presence shows the instrumental marker.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Gap {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub gap_ms: i64,
+    /// -2 intro, -3 outro, else the index of the line before the gap.
+    pub key: i64,
+}
+
+/// Instrumental gaps in a synced sheet (port of _calc_instrumental_gaps).
+/// A gap is >= 2x the song's median line length and >= 8 s; a mid-song gap
+/// also needs 4 s of real silence after the line is sung, and the marker
+/// goes up 3 s into the line so it can still be read.
+pub fn instrumental_gaps(synced: &[Line], duration_ms: i64) -> Vec<Gap> {
+    if synced.is_empty() || duration_ms <= 0 {
+        return vec![];
+    }
+    let n = synced.len();
+    let mut all: Vec<i64> = (0..n - 1).map(|i| synced[i + 1].start_ms - synced[i].start_ms).collect();
+    if synced[0].start_ms > 0 {
+        all.push(synced[0].start_ms);
+    }
+    all.push(duration_ms - synced[n - 1].start_ms);
+    all.sort();
+    let mid = all.len() / 2;
+    let median = if all.len() % 2 == 0 { (all[mid - 1] + all[mid]) as f64 / 2.0 } else { all[mid] as f64 };
+    const MULT: f64 = 2.0;
+    const ABS: i64 = 8000;
+    let mut gaps = Vec::new();
+    let intro = synced[0].start_ms;
+    if intro >= ABS && intro as f64 >= median * MULT {
+        gaps.push(Gap { start_ms: 0, end_ms: intro, gap_ms: intro, key: -2 });
+    }
+    for i in 0..n - 1 {
+        let (cur, nxt) = (synced[i].start_ms, synced[i + 1].start_ms);
+        let g = nxt - cur;
+        if g < ABS || (g as f64) < median * MULT {
+            continue;
+        }
+        let sung_end = cur + (median as i64).min(g - 1000);
+        if nxt - sung_end < 4000 {
+            continue;
+        }
+        let start = cur + 3000;
+        if start >= nxt {
+            continue;
+        }
+        gaps.push(Gap { start_ms: start, end_ms: nxt, gap_ms: g, key: i as i64 });
+    }
+    let last = synced[n - 1].start_ms;
+    let outro = duration_ms - last;
+    if outro >= ABS && outro as f64 >= median * MULT {
+        let start = last + (median as i64).min(outro - 1000);
+        if start < duration_ms {
+            gaps.push(Gap { start_ms: start, end_ms: duration_ms, gap_ms: outro, key: -3 });
+        }
+    }
+    gaps.sort_by_key(|g| g.start_ms);
+    gaps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +290,43 @@ mod tests {
         assert_eq!(current_index(&s, 500), None);
         assert_eq!(current_index(&s, 1000), Some(0));
         assert_eq!(current_index(&s, 9000), Some(1));
+    }
+
+    #[test]
+    fn offsets_resolve_like_python() {
+        assert_eq!(offset_key("spotify:track:4uLU6hMCjMI75M1A2tKUQC"), "4uLU6hMCjMI75M1A2tKUQC");
+        assert_eq!(offset_key(""), "");
+        assert_eq!(resolve_offset_ms(None, -40), -40);
+        assert_eq!(resolve_offset_ms(Some(""), -40), -40);
+        assert_eq!(resolve_offset_ms(Some("250"), -40), 250);
+        assert_eq!(resolve_offset_ms(Some("abc"), -40), -40);
+    }
+
+    #[test]
+    fn select_line_synced_and_plain() {
+        let l = Lyrics { mode: "synced".into(), synced: parse_lrc("[00:01.00]a
+[00:02.00]a
+[00:03.00]b"), plain: vec![], source: String::new() };
+        assert_eq!(select_line(&l, 500, 10_000), (String::new(), String::new()));
+        assert_eq!(select_line(&l, 1500, 10_000), ("a".into(), "b".into()));
+        let p = Lyrics { mode: "plain".into(), synced: vec![], plain: vec!["x".into(), "y".into()], source: String::new() };
+        assert_eq!(select_line(&p, 0, 10_000), ("x".into(), "y".into()));
+        assert_eq!(select_line(&p, 9_999, 10_000), ("y".into(), "y".into()));
+    }
+
+    #[test]
+    fn instrumental_gaps_intro_mid_outro() {
+        let mk = |v: &[i64]| v.iter().map(|&s| Line { start_ms: s, words: "w".into() }).collect::<Vec<_>>();
+        // lines every 3 s, a 20 s break after line at 21 s, intro 12 s, outro 30 s
+        let mut starts: Vec<i64> = (0..4).map(|i| 12_000 + i * 3_000).collect();
+        starts.push(41_000);
+        starts.extend((1..5).map(|i| 41_000 + i * 3_000));
+        let s = mk(&starts);
+        let g = instrumental_gaps(&s, 83_000);
+        assert_eq!(g[0], Gap { start_ms: 0, end_ms: 12_000, gap_ms: 12_000, key: -2 });
+        assert_eq!(g[1], Gap { start_ms: 24_000, end_ms: 41_000, gap_ms: 20_000, key: 3 });
+        assert_eq!(g[2], Gap { start_ms: 56_000, end_ms: 83_000, gap_ms: 30_000, key: -3 });
+        assert!(instrumental_gaps(&mk(&[0, 3000, 6000]), 9000).is_empty());
+        assert!(instrumental_gaps(&[], 9000).is_empty());
     }
 }

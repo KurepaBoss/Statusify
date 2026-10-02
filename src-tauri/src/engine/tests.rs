@@ -155,3 +155,61 @@ async fn plays_commit_after_twenty_seconds_listened() {
     assert_eq!(plays[0].listened_ms, 25_000);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+fn tmpdir(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("statusify-rs-{tag}-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+#[tokio::test]
+async fn pause_saves_listening_time_and_history_switch_is_honoured() {
+    let dir = tmpdir("pause");
+    let mut e = Engine::new(Some(Store::open(&dir).unwrap()), |_| {});
+    Arc::get_mut(&mut e).unwrap().lrclib_enabled = AtomicBool::new(false);
+    std::fs::write(dir.join("statusify.cfg"), "[preferences]\nsave_history = true\n").unwrap();
+    let cfg = Arc::new(crate::config::Config::open(&dir));
+    e.set_config(cfg.clone());
+    track(&e, "u1");
+    for p in (0..=22_000).step_by(1000) {
+        e.handle(&json!({"type":"position","position_ms":p,"is_playing":true}));
+    }
+    e.handle(&json!({"type":"position","position_ms":23_000,"is_playing":true}));
+    e.handle(&json!({"type":"paused"}));
+    assert_eq!(e.recent_plays(5)[0].listened_ms, 23_000);
+    // history off: nothing new is recorded
+    cfg.set("preferences", "save_history", "false");
+    e.config_changed();
+    track(&e, "u2");
+    for p in (0..=25_000).step_by(1000) {
+        e.handle(&json!({"type":"position","position_ms":p,"is_playing":true}));
+    }
+    track(&e, "u3");
+    assert_eq!(e.recent_plays(5).len(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn bridge_disconnect_means_not_playing() {
+    let e = engine("http://127.0.0.1:9/none");
+    e.update(|s| s.bridge_connected = true);
+    track(&e, "u1");
+    assert!(e.snapshot().is_playing);
+    let mut rx = e.subscribe();
+    e.update(|s| s.bridge_connected = false);
+    assert!(!e.snapshot().is_playing);
+    assert!(matches!(rx.try_recv(), Ok(Event::Paused)));
+}
+
+#[tokio::test]
+async fn blacklist_and_offsets_come_from_config() {
+    let dir = tmpdir("bl");
+    std::fs::write(dir.join("statusify.cfg"), "[preferences]\nblacklist = peep\nzzz\nlyric_delay_ms = 120\n\n[offsets]\nabc = -300\n").unwrap();
+    let e = engine("http://127.0.0.1:9/none");
+    e.set_config(Arc::new(crate::config::Config::open(&dir)));
+    e.handle(&json!({"type":"track_change","track_uri":"spotify:track:abc","artist":"Lil Peep","title":"x","duration_ms":1000}));
+    assert!(e.snapshot().track.unwrap().blacklisted);
+    assert_eq!(e.offset_ms(), -300);
+    assert_eq!(e.offset_ms_for("spotify:track:other"), 120);
+    let _ = std::fs::remove_dir_all(dir);
+}
