@@ -64,11 +64,12 @@ pub async fn serve(listener: TcpListener, engine: Arc<Engine>, outbox: Outbox) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     #[tokio::test]
     async fn bridge_messages_reach_engine_and_commands_reach_bridge() {
         let mut e = Engine::new(None, |_| {});
-        Arc::get_mut(&mut e).unwrap().lrclib_enabled = false;
+        Arc::get_mut(&mut e).unwrap().lrclib_enabled = AtomicBool::new(false);
         let l = bind(0).await.unwrap();
         let port = l.local_addr().unwrap().port();
         let out = Outbox::default();

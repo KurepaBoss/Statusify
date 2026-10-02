@@ -4,11 +4,48 @@
 //! The Python app's look-ahead planner (statusify_presence_plan.py) is a
 //! later port.
 
+use crate::engine::Engine;
 use crate::lyrics::{current_index, join_lines};
 use crate::state::Snapshot;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+
+/// Push the newest presence to Discord within the rate budget.
+pub async fn run_loop(engine: Arc<Engine>, tx: mpsc::UnboundedSender<crate::discord::Update>) {
+    let mut budget = Budget::new();
+    let init = Some(String::from("\u{0}init"));
+    let mut shown = init.clone();
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let snap = engine.snapshot();
+        if snap.discord_user.is_none() {
+            shown = init.clone(); // resend after reconnect
+            continue;
+        }
+        let now = crate::state::now_ms();
+        let want = desired(&snap, now);
+        let key = want.as_ref().map(|(k, _)| k.clone());
+        if key.as_deref() == Some("\u{0}blank") || key == shown {
+            continue;
+        }
+        if !budget.try_take(Instant::now()) {
+            continue;
+        }
+        let update = want.map(|(_, lines)| {
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            build_activity(&snap, &refs, now)
+        });
+        match &update {
+            Some(a) => crate::log(&format!("RPC  ·  {}", a["state"].as_str().unwrap_or(""))),
+            None => crate::log("RPC cleared"),
+        }
+        let _ = tx.send(update);
+        shown = key;
+    }
+}
 
 pub const RATE_CALLS: usize = 5;
 pub const RATE_WINDOW: Duration = Duration::from_secs(20);

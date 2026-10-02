@@ -1,18 +1,20 @@
 mod bridge;
+mod config;
 mod db;
 mod discord;
 mod engine;
+mod features;
 mod lrclib;
 mod lyrics;
 mod presence;
 mod state;
 
 use engine::Engine;
-use serde_json::json;
+use features::{Ctx, Feature};
+use serde_json::{json, Value};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 use tokio::sync::mpsc;
 
@@ -28,9 +30,9 @@ pub fn log(msg: &str) {
     }
 }
 
-/// Where history.db, .env and the log live: STATUSIFY_DATA_DIR, else the
-/// folder the exe is in.
-fn data_dir() -> PathBuf {
+/// Where history.db, statusify.cfg, .env and the log live:
+/// STATUSIFY_DATA_DIR, else the folder the exe is in.
+pub fn data_dir() -> PathBuf {
     std::env::var_os("STATUSIFY_DATA_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)))
@@ -38,63 +40,44 @@ fn data_dir() -> PathBuf {
 }
 
 struct App {
-    engine: Arc<Engine>,
-    outbox: bridge::Outbox,
+    ctx: Arc<Ctx>,
+    features: Vec<Arc<dyn Feature>>,
 }
 
 #[tauri::command]
 fn snapshot(app: tauri::State<App>) -> state::Snapshot {
-    app.engine.snapshot()
+    app.ctx.engine.snapshot()
 }
 
 #[tauri::command]
 fn recent_plays(app: tauri::State<App>, limit: i64) -> Vec<db::Play> {
-    app.engine.recent_plays(limit)
+    app.ctx.engine.recent_plays(limit)
 }
 
 /// Transport: play, pause, next, prev, toggle, shuffle, repeat, like.
 #[tauri::command]
 fn player(app: tauri::State<App>, action: String) -> bool {
-    app.outbox.send(json!({"type": "player", "action": action}))
+    app.ctx.outbox.send(json!({"type": "player", "action": action}))
 }
 
 #[tauri::command]
 fn seek(app: tauri::State<App>, position_ms: i64) -> bool {
-    app.outbox.send(json!({"type": "seek", "position_ms": position_ms.max(0)}))
+    app.ctx.outbox.send(json!({"type": "seek", "position_ms": position_ms.max(0)}))
 }
 
-/// Push the newest presence to Discord within the rate budget.
-async fn presence_loop(engine: Arc<Engine>, tx: mpsc::UnboundedSender<discord::Update>) {
-    let mut budget = presence::Budget::new();
-    let init = Some(String::from("\u{0}init"));
-    let mut shown = init.clone();
-    loop {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let snap = engine.snapshot();
-        if snap.discord_user.is_none() {
-            shown = init.clone(); // resend after reconnect
-            continue;
-        }
-        let now = state::now_ms();
-        let want = presence::desired(&snap, now);
-        let key = want.as_ref().map(|(k, _)| k.clone());
-        if key.as_deref() == Some("\u{0}blank") || key == shown {
-            continue;
-        }
-        if !budget.try_take(Instant::now()) {
-            continue;
-        }
-        let update = want.map(|(_, lines)| {
-            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-            presence::build_activity(&snap, &refs, now)
-        });
-        match &update {
-            Some(a) => log(&format!("RPC  ·  {}", a["state"].as_str().unwrap_or(""))),
-            None => log("RPC cleared"),
-        }
-        let _ = tx.send(update);
-        shown = key;
-    }
+/// The one entry point to every feature module (see features/mod.rs).
+#[tauri::command]
+async fn call(app: tauri::State<'_, App>, feature: String, action: String, args: Option<Value>) -> Result<Value, String> {
+    let f = app
+        .features
+        .iter()
+        .find(|f| f.name() == feature)
+        .cloned()
+        .ok_or_else(|| format!("no feature {feature}"))?;
+    let ctx = app.ctx.clone();
+    tauri::async_runtime::spawn_blocking(move || f.call(&ctx, &action, args.unwrap_or(Value::Null)))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -117,11 +100,15 @@ pub fn run() {
                     None
                 }
             };
+            let h = handle.clone();
             let engine = Engine::new(store, move |s| {
-                let _ = handle.emit("snapshot", s);
+                let _ = h.emit("snapshot", s);
             });
+            let config = Arc::new(config::Config::open(&dir));
             let outbox = bridge::Outbox::default();
-            app.manage(App { engine: engine.clone(), outbox: outbox.clone() });
+            let ctx = Arc::new(Ctx { engine: engine.clone(), outbox: outbox.clone(), config, app: handle, data_dir: dir.clone() });
+            let feats = features::all();
+            app.manage(App { ctx: ctx.clone(), features: feats.clone() });
 
             let port: u16 = std::env::var("STATUSIFY_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8765);
             let e = engine.clone();
@@ -149,13 +136,20 @@ pub fn run() {
                         }
                         discord::Status::Disconnected => e.update(|s| s.discord_user = None),
                     }));
-                    tauri::async_runtime::spawn(presence_loop(engine.clone(), tx));
+                    tauri::async_runtime::spawn(presence::run_loop(engine.clone(), tx));
                 }
                 None => engine.update(|s| s.note = "No DISCORD_APP_ID in .env — presence is off".into()),
             }
+
+            let c = ctx.clone();
+            tauri::async_runtime::spawn(async move {
+                for f in feats {
+                    f.start(&c);
+                }
+            });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![snapshot, recent_plays, player, seek])
+        .invoke_handler(tauri::generate_handler![snapshot, recent_plays, player, seek, call])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

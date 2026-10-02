@@ -123,6 +123,32 @@ impl Store {
         self.read("lyrics", uri)
     }
 
+    pub fn set_pin(&self, uri: &str, l: &Lyrics) -> rusqlite::Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO lyric_pins(track_uri, mode, synced, plain, source, pinned_at)
+             VALUES (?,?,?,?,?,?)",
+            params![
+                uri,
+                l.mode,
+                serde_json::to_string(&l.synced).unwrap(),
+                serde_json::to_string(&l.plain).unwrap(),
+                l.source,
+                now_iso()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_pin(&self, uri: &str) -> rusqlite::Result<()> {
+        self.db.lock().unwrap().execute("DELETE FROM lyric_pins WHERE track_uri=?", [uri])?;
+        Ok(())
+    }
+
+    /// Raw connection for feature modules with their own queries.
+    pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> T) -> T {
+        f(&self.db.lock().unwrap())
+    }
+
     pub fn save_lyrics(&self, uri: &str, l: &Lyrics) -> rusqlite::Result<()> {
         if uri.is_empty() || l.is_none() {
             return Ok(());

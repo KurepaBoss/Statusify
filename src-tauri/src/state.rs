@@ -26,6 +26,8 @@ pub struct Snapshot {
     pub bridge_connected: bool,
     pub discord_user: Option<String>,
     pub note: String,
+    /// Feature data (Engine::set_extra), e.g. extras["translation"].
+    pub extras: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Snapshot {

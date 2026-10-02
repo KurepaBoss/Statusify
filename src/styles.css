@@ -19,8 +19,20 @@ html, body { height: 100%; background: var(--base); color: var(--fg);
 #shade { position: fixed; inset: 0;
   background: linear-gradient(to bottom, rgba(0,0,0,0.25), rgba(0,0,0,0.05) 30%, rgba(0,0,0,0.45)); }
 
-main { position: relative; height: 100%; display: flex; flex-direction: column; padding: 18px 20px 12px; gap: 12px; }
-header { display: flex; gap: 14px; align-items: center; }
+body { display: flex; flex-direction: column; }
+#tabs { position: relative; display: flex; gap: 4px; padding: 10px 16px 0; flex: none; }
+.tab { all: unset; cursor: pointer; padding: 6px 12px; border-radius: 99px; font-size: 13px; color: var(--dim); }
+.tab:hover { color: var(--fg); background: rgba(255,255,255,0.06); }
+.tab.on { color: var(--fg); background: rgba(255,255,255,0.12); }
+.tab:focus-visible { outline: 2px solid var(--accent); }
+#pages { position: relative; flex: 1; min-height: 0; }
+.page { position: absolute; inset: 0; display: none; overflow: auto; }
+.page.on { display: block; }
+#page-now.on { display: flex; flex-direction: column; padding: 14px 20px 12px; gap: 12px; overflow: hidden; }
+/* Other pages sit on a darker backdrop, like the Python app's cover mode. */
+body:not([data-page="now"]) #shade { background: rgba(0,0,0,0.55); }
+.placeholder { padding: 40px; color: var(--dim); text-align: center; }
+.np-head { display: flex; gap: 14px; align-items: center; }
 #cover { width: 64px; height: 64px; border-radius: 8px; object-fit: cover; flex: none;
   box-shadow: 0 6px 20px rgba(0,0,0,0.45); background: rgba(255,255,255,0.06); }
 #cover:not([src]), #cover[src=""] { visibility: hidden; }
@@ -44,21 +56,16 @@ header { display: flex; gap: 14px; align-items: center; }
 
 #progress { height: 3px; border-radius: 3px; background: rgba(255,255,255,0.14); cursor: pointer; }
 #bar { height: 100%; width: 0; border-radius: 3px; background: var(--fg); }
-footer { display: flex; justify-content: space-between; align-items: center; }
+.np-foot { display: flex; justify-content: space-between; align-items: center; }
 .transport { display: flex; gap: 6px; }
-button { all: unset; cursor: pointer; width: 36px; height: 36px; display: grid; place-items: center;
+.transport button { all: unset; cursor: pointer; width: 36px; height: 36px; display: grid; place-items: center;
   border-radius: 50%; font-size: 16px; color: var(--fg); background: rgba(255,255,255,0.08);
   transition: background 0.15s; }
-button:hover { background: rgba(255,255,255,0.18); }
-button:focus-visible { outline: 2px solid var(--accent); }
+.transport button:hover { background: rgba(255,255,255,0.18); }
+.transport button:focus-visible { outline: 2px solid var(--accent); }
 .status { display: flex; gap: 6px; }
 .pill { font-size: 12px; padding: 3px 9px; border-radius: 99px; background: rgba(255,255,255,0.08); color: var(--dim); }
 .pill::before { content: "\25CF"; margin-right: 5px; color: #e5534b; }
 .pill.ok::before { color: var(--accent); }
 #note { color: #f0b429; font-size: 12px; }
 #note:empty { display: none; }
-#history { font-size: 13px; color: var(--dim); max-height: 30%; overflow: auto; }
-#history summary { cursor: pointer; }
-#plays { padding-left: 18px; margin-top: 6px; }
-#plays li { padding: 2px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#plays time { color: var(--faint); margin-left: 6px; }

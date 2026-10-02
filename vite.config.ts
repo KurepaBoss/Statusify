@@ -5,6 +5,12 @@ const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(() => ({
+  // One page per window: main, mini player, desktop lyrics overlay.
+  build: {
+    rollupOptions: {
+      input: { main: "index.html", mini: "mini.html", overlay: "overlay.html" },
+    },
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

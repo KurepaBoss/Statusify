@@ -12,12 +12,26 @@ use crate::lyrics::{Line, Lyrics};
 use crate::state::{now_ms, Snapshot, Track};
 use serde_json::Value;
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::broadcast;
 
 pub const PLAY_COMMIT_MS: i64 = 20_000;
 pub const LRCLIB_EARLY: Duration = Duration::from_millis(2500);
 const PREFETCH_CAP: usize = 20;
+
+/// What feature modules can react to (Engine::subscribe).
+#[derive(Clone, Debug)]
+pub enum Event {
+    /// Every raw message from the Spicetify bridge, before the engine acts
+    /// on it (queue, player_state, beats, ... are only seen this way).
+    Bridge(Value),
+    TrackChanged,
+    LyricsChanged,
+    Paused,
+    Resumed,
+}
 
 #[derive(Default)]
 struct Play {
@@ -43,9 +57,10 @@ pub struct Engine {
     pub store: Option<Store>,
     http: reqwest::Client,
     pub lrclib_url: String,
-    pub lrclib_enabled: bool,
+    pub lrclib_enabled: AtomicBool,
     pub lrclib_early: Duration,
     on_change: Box<dyn Fn(&Snapshot) + Send + Sync>,
+    events: broadcast::Sender<Event>,
 }
 
 fn s(v: &Value, k: &str) -> String {
@@ -69,10 +84,62 @@ impl Engine {
             store,
             http: lrclib::client(),
             lrclib_url: lrclib::URL.into(),
-            lrclib_enabled: true,
+            lrclib_enabled: AtomicBool::new(true),
             lrclib_early: LRCLIB_EARLY,
             on_change: Box::new(on_change),
+            events: broadcast::channel(256).0,
         })
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<Event> {
+        self.events.subscribe()
+    }
+
+    fn emit(&self, e: Event) {
+        let _ = self.events.send(e);
+    }
+
+    /// Feature data for the UI: lands in snapshot.extras[key].
+    pub fn set_extra(&self, key: &str, value: Value) {
+        self.update(|s| {
+            s.extras.insert(key.to_string(), value);
+        });
+    }
+
+    /// Lyrics from somewhere other than the bridge (search, translation
+    /// source switch, ...) for the current track.
+    pub fn set_lyrics(&self, l: Lyrics) {
+        let mut g = self.inner.lock().unwrap();
+        self.apply(&mut g, l);
+        drop(g);
+        self.changed();
+    }
+
+    /// The user's choice for the current track: stored in lyric_pins and
+    /// preferred over every source from now on.
+    pub fn pin_lyrics(&self, l: Lyrics) {
+        let mut g = self.inner.lock().unwrap();
+        let Some(uri) = g.snap.track.as_ref().map(|t| t.uri.clone()) else { return };
+        if let Some(st) = &self.store {
+            let _ = st.set_pin(&uri, &l);
+        }
+        g.pinned_uri = Some(uri);
+        self.apply(&mut g, l);
+        drop(g);
+        self.changed();
+    }
+
+    pub fn clear_pin(&self) {
+        let mut g = self.inner.lock().unwrap();
+        if let (Some(st), Some(t)) = (&self.store, &g.snap.track) {
+            let _ = st.clear_pin(&t.uri);
+        }
+        g.pinned_uri = None;
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.snap.track.as_ref().is_some_and(|t| g.pinned_uri.as_deref() == Some(t.uri.as_str()))
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -97,10 +164,12 @@ impl Engine {
             }
         }
         g.snap.lyrics = l;
+        self.emit(Event::LyricsChanged);
     }
 
     /// One message from the Spicetify bridge.
     pub fn handle(self: &Arc<Self>, msg: &Value) {
+        self.emit(Event::Bridge(msg.clone()));
         let t = msg.get("type").and_then(|x| x.as_str()).unwrap_or("");
         match t {
             "track_change" => self.on_track(msg),
@@ -110,6 +179,7 @@ impl Engine {
                 if g.snap.is_playing {
                     g.snap.is_playing = false;
                     drop(g);
+                    self.emit(Event::Paused);
                     self.changed();
                 }
             }
@@ -163,6 +233,7 @@ impl Engine {
                 self.apply(&mut g, c);
             }
         }
+        self.emit(Event::TrackChanged);
         self.changed();
         if self.snapshot().lyrics.is_none() {
             self.schedule_early_lrclib(uri);
@@ -186,6 +257,7 @@ impl Engine {
         if let Some(d) = i(m, "duration_ms") {
             g.snap.duration_ms = d;
         }
+        let resumed = playing && !g.snap.is_playing;
         g.snap.is_playing = playing;
         if g.play.id.is_none() && g.play.listened_ms >= PLAY_COMMIT_MS {
             if let (Some(st), Some(t)) = (&self.store, &g.snap.track) {
@@ -202,6 +274,9 @@ impl Engine {
             }
         }
         drop(g);
+        if resumed {
+            self.emit(Event::Resumed);
+        }
         self.changed();
     }
 
@@ -264,7 +339,7 @@ impl Engine {
     }
 
     pub fn schedule_early_lrclib(self: &Arc<Self>, uri: String) {
-        if !self.lrclib_enabled || uri.is_empty() {
+        if !self.lrclib_enabled.load(Ordering::Relaxed) || uri.is_empty() {
             return;
         }
         let me = self.clone();
@@ -279,7 +354,7 @@ impl Engine {
     /// One LRCLIB lookup per track; a network failure is forgotten so a
     /// later trigger (the bridge's "none") may retry it.
     pub fn fetch_lrclib(self: &Arc<Self>, uri: String) {
-        if !self.lrclib_enabled || uri.is_empty() {
+        if !self.lrclib_enabled.load(Ordering::Relaxed) || uri.is_empty() {
             return;
         }
         let (artist, title, dur) = {

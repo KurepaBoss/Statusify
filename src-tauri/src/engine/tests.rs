@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::AtomicBool;
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -133,7 +134,7 @@ async fn plays_commit_after_twenty_seconds_listened() {
     let dir = std::env::temp_dir().join(format!("statusify-rs-eng-{}", now_ms()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut e = Engine::new(Some(Store::open(&dir).unwrap()), |_| {});
-    Arc::get_mut(&mut e).unwrap().lrclib_enabled = false;
+    Arc::get_mut(&mut e).unwrap().lrclib_enabled = AtomicBool::new(false);
     track(&e, "u1");
     for p in (0..=25_000).step_by(1000) {
         e.handle(&json!({"type":"position","position_ms":p,"duration_ms":100000,"is_playing":true}));
