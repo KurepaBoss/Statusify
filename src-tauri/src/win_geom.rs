@@ -3,6 +3,8 @@
 //! can be tested headless. All values are physical pixels unless noted.
 
 use regex::Regex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use std::sync::LazyLock;
 
 /// A monitor work area: (left, top, right, bottom).
@@ -154,6 +156,86 @@ pub fn default_overlay_anchor(work: Area, dpi: u32) -> (i32, i32, bool) {
     ((work.0 + work.2).div_euclid(2), work.3 - (36.0 * s) as i32, false)
 }
 
+
+
+/// Python's `(value or "").lower() == "true"`: only the literal "true" is on
+/// (hand-edited "1"/"yes" are off); a missing key takes `default`.
+pub fn only_true_is_on(raw: Option<&str>, default: bool) -> bool {
+    raw.map_or(default, |v| v.trim().eq_ignore_ascii_case("true"))
+}
+
+/// Python's `(value or "").lower() != "false"`: only the literal "false" is
+/// off ("0"/"no" stay on); a missing key takes `default`.
+pub fn only_false_is_off(raw: Option<&str>, default: bool) -> bool {
+    raw.map_or(default, |v| !v.trim().eq_ignore_ascii_case("false"))
+}
+
+/// Trailing-edge debounce for a value that is persisted (Python's
+/// `_cfg_set_soon`): only the latest pushed value is written, once the pushes
+/// have been quiet for `delay`. One short-lived worker thread at a time.
+#[derive(Default)]
+pub struct Debounce {
+    state: Mutex<DebounceState>,
+}
+
+#[derive(Default)]
+struct DebounceState {
+    pending: Option<String>,
+    deadline: Option<Instant>,
+    worker: bool,
+}
+
+impl Debounce {
+    pub fn push(self: &Arc<Self>, value: String, delay: Duration, sink: Arc<dyn Fn(String) + Send + Sync>) {
+        let spawn = {
+            let mut st = self.state.lock().unwrap();
+            st.pending = Some(value);
+            st.deadline = Some(Instant::now() + delay);
+            !std::mem::replace(&mut st.worker, true)
+        };
+        if !spawn {
+            return;
+        }
+        let me = self.clone();
+        std::thread::spawn(move || loop {
+            let wait = {
+                let mut st = me.state.lock().unwrap();
+                match (st.pending.is_some(), st.deadline) {
+                    (true, Some(d)) if d > Instant::now() => Some(d - Instant::now()),
+                    (true, _) => {
+                        let v = st.pending.take();
+                        st.worker = false;
+                        drop(st);
+                        if let Some(v) = v {
+                            sink(v);
+                        }
+                        return;
+                    }
+                    _ => {
+                        st.worker = false;
+                        return;
+                    }
+                }
+            };
+            if let Some(w) = wait {
+                std::thread::sleep(w);
+            }
+        });
+    }
+
+    /// Write the pending value now (closing the window, quitting).
+    pub fn flush(&self, sink: impl FnOnce(String)) {
+        let v = {
+            let mut st = self.state.lock().unwrap();
+            st.deadline = None;
+            st.pending.take()
+        };
+        if let Some(v) = v {
+            sink(v);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +330,48 @@ mod tests {
     fn default_anchor_is_bottom_centre_of_primary() {
         assert_eq!(default_overlay_anchor((0, 0, 1920, 1040), 96), (960, 1004, false));
         assert_eq!(default_overlay_anchor((0, 0, 3840, 2080), 192), (1920, 2008, false));
+    }
+
+    #[test]
+    fn config_booleans_follow_the_python_literals() {
+        assert!(only_true_is_on(Some("True"), false));
+        assert!(!only_true_is_on(Some("1"), true));
+        assert!(!only_true_is_on(Some("yes"), true));
+        assert!(!only_true_is_on(Some(""), true));
+        assert!(only_true_is_on(None, true));
+        assert!(!only_false_is_off(Some(" FALSE "), true));
+        assert!(only_false_is_off(Some("0"), false));
+        assert!(only_false_is_off(Some("no"), false));
+        assert!(only_false_is_off(None, true));
+    }
+
+    #[test]
+    fn debounce_writes_only_the_latest_value_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let out = Arc::new(Mutex::new(Vec::<String>::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sink: Arc<dyn Fn(String) + Send + Sync> = {
+            let (o, c) = (out.clone(), calls.clone());
+            Arc::new(move |v| {
+                c.fetch_add(1, Ordering::SeqCst);
+                o.lock().unwrap().push(v);
+            })
+        };
+        let d = Arc::new(Debounce::default());
+        for i in 0..5 {
+            d.push(format!("v{i}"), Duration::from_millis(60), sink.clone());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "still inside the quiet window");
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(*out.lock().unwrap(), vec!["v4".to_string()]);
+        // A later push starts a fresh cycle; flush writes it immediately, once.
+        d.push("late".into(), Duration::from_millis(500), sink.clone());
+        d.flush(|v| out.lock().unwrap().push(v));
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(out.lock().unwrap().len(), 2);
+        assert_eq!(out.lock().unwrap()[1], "late");
+        d.flush(|_| panic!("nothing pending"));
     }
 
     #[test]

@@ -12,23 +12,28 @@
 //!   [window]      mini_geometry, overlay_geometry, overlay_locked
 //!   [preferences] overlay_enabled, overlay_next_line, overlay_size,
 //!                 overlay_opacity (new, percent, optional)
-//! Actions: toggle_mini, open_mini, close_mini, mini_menu, show_main,
+//! Actions: toggle_mini, open_mini, close_mini, mini_menu, mini_press, show_main,
+//!   player_failed, get_timing {uri}, overlay_visible {visible}, raise_overlay,
 //!   toggle_overlay, set_overlay_enabled {enabled}, toggle_overlay_lock,
 //!   set_overlay_locked {locked}, set_overlay_size {size},
 //!   nudge_overlay_size {delta}, set_overlay_next {enabled}, get_state.
 //! Pushes extras["windows"] = {mini, overlay, overlay_locked, overlay_size,
-//!   overlay_next, overlay_opacity, animations, dark, tint, offset_ms, accent,
-//!   layout}.
+//!   overlay_next, overlay_opacity, animations, dark, tint, offset_ms, offsets,
+//!   instrumental_text, timing_rev, accent, layout}.
+//! Event "mini-drag-end" {inside} (to the mini window) after a native drag.
+//! Word timing (endMs, syl) is not in the engine's Line type, so it is read
+//! off the raw bridge messages and served through get_timing.
 
 use super::{Ctx, Feature};
 use crate::config::Config;
 use crate::engine::Event;
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::menu::{ContextMenu, Menu, MenuItem, PredefinedMenuItem};
-use tauri::{Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
+use tauri::{Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent};
 
 #[path = "../win_geom.rs"]
 mod win_geom;
@@ -48,6 +53,14 @@ const DRAG_SETTLE: Duration = Duration::from_millis(300);
 const OWN_MOVE_ECHO: Duration = Duration::from_millis(250);
 const MINI_GLIDE_S: f64 = 0.2;
 const MENU_PREFIX: &str = "win:mini:";
+/// Python's default instrumental text (INSTRUMENTAL_TEXT).
+const DEFAULT_INSTRUMENTAL: &str = "\u{1F3B5} \u{2500} \u{2500} \u{2500} \u{2500} \u{2500} \u{2500} \u{2500} \u{2500} \u{2500} \u{1F3B5}";
+/// How long a moved overlay position waits before it is written (Python: _cfg_set_soon).
+const GEO_DEBOUNCE: Duration = Duration::from_millis(400);
+/// The overlay re-asserts topmost this often while shown.
+const RAISE_EVERY: Duration = Duration::from_millis(2000);
+/// Distinct tracks whose word timing is kept.
+const TIMING_KEEP: usize = 6;
 
 // ── Preferences ──────────────────────────────────────────────────────
 
@@ -62,21 +75,24 @@ struct Prefs {
     dark: bool,
     tint: bool,
     offset_ms: i64,
+    instrumental_text: String,
     accent: String,
 }
 
 fn read_prefs(c: &Config) -> Prefs {
     Prefs {
-        overlay_enabled: c.get_bool("preferences", "overlay_enabled", false),
-        overlay_next: c.get_bool("preferences", "overlay_next_line", true),
-        // Python: locked unless the value is literally "false".
-        overlay_locked: c.get_bool("window", "overlay_locked", true),
+        overlay_enabled: only_true_is_on(c.get("preferences", "overlay_enabled").as_deref(), false),
+        overlay_next: only_true_is_on(c.get("preferences", "overlay_next_line").as_deref(), true),
+        // Python reads these three as literals: only "true" turns the first two
+        // on, only "false" unlocks (hand-edited "1"/"no" keep their old meaning).
+        overlay_locked: only_false_is_off(c.get("window", "overlay_locked").as_deref(), true),
         overlay_size: c.get_i64("preferences", "overlay_size", DEFAULT_OVERLAY_SIZE).clamp(MIN_OVERLAY_SIZE, MAX_OVERLAY_SIZE),
         overlay_opacity: c.get_i64("preferences", "overlay_opacity", 100).clamp(20, 100),
         animations: c.get_bool("preferences", "animations", true),
         dark: c.get_bool("preferences", "dark_mode", true),
         tint: c.get_bool("preferences", "album_tint", true),
-        offset_ms: c.get_i64("preferences", "lyric_delay_ms", -40),
+        offset_ms: c.get_i64("preferences", "lyric_delay_ms", 0),
+        instrumental_text: Some(c.get_or("preferences", "instrumental_text", "")).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| DEFAULT_INSTRUMENTAL.into()),
         accent: Some(c.get_or("preferences", "accent_color", "#1db954")).filter(|a| !a.trim().is_empty()).unwrap_or_else(|| "#1db954".into()),
     }
 }
@@ -107,6 +123,16 @@ struct Inner {
     glide_gen: AtomicU64,
     last_extra: Mutex<Option<Value>>,
     epoch: Mutex<Option<Instant>>,
+    /// Bumped per open of each window; a dying window's late Destroyed event
+    /// must not clear the flag of the window that replaced it.
+    open_gen: [AtomicU64; 2],
+    /// Overlay window currently mapped (it is hidden while faded out).
+    ov_shown: AtomicBool,
+    /// Debounced overlay_geometry write.
+    geo: Arc<Debounce>,
+    /// Word timing per track from the raw bridge messages (newest last).
+    timing: Mutex<VecDeque<(String, Vec<Value>)>>,
+    timing_rev: AtomicU64,
 }
 
 #[derive(Default)]
@@ -169,13 +195,44 @@ fn physical_geometry(w: &WebviewWindow) -> Option<(i32, i32, i32, i32)> {
 }
 
 /// Move + resize without the Moved echo being mistaken for a user drag.
+///
+/// Position first, then size: the sizes are physical px for the TARGET
+/// monitor's DPI, and a window that crosses to a monitor with another DPI is
+/// rescaled by WM_DPICHANGED, which would rescale an already-set size again.
+/// The position is set once more afterwards in case the DPI change nudged it.
 fn place(inner: &I, w: &WebviewWindow, i: usize, size: Option<(i32, i32)>, pos: (i32, i32)) {
     inner.mark_own_move(i);
+    let _ = w.set_position(PhysicalPosition::new(pos.0, pos.1));
     if let Some((sw, sh)) = size {
         let _ = w.set_size(PhysicalSize::new(sw.max(1) as u32, sh.max(1) as u32));
+        let _ = w.set_position(PhysicalPosition::new(pos.0, pos.1));
+        if i == 0 {
+            mini_region(w, sw, sh);
+        }
     }
-    let _ = w.set_position(PhysicalPosition::new(pos.0, pos.1));
     inner.mark_own_move(i);
+}
+
+fn hwnd_of(w: &WebviewWindow) -> Option<isize> {
+    w.hwnd().ok().map(|h| h.0 as isize)
+}
+
+/// Clip the mini window to its pill so the transparent corners are not hit.
+fn mini_region(w: &WebviewWindow, pw: i32, ph: i32) {
+    if let Some(h) = hwnd_of(w) {
+        win_mon::round_region(h, pw, ph);
+    }
+}
+
+/// Wait for a destroyed window's label to be released (the window outlives
+/// destroy() briefly, and a new one cannot reuse the label until it is gone).
+fn wait_label_free(ctx: &C, label: &str) {
+    for _ in 0..150 {
+        if win(ctx, label).is_none() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 // ── Extras ───────────────────────────────────────────────────────────
@@ -193,7 +250,18 @@ fn layout_json(m: &OverlayMetrics) -> Value {
     })
 }
 
-fn extras_json(p: &Prefs, mini: bool, overlay: bool, metrics: Option<&OverlayMetrics>) -> Value {
+/// [offsets] (per-track lyric offsets, lower-cased keys as Config stores them) as
+/// {key: ms}; unparsable values are dropped (the global delay applies, as in Python).
+fn offsets_json(c: &Config) -> Value {
+    let m: serde_json::Map<String, Value> = c
+        .section("offsets")
+        .into_iter()
+        .filter_map(|(k, v)| v.trim().parse::<i64>().ok().map(|n| (k, json!(n))))
+        .collect();
+    Value::Object(m)
+}
+
+fn extras_json(p: &Prefs, mini: bool, overlay: bool, metrics: Option<&OverlayMetrics>, offsets: Value, timing_rev: u64) -> Value {
     let fallback = overlay_metrics(p.overlay_size, 96, 1920, p.overlay_next);
     json!({
         "mini": mini,
@@ -206,6 +274,9 @@ fn extras_json(p: &Prefs, mini: bool, overlay: bool, metrics: Option<&OverlayMet
         "dark": p.dark,
         "tint": p.tint,
         "offset_ms": p.offset_ms,
+        "offsets": offsets,
+        "instrumental_text": p.instrumental_text,
+        "timing_rev": timing_rev,
         "accent": p.accent,
         "layout": layout_json(metrics.unwrap_or(&fallback)),
     })
@@ -214,7 +285,14 @@ fn extras_json(p: &Prefs, mini: bool, overlay: bool, metrics: Option<&OverlayMet
 fn push_extras(ctx: &C, inner: &I) {
     let p = read_prefs(&ctx.config);
     let metrics = inner.ov.lock().unwrap().metrics;
-    let v = extras_json(&p, inner.open[0].load(Ordering::SeqCst), inner.open[1].load(Ordering::SeqCst), metrics.as_ref());
+    let v = extras_json(
+        &p,
+        inner.open[0].load(Ordering::SeqCst),
+        inner.open[1].load(Ordering::SeqCst),
+        metrics.as_ref(),
+        offsets_json(&ctx.config),
+        inner.timing_rev.load(Ordering::SeqCst),
+    );
     let mut last = inner.last_extra.lock().unwrap();
     if last.as_ref() != Some(&v) {
         *last = Some(v.clone());
@@ -227,9 +305,10 @@ fn push_extras(ctx: &C, inner: &I) {
 
 fn mini_open(ctx: &C, inner: &I) -> Result<(), String> {
     let g = inner.op.lock().unwrap();
-    if win(ctx, MINI).is_some() {
+    if inner.open[0].load(Ordering::SeqCst) {
         return Ok(());
     }
+    wait_label_free(ctx, MINI);
     // Saved spot, else top centre of the primary monitor.
     let saved = parse_position(&ctx.config.get_or("window", "mini_geometry", ""));
     let mi = match saved {
@@ -238,7 +317,8 @@ fn mini_open(ctx: &C, inner: &I) -> Result<(), String> {
     };
     let s = mi.dpi as f64 / 96.0;
     let (w, h) = ((MINI_W * s).round() as i32, (MINI_H * s).round() as i32);
-    let pos = saved.unwrap_or((mi.work.0 + (mi.work.2 - mi.work.0 - w) / 2, mi.work.1 + (40.0 * s) as i32));
+    // Python: 40 unscaled px below the top of the screen.
+    let pos = saved.unwrap_or((mi.work.0 + (mi.work.2 - mi.work.0 - w) / 2, mi.work.1 + 40));
     // Keep a saved spot on screen (its monitor may be gone).
     let mi = monitor(ctx, pos.0 + w / 2, pos.1 + h / 2, false);
     let (x, y) = snap_position(pos.0, pos.1, w, h, mi.work, 0, 0);
@@ -259,6 +339,9 @@ fn mini_open(ctx: &C, inner: &I) -> Result<(), String> {
         .visible(false)
         .build()
         .map_err(|e| format!("mini window: {e}"))?;
+    if let Some(h) = hwnd_of(&window) {
+        win_mon::hide_from_switcher(h);
+    }
     place(inner, &window, 0, Some((w, h)), (x, y));
     watch(ctx, inner, &window, 0);
     inner.open[0].store(true, Ordering::SeqCst);
@@ -279,13 +362,14 @@ fn mini_save_pos(ctx: &C) {
 
 fn mini_close(ctx: &C, inner: &I) {
     let g = inner.op.lock().unwrap();
-    let Some(w) = win(ctx, MINI) else { return };
     if !inner.open[0].swap(false, Ordering::SeqCst) {
-        return; // already closing (the window outlives destroy() briefly)
+        return; // not open, or already closing (the window outlives destroy() briefly)
     }
     mini_save_pos(ctx);
     inner.glide_gen.fetch_add(1, Ordering::SeqCst);
-    let _ = w.destroy();
+    if let Some(w) = win(ctx, MINI) {
+        let _ = w.destroy();
+    }
     crate::log("Mini player off");
     drop(g);
     push_extras(ctx, inner);
@@ -297,6 +381,9 @@ fn mini_settle(ctx: &C, inner: &I) {
     let Some((gw, gh, x, y)) = physical_geometry(&w) else { return };
     let mi = monitor(ctx, x + gw / 2, y + gh / 2, false);
     let (tx, ty) = snap_position(x, y, gw, gh, mi.work, SNAP_THRESHOLD, SNAP_MARGIN);
+    // The native drag swallowed the page's pointerup: tell it the gesture is
+    // over and whether the pointer is still on the pill (Python: _mini_leave).
+    mini_drag_end(&w);
     if (tx, ty) == (x, y) {
         mini_save_pos(ctx);
         return;
@@ -304,13 +391,15 @@ fn mini_settle(ctx: &C, inner: &I) {
     if !read_prefs(&ctx.config).animations {
         place(inner, &w, 0, None, (tx, ty));
         mini_save_pos(ctx);
+        mini_drag_end(&w);
         return;
     }
     let gen = inner.glide_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let t0 = Instant::now();
     loop {
-        // A new drag (button down / newer generation) takes over.
-        if inner.glide_gen.load(Ordering::SeqCst) != gen || win_mon::left_button_down() {
+        // Only a press on the pill (mini_press) or a new drag (Moved events)
+        // bumps the generation and takes over; a click elsewhere does not.
+        if inner.glide_gen.load(Ordering::SeqCst) != gen {
             return;
         }
         let p = t0.elapsed().as_secs_f64() / MINI_GLIDE_S;
@@ -324,6 +413,19 @@ fn mini_settle(ctx: &C, inner: &I) {
         std::thread::sleep(Duration::from_millis(16));
     }
     mini_save_pos(ctx);
+    mini_drag_end(&w); // the glide may have carried the pill out from under the pointer
+}
+
+/// Is the pointer over the mini window right now?
+fn pointer_inside(w: &WebviewWindow) -> bool {
+    match (win_mon::cursor_pos(), physical_geometry(w)) {
+        (Some((cx, cy)), Some((gw, gh, x, y))) => cx >= x && cx < x + gw && cy >= y && cy < y + gh,
+        _ => true, // unknown: do not collapse the pill under a pointer that may be on it
+    }
+}
+
+fn mini_drag_end(w: &WebviewWindow) {
+    let _ = w.emit_to(MINI, "mini-drag-end", json!({ "inside": pointer_inside(w) }));
 }
 
 fn mini_menu(ctx: &C) -> Result<(), String> {
@@ -348,6 +450,11 @@ fn mini_menu(ctx: &C) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Python: _tray_player logs this when the bridge is not connected.
+fn log_player_failed() {
+    crate::log("Playback control needs Spotify connected (Spicetify bridge)");
+}
+
 fn show_main(ctx: &C) {
     if let Some(w) = win(ctx, "main") {
         let _ = w.unminimize();
@@ -360,9 +467,10 @@ fn show_main(ctx: &C) {
 
 fn overlay_open(ctx: &C, inner: &I) -> Result<(), String> {
     let g = inner.op.lock().unwrap();
-    if win(ctx, OVERLAY).is_some() {
+    if inner.open[1].load(Ordering::SeqCst) {
         return Ok(());
     }
+    wait_label_free(ctx, OVERLAY);
     let window = WebviewWindowBuilder::new(&ctx.app, OVERLAY, WebviewUrl::App("overlay.html".into()))
         .title("Statusify lyrics overlay")
         .inner_size(900.0, 100.0)
@@ -379,12 +487,18 @@ fn overlay_open(ctx: &C, inner: &I) -> Result<(), String> {
         .visible(false)
         .build()
         .map_err(|e| format!("overlay window: {e}"))?;
+    if let Some(h) = hwnd_of(&window) {
+        win_mon::hide_from_switcher(h);
+    }
     watch(ctx, inner, &window, 1);
     inner.open[1].store(true, Ordering::SeqCst);
     overlay_load_anchor(ctx, inner);
     overlay_relayout_locked(ctx, inner, &window);
     let _ = window.set_ignore_cursor_events(read_prefs(&ctx.config).overlay_locked);
     let _ = window.show();
+    inner.ov_shown.store(true, Ordering::SeqCst);
+    raise_overlay(&window);
+    spawn_raiser(ctx, inner);
     crate::log("Lyrics overlay on");
     drop(g);
     push_extras(ctx, inner);
@@ -393,15 +507,54 @@ fn overlay_open(ctx: &C, inner: &I) -> Result<(), String> {
 
 fn overlay_close(ctx: &C, inner: &I) {
     let g = inner.op.lock().unwrap();
-    let Some(w) = win(ctx, OVERLAY) else { return };
     if !inner.open[1].swap(false, Ordering::SeqCst) {
-        return; // already closing (the window outlives destroy() briefly)
+        return; // not open, or already closing (the window outlives destroy() briefly)
     }
-    let _ = w.destroy();
+    inner.ov_shown.store(false, Ordering::SeqCst);
+    flush_geometry(ctx, inner);
+    if let Some(w) = win(ctx, OVERLAY) {
+        let _ = w.destroy();
+    }
     inner.ov.lock().unwrap().applied = None;
     crate::log("Lyrics overlay off");
     drop(g);
     push_extras(ctx, inner);
+}
+
+/// overlay_geometry is rewritten on every resize notch and drag drop; only the
+/// last value within the quiet window reaches statusify.cfg (Python: _cfg_set_soon).
+fn save_geometry_soon(ctx: &C, inner: &I, geometry: String) {
+    let cfg = ctx.config.clone();
+    inner.geo.push(geometry, GEO_DEBOUNCE, Arc::new(move |g| cfg.set("window", "overlay_geometry", &g)));
+}
+
+fn flush_geometry(ctx: &C, inner: &I) {
+    inner.geo.flush(|g| ctx.config.set("window", "overlay_geometry", &g));
+}
+
+fn raise_overlay(w: &WebviewWindow) {
+    if let Some(h) = hwnd_of(w) {
+        win_mon::raise_topmost(h);
+    }
+}
+
+/// Python re-raised the overlay on every scene change so a game or another
+/// topmost window that raised itself later cannot bury it. The page asks for
+/// that on scene changes (raise_overlay); this covers the quiet stretches.
+fn spawn_raiser(ctx: &C, inner: &I) {
+    let (ctx, inner) = (ctx.clone(), inner.clone());
+    let my = inner.open_gen[1].load(Ordering::SeqCst);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(RAISE_EVERY);
+        if inner.open_gen[1].load(Ordering::SeqCst) != my || !inner.open[1].load(Ordering::SeqCst) {
+            return;
+        }
+        if inner.ov_shown.load(Ordering::SeqCst) {
+            if let Some(w) = win(&ctx, OVERLAY) {
+                raise_overlay(&w);
+            }
+        }
+    });
 }
 
 /// The saved strip position becomes an anchor, but only on a monitor that
@@ -436,7 +589,7 @@ fn overlay_relayout_locked(ctx: &C, inner: &I, w: &WebviewWindow) {
     // edge would creep the strip.
     let (x, y) = clamp_rect(cx - m.w.div_euclid(2), if top { ey } else { ey - m.h }, m.w, m.h, mi.work);
     place(inner, w, 1, Some((m.w, m.h)), (x, y));
-    ctx.config.set("window", "overlay_geometry", &format_geometry(m.w, m.h, x, y));
+    save_geometry_soon(ctx, inner, format_geometry(m.w, m.h, x, y));
     let mut ov = inner.ov.lock().unwrap();
     ov.anchor = Some(anchor);
     ov.metrics = Some(m);
@@ -460,10 +613,20 @@ fn overlay_dropped(ctx: &C, inner: &I) {
 
 fn watch(ctx: &C, inner: &I, w: &WebviewWindow, i: usize) {
     let (ctx, inner) = (ctx.clone(), inner.clone());
+    let my = inner.open_gen[i].fetch_add(1, Ordering::SeqCst) + 1;
+    let hwnd = hwnd_of(w);
     w.on_window_event(move |ev| match ev {
         WindowEvent::Moved(_) => note_moved(&ctx, &inner, i),
+        // A DPI change resizes the pill: the click-through clip must follow.
+        WindowEvent::Resized(sz) if i == 0 => {
+            if let Some(h) = hwnd {
+                win_mon::round_region(h, sz.width as i32, sz.height as i32);
+            }
+        }
         WindowEvent::Destroyed => {
-            if inner.open[i].swap(false, Ordering::SeqCst) {
+            // Only the current window may clear the flag: a quick off/on leaves
+            // the old one's Destroyed arriving after the new one opened.
+            if inner.open_gen[i].load(Ordering::SeqCst) == my && inner.open[i].swap(false, Ordering::SeqCst) {
                 push_extras(&ctx, &inner);
             }
         }
@@ -513,7 +676,7 @@ fn note_moved(ctx: &C, inner: &I, i: usize) {
 /// tray and hotkeys all just write the config and tell us (ConfigChanged).
 fn sync(ctx: &C, inner: &I) {
     let p = read_prefs(&ctx.config);
-    let exists = win(ctx, OVERLAY).is_some();
+    let exists = inner.open[1].load(Ordering::SeqCst);
     if p.overlay_enabled && !exists {
         if let Err(e) = overlay_open(ctx, inner) {
             crate::log(&e);
@@ -521,16 +684,20 @@ fn sync(ctx: &C, inner: &I) {
     } else if !p.overlay_enabled && exists {
         overlay_close(ctx, inner);
     } else if exists {
-        let applied = inner.ov.lock().unwrap().applied;
         let now = (p.overlay_size, p.overlay_next, p.overlay_locked);
-        if applied != Some(now) {
+        if inner.ov.lock().unwrap().applied != Some(now) {
+            // Re-read under the op lock: a ConfigChanged event and the direct
+            // call from an action both land here, and only one should relayout.
             let g = inner.op.lock().unwrap();
-            if let Some(w) = win(ctx, OVERLAY) {
-                if applied.map(|a| (a.0, a.1)) != Some((now.0, now.1)) {
-                    overlay_relayout_locked(ctx, inner, &w);
+            let applied = inner.ov.lock().unwrap().applied;
+            if applied != Some(now) {
+                if let Some(w) = win(ctx, OVERLAY) {
+                    if applied.map(|a| (a.0, a.1)) != Some((now.0, now.1)) {
+                        overlay_relayout_locked(ctx, inner, &w);
+                    }
+                    let _ = w.set_ignore_cursor_events(p.overlay_locked);
+                    inner.ov.lock().unwrap().applied = Some(now);
                 }
-                let _ = w.set_ignore_cursor_events(p.overlay_locked);
-                inner.ov.lock().unwrap().applied = Some(now);
             }
             drop(g);
         }
@@ -582,6 +749,58 @@ fn arg_i64(args: &Value, key: &str) -> Option<i64> {
 
 // ── Feature ──────────────────────────────────────────────────────────
 
+// -- Word timing (karaoke fill, end-of-line gaps) -----------------------
+
+/// Per-line timing out of a raw bridge "lyrics"/"lyrics_prefetch" message:
+/// (track uri, [{s: startMs, w: words, e: endMs?, syl: [[start, end, text]]?}])
+/// for the lines that carry any. The engine's Line type keeps only startMs and
+/// words, so this is the only place the extra fields survive.
+fn timing_from_bridge(msg: &Value) -> Option<(String, Vec<Value>)> {
+    let t = msg.get("type")?.as_str()?;
+    if t != "lyrics" && t != "lyrics_prefetch" {
+        return None;
+    }
+    let uri = msg.get("track_uri")?.as_str()?.to_string();
+    let mut out = Vec::new();
+    for line in msg.get("synced")?.as_array()? {
+        let Some(s) = line.get("startMs").and_then(|v| v.as_f64()) else { continue };
+        let words = line.get("words").and_then(|v| v.as_str()).unwrap_or("");
+        let end = line.get("endMs").and_then(|v| v.as_f64()).map(|f| f as i64);
+        let syl = line.get("syl").filter(|v| v.as_array().is_some_and(|a| !a.is_empty()));
+        if end.is_none() && syl.is_none() {
+            continue;
+        }
+        out.push(json!({ "s": s as i64, "w": words, "e": end, "syl": syl }));
+    }
+    Some((uri, out))
+}
+
+/// Remember a track's timing (newest last, at most TIMING_KEEP tracks).
+/// Returns whether anything changed.
+fn store_timing(inner: &Inner, uri: String, lines: Vec<Value>) -> bool {
+    let mut q = inner.timing.lock().unwrap();
+    let before = q.iter().find(|(u, _)| *u == uri).map(|(_, l)| l.clone());
+    if before.as_ref() == Some(&lines) {
+        return false;
+    }
+    if before.is_none() && lines.is_empty() {
+        return false;
+    }
+    q.retain(|(u, _)| *u != uri);
+    q.push_back((uri, lines));
+    while q.len() > TIMING_KEEP {
+        q.pop_front();
+    }
+    drop(q);
+    inner.timing_rev.fetch_add(1, Ordering::SeqCst);
+    true
+}
+
+fn timing_for(inner: &Inner, uri: &str) -> Value {
+    let q = inner.timing.lock().unwrap();
+    q.iter().find(|(u, _)| u == uri).map(|(_, l)| json!(l)).unwrap_or_else(|| json!([]))
+}
+
 impl Feature for Windows {
     fn name(&self) -> &'static str {
         "windows"
@@ -598,7 +817,9 @@ impl Feature for Windows {
                 let Some(cmd) = ev.id().0.strip_prefix(MENU_PREFIX) else { return };
                 match cmd {
                     "toggle" | "prev" | "next" => {
-                        c.outbox.send(json!({"type": "player", "action": cmd}));
+                        if !c.outbox.send(json!({"type": "player", "action": cmd})) {
+                            log_player_failed();
+                        }
                     }
                     "open" => show_main(&c),
                     "close" => {
@@ -620,6 +841,13 @@ impl Feature for Windows {
                         Ok(Event::ConfigChanged) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             let (c, i) = (c.clone(), i.clone());
                             let _ = tauri::async_runtime::spawn_blocking(move || sync(&c, &i)).await;
+                        }
+                        Ok(Event::Bridge(m)) => {
+                            if let Some((uri, lines)) = timing_from_bridge(&m) {
+                                if store_timing(&i, uri, lines) {
+                                    push_extras(&c, &i);
+                                }
+                            }
                         }
                         Ok(_) => {}
                         Err(_) => break,
@@ -645,7 +873,14 @@ impl Feature for Windows {
             "get_state" => {
                 let p = read_prefs(&ctx.config);
                 let m = inner.ov.lock().unwrap().metrics;
-                Ok(extras_json(&p, inner.open[0].load(Ordering::SeqCst), inner.open[1].load(Ordering::SeqCst), m.as_ref()))
+                Ok(extras_json(
+                    &p,
+                    inner.open[0].load(Ordering::SeqCst),
+                    inner.open[1].load(Ordering::SeqCst),
+                    m.as_ref(),
+                    offsets_json(&ctx.config),
+                    inner.timing_rev.load(Ordering::SeqCst),
+                ))
             }
             "toggle_mini" => {
                 if inner.open[0].load(Ordering::SeqCst) {
@@ -661,6 +896,40 @@ impl Feature for Windows {
                 ok
             }
             "mini_menu" => mini_menu(ctx).map(|_| json!(true)),
+            // The pill was pressed: a snap glide in progress stops (Python: _mini_press).
+            "mini_press" => {
+                inner.glide_gen.fetch_add(1, Ordering::SeqCst);
+                ok
+            }
+            "player_failed" => {
+                log_player_failed();
+                ok
+            }
+            "get_timing" => Ok(timing_for(inner, args.get("uri").and_then(|v| v.as_str()).unwrap_or(""))),
+            "raise_overlay" => {
+                if let Some(w) = win(ctx, OVERLAY) {
+                    if inner.ov_shown.load(Ordering::SeqCst) {
+                        raise_overlay(&w);
+                    }
+                }
+                ok
+            }
+            // The faded overlay is unmapped (Python: SW_HIDE), not left as an
+            // invisible topmost window.
+            "overlay_visible" => {
+                let show = arg_bool(&args, "visible").ok_or("visible: bool required")?;
+                if inner.open[1].load(Ordering::SeqCst) && inner.ov_shown.swap(show, Ordering::SeqCst) != show {
+                    if let Some(w) = win(ctx, OVERLAY) {
+                        if show {
+                            let _ = w.show();
+                            raise_overlay(&w);
+                        } else {
+                            let _ = w.hide();
+                        }
+                    }
+                }
+                ok
+            }
             "show_main" => {
                 show_main(ctx);
                 ok
@@ -726,7 +995,8 @@ mod tests {
         assert_eq!(p.overlay_size, 30);
         assert_eq!(p.overlay_opacity, 100);
         assert!(p.animations && p.dark && p.tint);
-        assert_eq!(p.offset_ms, -40);
+        assert_eq!(p.offset_ms, 0, "Python: LYRIC_DELAY_MS defaults to 0");
+        assert_eq!(p.instrumental_text, DEFAULT_INSTRUMENTAL);
         assert_eq!(p.accent, "#1db954");
         let _ = std::fs::remove_dir_all(d);
     }
@@ -760,17 +1030,90 @@ mod tests {
         let (c, d) = cfg("");
         let p = read_prefs(&c);
         let hi = overlay_metrics(30, 192, 3840, true); // 200% display
-        let v = extras_json(&p, true, false, Some(&hi));
+        let v = extras_json(&p, true, false, Some(&hi), json!({}), 3);
+        assert_eq!(v["timing_rev"], 3);
         assert_eq!(v["mini"], true);
         assert_eq!(v["overlay"], false);
         assert_eq!(v["overlay_locked"], true);
         // Physical metrics are reported in CSS px: 60 physical px at 2x = 30.
         assert_eq!(v["layout"]["px"], 30.0);
         assert_eq!(v["layout"]["bar"], 26.0);
-        let none = extras_json(&p, false, false, None);
+        let none = extras_json(&p, false, false, None, json!({}), 0);
         assert_eq!(none["layout"]["px"], 30.0);
         assert_eq!(none["layout"]["w"], 900.0);
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn hand_edited_booleans_keep_their_python_meaning() {
+        let (c, d) = cfg("[preferences]\noverlay_enabled = 1\noverlay_next_line = yes\n[window]\noverlay_locked = 0\n");
+        let p = read_prefs(&c);
+        assert!(!p.overlay_enabled, "only the literal true enables the overlay");
+        assert!(!p.overlay_next, "yes is not true");
+        assert!(p.overlay_locked, "0 is not the literal false, so it stays locked");
+        let _ = std::fs::remove_dir_all(d);
+        let (c, d) = cfg("[preferences]\noverlay_enabled = TRUE\noverlay_next_line = true\n[window]\noverlay_locked = False\n");
+        let p = read_prefs(&c);
+        assert!(p.overlay_enabled && p.overlay_next && !p.overlay_locked);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn per_track_offsets_and_instrumental_text_reach_the_extras() {
+        let (c, d) = cfg("[preferences]\ninstrumental_text = ~ solo ~\nlyric_delay_ms = 15\n[offsets]\nabc123 = -250\nbad = nope\n");
+        let p = read_prefs(&c);
+        assert_eq!(p.instrumental_text, "~ solo ~");
+        let off = offsets_json(&c);
+        assert_eq!(off["abc123"], -250);
+        assert!(off.get("bad").is_none(), "unparsable offsets fall back to the global delay");
+        let v = extras_json(&p, false, false, None, off, 0);
+        assert_eq!(v["offsets"]["abc123"], -250);
+        assert_eq!(v["offset_ms"], 15);
+        assert_eq!(v["instrumental_text"], "~ solo ~");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn word_timing_is_read_off_bridge_lyrics_messages() {
+        let msg = json!({"type": "lyrics", "track_uri": "spotify:track:t1", "mode": "synced", "synced": [
+            {"startMs": 1000, "words": "plain line"},
+            {"startMs": 2000, "words": "hello world", "endMs": 4500, "syl": [[2000, 3000, "hello "], [3000, 4500, "world"]]},
+            {"startMs": 6000, "words": "only end", "endMs": 7000},
+            {"words": "no start"}
+        ]});
+        let (uri, lines) = timing_from_bridge(&msg).unwrap();
+        assert_eq!(uri, "spotify:track:t1");
+        assert_eq!(lines.len(), 2, "lines without timing are left out");
+        assert_eq!(lines[0]["s"], 2000);
+        assert_eq!(lines[0]["e"], 4500);
+        assert_eq!(lines[0]["syl"][1][2], "world");
+        assert_eq!(lines[1]["e"], 7000);
+        assert!(lines[1]["syl"].is_null());
+        let pre = json!({"type": "lyrics_prefetch", "track_uri": "u2", "synced": [{"startMs": 1, "words": "x", "endMs": 9}]});
+        assert!(timing_from_bridge(&pre).is_some());
+        assert!(timing_from_bridge(&json!({"type": "position", "track_uri": "u"})).is_none());
+        assert!(timing_from_bridge(&json!({"type": "lyrics", "synced": []})).is_none(), "needs a track uri");
+    }
+
+    #[test]
+    fn timing_store_keeps_recent_tracks_and_bumps_the_revision() {
+        let inner = Inner::default();
+        let l = |n: i64| vec![json!({"s": n, "w": "x", "e": n + 5, "syl": null})];
+        assert!(store_timing(&inner, "a".into(), l(1)));
+        assert_eq!(inner.timing_rev.load(Ordering::SeqCst), 1);
+        assert!(!store_timing(&inner, "a".into(), l(1)), "same timing again is not a change");
+        assert!(!store_timing(&inner, "none".into(), vec![]), "nothing to remember");
+        assert!(store_timing(&inner, "a".into(), l(2)));
+        assert_eq!(timing_for(&inner, "a")[0]["s"], 2);
+        assert_eq!(timing_for(&inner, "missing"), json!([]));
+        for k in 0..TIMING_KEEP {
+            store_timing(&inner, format!("t{k}"), l(k as i64));
+        }
+        assert_eq!(timing_for(&inner, "a"), json!([]), "oldest track dropped");
+        assert_eq!(inner.timing.lock().unwrap().len(), TIMING_KEEP);
+        // A track whose timing vanished (re-fetched without it) is forgotten.
+        assert!(store_timing(&inner, "t0".into(), vec![]));
+        assert_eq!(timing_for(&inner, "t0"), json!([]));
     }
 
     #[test]

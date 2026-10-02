@@ -47,13 +47,25 @@ export function selectLine(mode: string, synced: L[], plain: string[], pos: numb
   return ["", ""];
 }
 
-/** Effective lyric offset: core's per-track value, else the global delay. */
-export function lyricOffset(extras: Record<string, any> | undefined): number {
+/** Config-safe option name of a track URI (statusify_lyrics.offset_key). The
+ * config store lower-cases keys, so the lookup does too. */
+export function offsetKey(uri: string | undefined): string {
+  return uri ? uri.slice(uri.lastIndexOf(":") + 1) : "";
+}
+
+/** Effective lyric offset: core's per-track value, else this track's [offsets]
+ * entry, else the global delay (Python's LYRIC_DELAY_MS, default 0). */
+export function lyricOffset(extras: Record<string, any> | undefined, uri?: string): number {
   const c = extras?.core?.track_offset_ms;
   if (typeof c === "number") return c;
+  const per = extras?.windows?.offsets?.[offsetKey(uri).toLowerCase()];
+  if (uri && typeof per === "number") return per;
   const w = extras?.windows?.offset_ms;
-  return typeof w === "number" ? w : -40;
+  return typeof w === "number" ? w : 0;
 }
+
+/** What the RPC loop published when there are no lyrics to follow. */
+export type MiniStatus = { paused?: boolean; blacklisted?: boolean; instrumental?: boolean; instrumentalText?: string };
 
 /** What the mini player shows as the current lyric. */
 export function miniLyric(
@@ -63,13 +75,72 @@ export function miniLyric(
   plain: string[],
   pos: number,
   duration: number,
+  status: MiniStatus = {},
 ): string {
   if (!title) return "Waiting for Spotify…";
   let cur = "";
   if ((mode === "synced" || mode === "plain") && (synced.length || plain.length)) {
     cur = selectLine(mode, synced, plain, pos, duration)[0].trim();
+  } else if (status.paused) {
+    // No lyrics / instrumental / blacklisted: Python shows whatever the RPC
+    // loop published to its label, and the pause handler overwrote that.
+    cur = "Paused";
+  } else if (status.blacklisted) {
+    cur = "— blacklisted —";
+  } else if (status.instrumental) {
+    cur = (status.instrumentalText ?? "").trim();
   }
   return PLACEHOLDER.has(cur) ? "♪" : cur;
+}
+
+/** Accent to draw with: the cover's accent when album tint is on and a palette
+ * for this track exists (Python's M.ACCENT), else the user's pick. */
+export function pickAccent(
+  userAccent: unknown,
+  palette: Record<string, any> | null | undefined,
+  tint: boolean,
+  dark: boolean,
+  uri?: string,
+): [number, number, number] {
+  const fallback = parseColor(userAccent) ?? [29, 185, 84];
+  if (!tint || !palette) return fallback;
+  if (palette.uri && uri && palette.uri !== uri) return fallback; // stale cover
+  const hex = dark ? palette.accent : palette.light?.accent ?? palette.accent;
+  return parseColor(hex) ?? fallback;
+}
+
+/** Word timing from windows.get_timing: [{s, w, e?, syl?}] keyed by line start. */
+export type Timing = { s: number; w: string; e?: number | null; syl?: unknown }[];
+
+/** The synced lines with endMs / syl filled in from the bridge's timing (the
+ * engine's own line type carries only startMs and words). A line is matched on
+ * start time and text, so lyrics from another source never pick up foreign timing. */
+export function mergeTiming(synced: L[], timing: Timing | null | undefined): L[] {
+  if (!timing?.length) return synced;
+  const byStart = new Map<number, Timing[number]>();
+  for (const t of timing) byStart.set(t.s, t);
+  let any = false;
+  const out = synced.map((l) => {
+    const t = byStart.get(l.startMs);
+    if (!t || t.w !== l.words) return l;
+    any = true;
+    const m: L = { ...l };
+    if (typeof t.e === "number") m.endMs = t.e;
+    if (Array.isArray(t.syl) && t.syl.length) m.syl = t.syl;
+    return m;
+  });
+  return any ? out : synced;
+}
+
+/** Cheap identity of a lyric sheet, to know when a cached merge is still valid. */
+export function sheetKey(uri: string | undefined, rev: number, synced: L[]): string {
+  let h = 5381;
+  for (const l of synced) {
+    h = (Math.imul(h, 33) + l.startMs) | 0;
+    const w = l.words || "";
+    for (let i = 0; i < w.length; i++) h = (Math.imul(h, 33) + w.charCodeAt(i)) | 0;
+  }
+  return `${uri ?? ""}|${rev}|${synced.length}|${h}`;
 }
 
 /** Index of the line on screen at `pos`, or -1 before the first line. */

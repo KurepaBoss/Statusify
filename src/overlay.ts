@@ -9,10 +9,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { call, onSnapshot, position, snapshot, type Snapshot } from "./api";
 import {
   lyricOffset,
+  mergeTiming,
   msToNextEvent,
   overlayWanted,
+  pickAccent,
   pickView,
   readableAccent,
+  sheetKey,
+  type Timing,
   rgb,
   sungChars,
   PAUSE_HIDE_MS,
@@ -38,6 +42,38 @@ let timer = 0;
 let raf = 0;
 let unlocked = false;
 let anim = true;
+let shownWin: boolean | null = null; // is the (topmost) window mapped?
+let timing: Timing | null = null; // word timing from the bridge, per track
+let timingKey = "";
+let sheet = { key: "", lines: [] as L[] };
+
+/** Word timing (syl / endMs) is not in the snapshot's lines; fetch it per track. */
+function ensureTiming(uri: string | undefined, rev: number) {
+  const key = `${uri ?? ""}|${rev}`;
+  if (key === timingKey) return;
+  timingKey = key;
+  if (!uri) {
+    timing = null;
+    return;
+  }
+  call<Timing>("windows", "get_timing", { uri }).then(
+    (t) => {
+      if (key !== timingKey) return;
+      timing = t;
+      tick();
+    },
+    () => {},
+  );
+}
+
+/** The snapshot's synced lines with the bridge's timing merged in (cached). */
+function syncedLines(s: Snapshot, rev: number): L[] {
+  const raw = (s.lyrics.mode === "synced" ? s.lyrics.synced : []) as L[];
+  if (!raw.length) return raw;
+  const key = sheetKey(s.track?.uri, rev, raw) + "|" + (timing?.length ?? 0);
+  if (key !== sheet.key) sheet = { key, lines: mergeTiming(raw, timing) };
+  return sheet.lines;
+}
 
 // ── Scene building ───────────────────────────────────────────────────
 
@@ -124,7 +160,7 @@ function karaokeFrame() {
   raf = 0;
   const s = snapshot();
   if (!s || !scene?.syl || !s.is_playing) return;
-  const pos = position(s) + lyricOffset(s.extras);
+  const pos = position(s) + lyricOffset(s.extras, s.track?.uri);
   fill(pos);
   if (pos < scene.end) raf = requestAnimationFrame(karaokeFrame);
 }
@@ -150,6 +186,8 @@ function present(next: Scene, slide: boolean, up: boolean, lhPx: number) {
   next.el.animate([{ transform: `translateY(${dist}px)`, opacity: 0 }, { transform: "translateY(0)", opacity: 1 }], opts);
 }
 
+const rgbHex = (c: [number, number, number]) => "#" + c.map((n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, "0")).join("");
+
 function applyLayout(s: Snapshot) {
   const w = s.extras?.windows ?? {};
   const l = w.layout ?? {};
@@ -162,7 +200,10 @@ function applyLayout(s: Snapshot) {
   set("--bar", l.bar);
   set("--gap", l.gap);
   set("--nlh", l.nlh);
-  const acc = readableAccent(typeof w.accent === "string" ? w.accent : "#1db954");
+  // The cover's accent while album tint is on (Python's M.ACCENT), else the Settings pick.
+  const acc = readableAccent(
+    rgbHex(pickAccent(typeof w.accent === "string" ? w.accent : "#1db954", s.extras?.palette, w.tint !== false, w.dark !== false, s.track?.uri)),
+  );
   root.style.setProperty("--acc", rgb(acc));
   root.style.setProperty("--acc-edge", `rgba(${acc[0]}, ${acc[1]}, ${acc[2]}, 0.9)`);
 }
@@ -179,8 +220,10 @@ function step(): number {
   root.classList.toggle("noanim", !anim);
   applyLayout(s);
 
-  const pos = position(s) + lyricOffset(s.extras);
-  const synced: L[] = s.lyrics.mode === "synced" ? (s.lyrics.synced as L[]) : [];
+  const pos = position(s) + lyricOffset(s.extras, s.track?.uri);
+  const rev = Number(w.timing_rev) || 0;
+  ensureTiming(s.track?.uri, rev);
+  const synced: L[] = syncedLines(s, rev);
   let view: View | null = synced.length ? pickView(synced, pos, s.duration_ms || 0) : null;
   const playing = s.is_playing;
   if (playing) pausedAt = null;
@@ -202,6 +245,7 @@ function step(): number {
       const lh = (parseFloat(getComputedStyle(root).getPropertyValue("--px")) || 30) * 1.3;
       present(build(view, showNext), slide, oldIdx === null || view.idx >= oldIdx, lh);
       if (scene && playing) fill(pos);
+      if (shownWin) void call("windows", "raise_overlay"); // Python: raise_top() on every scene change
     }
     if (scene?.syl && playing && !raf) raf = requestAnimationFrame(karaokeFrame);
   }
@@ -209,11 +253,30 @@ function step(): number {
   // Whole-window fade.
   const opacity = (Number(w.overlay_opacity) || 100) / 100;
   root.style.opacity = want && scene ? String(opacity) : "0";
+  setMapped(!!(want && scene));
 
   if (!want) return IDLE_MS;
   let next = synced.length && playing ? msToNextEvent(synced, pos, view) : IDLE_MS;
   if (!playing && pausedAt !== null && !unlocked) next = Math.min(next, PAUSE_HIDE_MS - (now - pausedAt) + 5);
   return Math.max(4, Math.min(IDLE_MS, next));
+}
+
+/** Map or unmap the window: a faded-out overlay must not stay as an invisible
+ * topmost window (Python: SW_HIDE). Unmapping waits for the fade to finish. */
+let hideTimer = 0;
+function setMapped(on: boolean) {
+  clearTimeout(hideTimer);
+  if (on) {
+    if (shownWin !== true) {
+      shownWin = true;
+      void call("windows", "overlay_visible", { visible: true });
+    }
+  } else if (shownWin !== false) {
+    hideTimer = window.setTimeout(() => {
+      shownWin = false;
+      void call("windows", "overlay_visible", { visible: false });
+    }, 500);
+  }
 }
 
 function tick() {
@@ -234,12 +297,16 @@ tick();
 
 const inButton = (t: EventTarget | null) => !!(t as HTMLElement | null)?.closest?.("button");
 
+// startDragging runs the native caption-drag loop, which swallows the mouseup,
+// so the page never sees a "dblclick": the second press (detail 2) is the
+// double click, and it locks instead of starting another drag.
 root.addEventListener("mousedown", (e) => {
   if (!unlocked || e.button !== 0 || inButton(e.target)) return;
+  if (e.detail >= 2) {
+    void call("windows", "set_overlay_locked", { locked: true });
+    return;
+  }
   getCurrentWindow().startDragging().catch(() => {});
-});
-root.addEventListener("dblclick", (e) => {
-  if (unlocked && !inButton(e.target)) void call("windows", "set_overlay_locked", { locked: true });
 });
 root.addEventListener(
   "wheel",

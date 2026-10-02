@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   selectLine, miniLyric, currentIndex, pickView, msToNextEvent, lineSyl, sungChars, readableAccent,
-  overlayWanted, lyricOffset, parseColor, mix, luma,
+  overlayWanted, lyricOffset, offsetKey, parseColor, mix, luma, pickAccent, mergeTiming, sheetKey,
 } from "../src/win_common.ts";
 
 const S = [
@@ -120,11 +120,18 @@ test("overlayWanted: unlocked always, else playing or paused < 5 s", () => {
   assert.equal(overlayWanted(false, true, false, 5000), false);
 });
 
-test("lyricOffset prefers core's value, then the config delay, then -40", () => {
+test("lyricOffset prefers core's value, then the per-track entry, then the config delay, then 0", () => {
   assert.equal(lyricOffset({ core: { track_offset_ms: 250 }, windows: { offset_ms: 10 } }), 250);
   assert.equal(lyricOffset({ windows: { offset_ms: 10 } }), 10);
-  assert.equal(lyricOffset({}), -40);
-  assert.equal(lyricOffset(undefined), -40);
+  assert.equal(lyricOffset({}), 0);
+  assert.equal(lyricOffset(undefined), 0);
+  // Without core: the [offsets] entry (lower-cased key) wins over the global delay.
+  const ex = { windows: { offset_ms: 10, offsets: { abc123: -250 } } };
+  assert.equal(lyricOffset(ex, "spotify:track:ABC123"), -250);
+  assert.equal(lyricOffset(ex, "spotify:track:other"), 10);
+  assert.equal(lyricOffset(ex), 10);
+  assert.equal(offsetKey("spotify:track:XyZ"), "XyZ");
+  assert.equal(offsetKey(undefined), "");
 });
 
 test("colour helpers", () => {
@@ -133,4 +140,64 @@ test("colour helpers", () => {
   assert.equal(parseColor("red"), null);
   assert.deepEqual(mix([0, 0, 0], [100, 200, 50], 0.5), [50, 100, 25]);
   assert.ok(luma([255, 255, 255]) > 150 && luma([0, 0, 0]) < 1);
+});
+
+test("miniLyric: without lyrics it shows what the RPC loop published", () => {
+  const none = (st) => miniLyric("T", "none", [], [], 0, 0, st);
+  assert.equal(none({}), "♪");
+  assert.equal(none({ paused: true }), "Paused");
+  assert.equal(none({ blacklisted: true }), "— blacklisted —");
+  assert.equal(none({ instrumental: true, instrumentalText: "~ solo ~" }), "~ solo ~");
+  assert.equal(none({ instrumental: true, instrumentalText: "" }), "♪");
+  assert.equal(none({ paused: true, instrumental: true, instrumentalText: "x" }), "Paused");
+  assert.equal(miniLyric("", "none", [], [], 0, 0, { paused: true }), "Waiting for Spotify…");
+  // With lyrics the current line wins, paused or not.
+  assert.equal(miniLyric("T", "synced", S, [], 6000, 20000, { paused: true }), "two");
+});
+
+test("pickAccent: cover accent with album tint, else the user's pick", () => {
+  const pal = { uri: "u1", accent: "#ff0000", light: { accent: "#0000ff" } };
+  assert.deepEqual(pickAccent("#1db954", pal, true, true, "u1"), [255, 0, 0]);
+  assert.deepEqual(pickAccent("#1db954", pal, true, false, "u1"), [0, 0, 255]);
+  assert.deepEqual(pickAccent("#1db954", pal, false, true, "u1"), [29, 185, 84], "tint off");
+  assert.deepEqual(pickAccent("#1db954", pal, true, true, "other"), [29, 185, 84], "stale palette");
+  assert.deepEqual(pickAccent("#1db954", { uri: "u1", accent: null }, true, true, "u1"), [29, 185, 84], "no cover colours");
+  assert.deepEqual(pickAccent("#1db954", undefined, true, true, "u1"), [29, 185, 84]);
+  assert.deepEqual(pickAccent("garbage", undefined, true, true), [29, 185, 84]);
+});
+
+test("mergeTiming fills endMs and syl by start time and text", () => {
+  const lines = [
+    { startMs: 1000, words: "one" },
+    { startMs: 2000, words: "hello world" },
+    { startMs: 5000, words: "changed" },
+  ];
+  const timing = [
+    { s: 2000, w: "hello world", e: 4500, syl: [[2000, 3000, "hello "], [3000, 4500, "world"]] },
+    { s: 5000, w: "other text", e: 6000 },
+  ];
+  const m = mergeTiming(lines, timing);
+  assert.equal(m[0].endMs, undefined);
+  assert.equal(m[1].endMs, 4500);
+  assert.equal(m[1].syl.length, 2);
+  assert.equal(m[2].endMs, undefined, "text differs: foreign timing is ignored");
+  assert.equal(lines[1].endMs, undefined, "input is not mutated");
+  assert.equal(mergeTiming(lines, null), lines);
+  assert.equal(mergeTiming(lines, [{ s: 9, w: "x", e: 1 }]), lines, "nothing matched: same array");
+  // The merged sheet drives the overlay's gap logic end to end.
+  const view = pickView(m, 4600, 10000);
+  assert.equal(view.kind, "line"); // 2000..5000 gap is only 500 ms: no dots
+  const gapLines = mergeTiming(
+    [{ startMs: 0, words: "a" }, { startMs: 10000, words: "b" }],
+    [{ s: 0, w: "a", e: 3000 }],
+  );
+  assert.equal(pickView(gapLines, 4000, 20000).kind, "gap");
+});
+
+test("sheetKey changes with the track, the revision and any line's text", () => {
+  const a = [{ startMs: 1, words: "x" }];
+  assert.equal(sheetKey("u", 1, a), sheetKey("u", 1, [{ startMs: 1, words: "x" }]));
+  assert.notEqual(sheetKey("u", 1, a), sheetKey("v", 1, a));
+  assert.notEqual(sheetKey("u", 1, a), sheetKey("u", 2, a));
+  assert.notEqual(sheetKey("u", 1, a), sheetKey("u", 1, [{ startMs: 1, words: "y" }]));
 });

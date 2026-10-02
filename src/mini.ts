@@ -5,9 +5,10 @@
 // hover, dimming when the pointer has been away, drag to move (the backend
 // snaps it to screen edges), double-click the cover to open the main window,
 // right-click for a menu.
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { call, onSnapshot, player, position, snapshot, type Snapshot } from "./api";
-import { luma, lyricOffset, miniLyric, mix, parseColor, rgb, type L } from "./win_common";
+import { luma, lyricOffset, miniLyric, mix, parseColor, pickAccent, rgb, type L } from "./win_common";
 
 const IDLE_DELAY_MS = 1500; // pointer away this long -> dim
 const LYRIC_ANIM_MS = 280;
@@ -63,6 +64,8 @@ function hitOf(t: EventTarget | null): Hit {
 pill.addEventListener("pointerdown", (e) => {
   if (e.button !== 0) return;
   down = { x: e.screenX, y: e.screenY, hit: hitOf(e.target), moved: false };
+  // A press on the pill stops a snap glide in progress (a click elsewhere does not).
+  void call("windows", "mini_press");
 });
 pill.addEventListener("pointermove", (e) => {
   const d = down;
@@ -78,7 +81,11 @@ pill.addEventListener("pointerup", (e) => {
   const d = down;
   down = null;
   if (!d || d.moved || e.button !== 0) return;
-  if (d.hit && d.hit === hitOf(e.target)) void player(d.hit);
+  if (d.hit && d.hit === hitOf(e.target)) {
+    void player(d.hit).then((ok) => {
+      if (!ok) void call("windows", "player_failed"); // logs: needs the Spicetify bridge
+    });
+  }
 });
 const endGesture = () => {
   const wasDrag = down?.moved;
@@ -90,8 +97,17 @@ const endGesture = () => {
 };
 pill.addEventListener("pointercancel", endGesture);
 window.addEventListener("blur", endGesture);
-// startDragging eats the pointerup; the next pointer entry tells us it ended.
+// startDragging eats the pointerup (and the window never has focus, so no blur):
+// the backend reports the end of the drag, and whether the pointer is still
+// on the pill, which decides between staying expanded and collapsing + dimming.
 pill.addEventListener("pointerenter", () => (down = null));
+void listen<{ inside: boolean }>("mini-drag-end", (e) => {
+  down = null;
+  if (e.payload?.inside === false) {
+    pill.classList.remove("hover");
+    scheduleAway();
+  }
+});
 
 pill.addEventListener("dblclick", (e) => {
   if ((e.target as HTMLElement).closest("#cover")) void call("windows", "show_main");
@@ -134,16 +150,22 @@ function paint(s: Snapshot) {
 
   // Colours: the user accent a little toward the foreground; album tint from
   // the palette (when the now-playing area provides one) behind the cover blur.
-  const accent = parseColor(w.accent) ?? [29, 185, 84];
+  // Accent: the cover's (album tint on, the default) else the Settings pick.
+  const pal = s.extras?.palette;
+  const accent = pickAccent(w.accent, pal, w.tint !== false, dark, s.track?.uri);
   const fg: [number, number, number] = dark ? [255, 255, 255] : [18, 20, 26];
   const acc = mix(accent, fg, 0.2);
   pill.style.setProperty("--accent", rgb(acc));
   pill.style.setProperty("--glyph", luma(acc) > 150 ? "rgb(18, 20, 26)" : "#fff");
-  const pal = s.extras?.palette;
-  const cols = (pal?.colors ?? pal?.tint ?? pal?.blobs) as unknown;
-  const first = Array.isArray(cols) ? parseColor(cols[1] ?? cols[0]) : null;
-  if (first && w.tint !== false) {
-    pill.style.setProperty("--base", rgb(dark ? mix(first, [0, 0, 0], 0.55) : mix(first, [255, 255, 255], 0.75)));
+  const base = parseColor(dark ? pal?.base : (pal?.light?.base ?? pal?.base));
+  const cols = (pal?.colors ?? pal?.blobs) as unknown;
+  const first = base ?? (Array.isArray(cols) ? parseColor(cols[1] ?? cols[0]) : null);
+  if (first && w.tint !== false && (!pal?.uri || pal.uri === s.track?.uri)) {
+    // The palette's own base is already normalised for the theme.
+    pill.style.setProperty(
+      "--base",
+      rgb(base ? base : dark ? mix(first, [0, 0, 0], 0.55) : mix(first, [255, 255, 255], 0.75)),
+    );
   } else {
     pill.style.removeProperty("--base");
   }
@@ -169,7 +191,12 @@ function paint(s: Snapshot) {
   toggleBtn.classList.toggle("playing", s.is_playing);
 
   const synced = (s.lyrics.synced ?? []) as L[];
-  const text = miniLyric(title, s.lyrics.mode, synced, s.lyrics.plain ?? [], position(s) + lyricOffset(s.extras), s.duration_ms);
+  const text = miniLyric(title, s.lyrics.mode, synced, s.lyrics.plain ?? [], position(s) + lyricOffset(s.extras, t?.uri), s.duration_ms, {
+    paused: !s.is_playing,
+    blacklisted: !!t?.blacklisted,
+    instrumental: !!s.extras?.core?.in_instrumental,
+    instrumentalText: typeof w.instrumental_text === "string" ? w.instrumental_text : undefined,
+  });
   if (text !== lyric) setLyric(text);
 }
 
