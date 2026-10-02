@@ -80,7 +80,7 @@
   font-family: var(--lyric-font, inherit); font-size: var(--lpx); font-weight: 700; line-height: 1.25; letter-spacing: -0.005em; overflow-wrap: anywhere;
   transition: transform 0.72s var(--ease) var(--dl, 0ms), opacity 0.72s var(--ease) var(--dl, 0ms),
               filter 0.72s var(--ease) var(--dl, 0ms), background 0.15s;
-  will-change: transform; }
+  }
 .np .ln.off { visibility: hidden; }
 .np .rows.nt .ln,
 .np .sheet.noanim .ln { transition: none; }
@@ -252,3 +252,13 @@
 .np .np-toast .tb { display: block; height: 3px; margin-top: 6px; border-radius: 3px; background: color-mix(in srgb, var(--ink) 25%, transparent); }
 .np .np-toast .tb b { display: block; height: 100%; border-radius: 3px; background: var(--ink); }
 .np.fs .np-toast { bottom: 40px; }
+
+/* Smooth animations off (Settings): nothing moves, everything still works. */
+html[data-anim="off"] .np, html[data-anim="off"] .np * { transition: none !important; animation: none !important; }
+
+/* Narrow windows (minimum 380 px): the Discord pill keeps just its dot so the title has room. */
+@media (max-width: 440px) {
+  .np .np-rpc span { display: none; }
+  .np .np-rpc { padding: 0 11px; }
+  .np .np-head { padding-left: 20px; padding-right: 20px; }
+}

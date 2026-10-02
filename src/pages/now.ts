@@ -111,6 +111,7 @@ let lastEl = "";
 let lastLiveTier = -1;
 let lastBeatKey = "";
 let seekRect: DOMRect | null = null;
+let seekW = 0;
 let overflow: string[] = [];
 
 type Cur = { baseKey: string; extra: string; subSig: string; kind: "synced" | "plain" | "none"; specs: RowSpec[]; plan: L.PlanRow[]; t0s: number[]; n: number; geo: string };
@@ -669,7 +670,7 @@ function tick(ts: number) {
   if (key !== lastFill) {
     lastFill = key;
     elFill.style.transform = `scaleX(${frac})`;
-    elKnob.style.transform = `translate3d(${(frac * elSeek.clientWidth - 7).toFixed(1)}px,0,0)`;
+    elKnob.style.transform = `translate3d(${(frac * seekW - 7).toFixed(1)}px,0,0)`;
   }
   const el = L.fmtTime(drag !== null && dur ? drag * dur : pos);
   if (el !== lastEl) {
@@ -917,7 +918,7 @@ export function mount(root: HTMLElement) {
   window.addEventListener("keydown", onKey);
   document.addEventListener("fullscreenchange", () => setFs(!!document.fullscreenElement));
   window.addEventListener("resize", onResize);
-  new ResizeObserver(() => { updateGeometry(); layoutActions(); }).observe(np);
+  new ResizeObserver(() => { seekW = elSeek.clientWidth; lastFill = ""; updateGeometry(); layoutActions(); }).observe(np);
   new ResizeObserver(() => updateGeometry()).observe(elFoot);
   // The dev harness (tests-ts/harness.html) inspects the sheet through this.
   const dbg = window as unknown as { __npDebug?: boolean; __np?: unknown };

@@ -153,7 +153,10 @@ export class Sheet {
       // The sheet rises and fades in over 0.45 s.
       this.el.classList.remove("born");
       void this.el.offsetWidth;
-      if (this.anim) this.el.classList.add("born");
+      if (this.anim) {
+        this.el.classList.add("born");
+        window.setTimeout(() => this.el.classList.remove("born"), 520);
+      }
     }
     this.measure();
     this.focusAt = now - 10;
@@ -176,19 +179,31 @@ export class Sheet {
     row.body = body;
     el.append(body);
     if (!s.text.trim()) el.classList.add("blank");
-    row.pieces = s.kind === "line" ? karaPieces(s.text, s.syl) : null;
-    if (row.pieces) {
-      let at = 0;
-      for (const p of row.pieces) {
-        if (p.a > at) body.append(document.createTextNode(s.text.slice(at, p.a)));
+    const timed = s.kind === "line" ? karaPieces(s.text, s.syl) : null;
+    if (timed) {
+      // Every piece of the text is a span, so the text between the timed pieces
+      // (punctuation) is dim until the piece before it is sung, as one line.
+      row.pieces = [];
+      const add = (a: number, b: number, t0: number, t1: number) => {
         const sp = document.createElement("span");
         sp.className = "k";
-        sp.textContent = s.text.slice(p.a, p.b);
+        sp.textContent = s.text.slice(a, b);
         body.append(sp);
         row.spans.push(sp);
+        row.pieces!.push({ a, b, t0, t1 });
+      };
+      let at = 0, prevEnd = timed[0].t0;
+      for (const p of timed) {
+        const gap = s.text.slice(at, p.a);
+        if (gap.trim()) add(at, p.a, prevEnd, prevEnd + 1);
+        else if (gap) body.append(document.createTextNode(gap));
+        add(p.a, p.b, p.t0, p.t1);
         at = p.b;
+        prevEnd = p.t1;
       }
-      if (at < s.text.length) body.append(document.createTextNode(s.text.slice(at)));
+      const tail = s.text.slice(at);
+      if (tail.trim()) add(at, s.text.length, prevEnd, prevEnd + 1);
+      else if (tail) body.append(document.createTextNode(tail));
     } else {
       body.textContent = s.text;
     }

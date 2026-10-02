@@ -52,7 +52,12 @@ impl TState {
         let cache = Cache::open(data_dir)
             .or_else(|_| Cache::from_conn(rusqlite::Connection::open_in_memory().unwrap()))
             .expect("translation cache");
-        let client = reqwest::Client::new();
+        // Google's free endpoint answers TLS 1.3 clients here with 429 while the same
+        // request over TLS 1.2 (what Python's urllib ended up using) goes through.
+        let client = reqwest::Client::builder()
+            .max_tls_version(reqwest::tls::Version::TLS_1_2)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let handle = tauri::async_runtime::handle().inner().clone();
         Self::new(cache, Arc::new(move |tl, text| t::http_post(&client, &handle, tl, text)))
     }

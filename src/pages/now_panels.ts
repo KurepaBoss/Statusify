@@ -60,14 +60,21 @@ export class Panels {
     document.addEventListener("pointerdown", (e) => {
       const t = e.target as Node;
       if (this.menuOpen && !this.menuEl.contains(t)) {
-        // A click outside a menu only closes it.
+        // A click outside a menu only closes it (the click that follows is swallowed).
         this.closeMenu();
-        window.addEventListener("click", (ev) => { ev.stopPropagation(); ev.preventDefault(); }, { capture: true, once: true });
+        if (e.button === 0) {
+          const swallow = (ev: Event) => { ev.stopPropagation(); ev.preventDefault(); };
+          window.addEventListener("click", swallow, { capture: true, once: true });
+          window.setTimeout(() => window.removeEventListener("click", swallow, true), 400);
+        }
       }
     }, true);
-    host.root.querySelector(".sheet")?.addEventListener("click", () => {
-      if (this.kind) this.close();
-    });
+    // A click on the sheet while a panel is open only closes the panel (capture: before the row's seek).
+    host.root.querySelector(".sheet")?.addEventListener("click", (e) => {
+      if (!this.kind) return;
+      e.stopPropagation();
+      this.close();
+    }, true);
   }
 
   // ── Panels ──────────────────────────────────────────────────
