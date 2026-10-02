@@ -339,13 +339,11 @@ fn mini_open(ctx: &C, inner: &I) -> Result<(), String> {
         .visible(false)
         .build()
         .map_err(|e| format!("mini window: {e}"))?;
-    if let Some(h) = hwnd_of(&window) {
-        win_mon::hide_from_switcher(h);
-    }
     place(inner, &window, 0, Some((w, h)), (x, y));
     watch(ctx, inner, &window, 0);
     inner.open[0].store(true, Ordering::SeqCst);
     let _ = window.show();
+    tidy_style(&window);
     crate::log("Mini player on");
     drop(g);
     push_extras(ctx, inner);
@@ -487,9 +485,6 @@ fn overlay_open(ctx: &C, inner: &I) -> Result<(), String> {
         .visible(false)
         .build()
         .map_err(|e| format!("overlay window: {e}"))?;
-    if let Some(h) = hwnd_of(&window) {
-        win_mon::hide_from_switcher(h);
-    }
     watch(ctx, inner, &window, 1);
     inner.open[1].store(true, Ordering::SeqCst);
     overlay_load_anchor(ctx, inner);
@@ -497,6 +492,7 @@ fn overlay_open(ctx: &C, inner: &I) -> Result<(), String> {
     let _ = window.set_ignore_cursor_events(read_prefs(&ctx.config).overlay_locked);
     let _ = window.show();
     inner.ov_shown.store(true, Ordering::SeqCst);
+    tidy_style(&window);
     raise_overlay(&window);
     spawn_raiser(ctx, inner);
     crate::log("Lyrics overlay on");
@@ -532,6 +528,13 @@ fn flush_geometry(ctx: &C, inner: &I) {
     inner.geo.flush(|g| ctx.config.set("window", "overlay_geometry", &g));
 }
 
+/// Out of Alt+Tab / Win+Tab, as Python's WS_EX_TOOLWINDOW (see win_mon).
+fn tidy_style(w: &WebviewWindow) {
+    if let Some(h) = hwnd_of(w) {
+        win_mon::hide_from_switcher(h);
+    }
+}
+
 fn raise_overlay(w: &WebviewWindow) {
     if let Some(h) = hwnd_of(w) {
         win_mon::raise_topmost(h);
@@ -551,6 +554,7 @@ fn spawn_raiser(ctx: &C, inner: &I) {
         }
         if inner.ov_shown.load(Ordering::SeqCst) {
             if let Some(w) = win(&ctx, OVERLAY) {
+                tidy_style(&w);
                 raise_overlay(&w);
             }
         }
@@ -696,6 +700,7 @@ fn sync(ctx: &C, inner: &I) {
                         overlay_relayout_locked(ctx, inner, &w);
                     }
                     let _ = w.set_ignore_cursor_events(p.overlay_locked);
+                    tidy_style(&w);
                     inner.ov.lock().unwrap().applied = Some(now);
                 }
             }
@@ -922,6 +927,7 @@ impl Feature for Windows {
                     if let Some(w) = win(ctx, OVERLAY) {
                         if show {
                             let _ = w.show();
+                            tidy_style(&w);
                             raise_overlay(&w);
                         } else {
                             let _ = w.hide();

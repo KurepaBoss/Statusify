@@ -118,7 +118,11 @@ mod imp {
     /// Alt+Tab / Win+Tab skip tool windows; strip WS_EX_APPWINDOW too.
     pub fn hide_from_switcher(hwnd: isize) {
         unsafe {
-            let ex = (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW;
+            let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let ex = (cur | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW;
+            if ex == cur {
+                return;
+            }
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
             SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
@@ -171,6 +175,9 @@ pub fn cursor_pos() -> Option<(i32, i32)> {
 }
 
 /// Keep the window out of Alt+Tab / Win+Tab (tool window, not app window).
+/// Idempotent and cheap when nothing is wrong: tao rewrites the whole extended
+/// style whenever one of its own flags changes (show, click-through, ...), so
+/// callers re-apply this after each of those.
 pub fn hide_from_switcher(hwnd: isize) {
     #[cfg(windows)]
     imp::hide_from_switcher(hwnd);
