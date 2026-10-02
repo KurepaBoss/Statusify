@@ -1,71 +1,114 @@
+/* The window palette. Dark and light defaults are Python's ramps; with album tint
+   on, src/pages/now_fx.ts (applySurfaces) replaces them from the cover's hue
+   (statusify_colors.tinted_palette). Registered as colours so a change fades. */
+@property --bg { syntax: "<color>"; inherits: true; initial-value: #0b0d10; }
+@property --bg2 { syntax: "<color>"; inherits: true; initial-value: #12151a; }
+@property --bg3 { syntax: "<color>"; inherits: true; initial-value: #1a1f26; }
+@property --bg4 { syntax: "<color>"; inherits: true; initial-value: #232932; }
+@property --text { syntax: "<color>"; inherits: true; initial-value: #f2f4f7; }
+@property --text2 { syntax: "<color>"; inherits: true; initial-value: #a8b0bb; }
+@property --muted { syntax: "<color>"; inherits: true; initial-value: #6b7480; }
+@property --border { syntax: "<color>"; inherits: true; initial-value: #252b34; }
 :root {
-  --fg: #f4f4f6;
-  --dim: rgba(244, 244, 246, 0.45);
-  --faint: rgba(244, 244, 246, 0.22);
+  --bg: #0b0d10; --bg2: #12151a; --bg3: #1a1f26; --bg4: #232932;
+  --text: #f2f4f7; --text2: #a8b0bb; --muted: #6b7480; --border: #252b34;
+  --fg: var(--text);
+  --dim: color-mix(in srgb, var(--text) 45%, transparent);
+  --faint: color-mix(in srgb, var(--text) 22%, transparent);
+  --base: var(--bg);
   --accent: #1ed760;
-  --base: #121216;
   color-scheme: dark;
+  transition: --bg 1.2s ease-in-out, --bg2 1.2s ease-in-out, --bg3 1.2s ease-in-out, --bg4 1.2s ease-in-out,
+    --text 1.2s ease-in-out, --text2 1.2s ease-in-out, --muted 1.2s ease-in-out, --border 1.2s ease-in-out;
 }
+html[data-light] {
+  --bg: #f4f6f8; --bg2: #ffffff; --bg3: #eaeef2; --bg4: #dde3ea;
+  --text: #12161b; --text2: #4a5563; --muted: #7b8794; --border: #d9e0e7;
+  color-scheme: light;
+}
+html[data-anim="off"] { transition: none; }
 * { box-sizing: border-box; margin: 0; }
-html, body { height: 100%; background: var(--base); color: var(--fg);
+html, body { height: 100%; background: var(--bg); color: var(--text);
   font: 15px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   overflow: hidden; user-select: none; }
 
-/* Blurred cover behind everything, composited on the GPU. */
-#backdrop { position: fixed; inset: -60px; background: center / cover no-repeat;
-  filter: blur(48px) saturate(1.4) brightness(0.55); transform: scale(1.1);
-  transition: opacity 0.6s ease; opacity: 0; }
-#backdrop.on { opacity: 1; }
-#shade { position: fixed; inset: 0;
-  background: linear-gradient(to bottom, rgba(0,0,0,0.25), rgba(0,0,0,0.05) 30%, rgba(0,0,0,0.45)); }
+/* ── The window's backdrop (src/pages/now_fx.ts) ──────────────────
+   The cover, enlarged and blurred, drifts under five blobs of its colours.
+   Only transform and opacity ever animate, so it stays on the compositor. */
+@property --bd-base { syntax: "<color>"; inherits: true; initial-value: #121216; }
+@property --c { syntax: "<color>"; inherits: false; initial-value: #202028; }
+
+#backdrop { position: fixed; inset: 0; overflow: hidden; background: #000;
+  --bd-base: #121216; transition: --bd-base 1.6s ease-in-out; contain: strict; }
+.bd-base { position: absolute; inset: 0; background: var(--bd-base); }
+.bd-cov { position: absolute; inset: 0; opacity: 0; transition: opacity 1.2s ease-in-out; }
+.bd-cov.on { opacity: 1; }
+.bd-img { position: absolute; left: 50%; top: 50%; width: 180vmax; height: 180vmax;
+  margin: -90vmax 0 0 -90vmax; will-change: transform;
+  animation: bd-drift 60s ease-in-out infinite alternate; }
+@keyframes bd-drift {
+  from { transform: translate3d(0, 0, 0) rotate(0deg) scale(1); }
+  to   { transform: translate3d(4%, -3%, 0) rotate(8deg) scale(1.18); }
+}
+.bd-water { position: absolute; inset: 0; background: var(--bd-base); opacity: 1; transition: opacity 1.2s ease-in-out; }
+#backdrop.cover .bd-water { opacity: 0.3; }
+.bl { position: absolute; left: 50%; top: 50%; width: 0; height: 0; will-change: transform; }
+.bd-blob { position: absolute; border-radius: 50%; will-change: transform;
+  background: radial-gradient(closest-side, var(--c), transparent); transition: --c 1.6s ease-in-out; }
+@keyframes bd-x { from { transform: translate3d(calc(var(--amp) * -1), 0, 0); } to { transform: translate3d(var(--amp), 0, 0); } }
+@keyframes bd-y { from { transform: translate3d(0, calc(var(--amp) * -1), 0); } to { transform: translate3d(0, var(--amp), 0); } }
+@keyframes bd-s { from { transform: scale(0.82); } to { transform: scale(1.18); } }
+#backdrop.still *, #backdrop.still { animation-play-state: paused !important; }
+/* Cover mode (album tint on, dark theme, a cover loaded) darkens the picture:
+   the vignette here, and #shade per page (Lyrics 0.45, the rest 0.76 black).
+   Outside cover mode the water is shown as it is, melting into the window
+   colour at the Lyrics page's top and bottom edges; every other page is flat. */
+.bd-vig, .bd-edge, .bd-flat { position: absolute; inset: 0; opacity: 0; pointer-events: none; transition: opacity 0.42s cubic-bezier(0.22, 1, 0.36, 1); }
+.bd-vig { background: radial-gradient(ellipse 90% 70% at 50% 45%, rgba(0,0,0,0), rgba(0,0,0,0.5)),
+              linear-gradient(to bottom, rgba(0,0,0,0.45), rgba(0,0,0,0) 22%, rgba(0,0,0,0) 70%, rgba(0,0,0,0.6)); }
+.bd-edge { background: linear-gradient(to bottom, var(--bg), transparent 56px, transparent calc(100% - 78px), var(--bg)); }
+.bd-flat { background: var(--bg); }
+#backdrop.cover .bd-vig { opacity: 1; }
+body[data-page="now"] #backdrop:not(.cover) .bd-edge { opacity: 1; }
+body:not([data-page="now"]) #backdrop:not(.cover) .bd-flat { opacity: 1; }
+html[data-npfs] .bd-edge { opacity: 0 !important; }
+.bd-beat { position: absolute; inset: 0; background: #fff; opacity: 0; }
+#shade { position: fixed; inset: 0; background: #000; pointer-events: none; opacity: 0;
+  transition: opacity 0.42s cubic-bezier(0.22, 1, 0.36, 1); }
+#backdrop.cover ~ #shade { opacity: 0.45; }
+body:not([data-page="now"]) #backdrop.cover ~ #shade { opacity: 0.76; }
+html[data-anim="off"] #shade, html[data-anim="off"] .bd-vig, html[data-anim="off"] .bd-edge, html[data-anim="off"] .bd-flat { transition: none; }
 
 body { display: flex; flex-direction: column; }
-#tabs { position: relative; display: flex; gap: 4px; padding: 10px 16px 0; flex: none; }
-.tab { all: unset; cursor: pointer; padding: 6px 12px; border-radius: 99px; font-size: 13px; color: var(--dim); }
-.tab:hover { color: var(--fg); background: rgba(255,255,255,0.06); }
-.tab.on { color: var(--fg); background: rgba(255,255,255,0.12); }
-.tab:focus-visible { outline: 2px solid var(--accent); }
-#pages { position: relative; flex: 1; min-height: 0; }
+
+/* ── Page switcher: a segmented control at the bottom (src/pages/now_nav.ts) ──
+   The pill under the selected page slides with the pages. */
+#tabs { order: 2; position: relative; flex: none; z-index: 2; align-self: center;
+  display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; width: min(calc(100% - 32px), 392px);
+  margin: 6px 16px 12px; padding: 3px; border-radius: 12px;
+  background: color-mix(in srgb, var(--bg2) 72%, transparent); border: 1px solid var(--border);
+  -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px); }
+.tab-pill { position: absolute; left: 3px; top: 3px; bottom: 3px; width: calc((100% - 6px) / var(--tabs, 4)); border-radius: 9px;
+  background: var(--bg4); box-shadow: 0 1px 6px rgba(0,0,0,0.22); will-change: transform; pointer-events: none; }
+.tab { all: unset; position: relative; z-index: 1; cursor: pointer; text-align: center; padding: 7px 8px; border-radius: 9px;
+  font-size: 13px; font-weight: 600; color: var(--muted); transition: color 0.25s; white-space: nowrap; }
+.tab:hover { color: var(--text2); }
+.tab.on { color: var(--text); }
+.tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+#pages { position: relative; flex: 1; min-height: 0; touch-action: pan-y; }
 .page { position: absolute; inset: 0; display: none; overflow: auto; }
 .page.on { display: block; }
-#page-now.on { display: flex; flex-direction: column; padding: 14px 20px 12px; gap: 12px; overflow: hidden; }
-/* Other pages sit on a darker backdrop, like the Python app's cover mode. */
-body:not([data-page="now"]) #shade { background: rgba(0,0,0,0.55); }
+/* While pages move, every page within one width of the view is shown. */
+#pages.sliding { overflow: hidden; }
+#pages.sliding .page { display: none; overflow: hidden; }
+#pages.sliding .page.sl { display: block; will-change: transform; }
+#pages.dragging, #pages.dragging * { cursor: grabbing; }
+#page-now.on { display: block; overflow: hidden; }
 .placeholder { padding: 40px; color: var(--dim); text-align: center; }
-.np-head { display: flex; gap: 14px; align-items: center; }
-#cover { width: 64px; height: 64px; border-radius: 8px; object-fit: cover; flex: none;
-  box-shadow: 0 6px 20px rgba(0,0,0,0.45); background: rgba(255,255,255,0.06); }
-#cover:not([src]), #cover[src=""] { visibility: hidden; }
-.meta { min-width: 0; }
-#title { font-weight: 600; font-size: 17px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#artist { color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#source { color: var(--faint); font-size: 12px; margin-top: 2px; }
-
-#lyrics { flex: 1; overflow: hidden; position: relative;
-  mask-image: linear-gradient(to bottom, transparent, #000 18%, #000 70%, transparent); }
-#sheet { position: absolute; left: 0; right: 0; top: 0; will-change: transform;
-  transition: transform 0.45s cubic-bezier(0.2, 0.7, 0.2, 1); }
-.line { font-size: 24px; font-weight: 700; line-height: 1.25; padding: 7px 0;
-  color: var(--faint); transition: color 0.3s ease, transform 0.3s ease; transform-origin: left center; }
-.line.past { color: var(--dim); }
-.line.now { color: var(--fg); transform: scale(1.03); }
-.line.blank { min-height: 1.25em; }
-.line.blank::after { content: "\266A"; color: var(--faint); }
-.plain .line { color: var(--fg); font-size: 18px; font-weight: 500; }
-.empty { color: var(--dim); font-size: 16px; padding-top: 30%; text-align: center; }
-
-#progress { height: 3px; border-radius: 3px; background: rgba(255,255,255,0.14); cursor: pointer; }
-#bar { height: 100%; width: 0; border-radius: 3px; background: var(--fg); }
-.np-foot { display: flex; justify-content: space-between; align-items: center; }
-.transport { display: flex; gap: 6px; }
-.transport button { all: unset; cursor: pointer; width: 36px; height: 36px; display: grid; place-items: center;
-  border-radius: 50%; font-size: 16px; color: var(--fg); background: rgba(255,255,255,0.08);
-  transition: background 0.15s; }
-.transport button:hover { background: rgba(255,255,255,0.18); }
-.transport button:focus-visible { outline: 2px solid var(--accent); }
-.status { display: flex; gap: 6px; }
-.pill { font-size: 12px; padding: 3px 9px; border-radius: 99px; background: rgba(255,255,255,0.08); color: var(--dim); }
-.pill::before { content: "\25CF"; margin-right: 5px; color: #e5534b; }
+.pill { font-size: 12px; padding: 3px 9px; border-radius: 99px; background: color-mix(in srgb, var(--text) 8%, transparent); color: var(--dim); }
+.pill::before { content: "CF"; margin-right: 5px; color: #e5534b; }
 .pill.ok::before { color: var(--accent); }
-#note { color: #f0b429; font-size: 12px; }
-#note:empty { display: none; }
+
+/* Fullscreen lyrics: the switcher steps aside (src/pages/now.ts). */
+html[data-npfs] #tabs { display: none; }
+html[data-npfs] #pages { position: fixed; inset: 0; }
