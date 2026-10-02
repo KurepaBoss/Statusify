@@ -1,0 +1,49 @@
+/* Desktop lyrics overlay (owner: windows agent). The window is a transparent,
+   borderless strip; sizes arrive as CSS variables from the backend's layout. */
+:root { --px: 30px; --npx: 19px; --pad: 12px; --bar: 26px; --gap: 5px; --nlh: 25px;
+  --acc: rgb(29, 185, 84); --acc-edge: rgba(29, 185, 84, 0.9); }
+* { box-sizing: border-box; margin: 0; }
+html, body { width: 100%; height: 100%; background: transparent; overflow: hidden; user-select: none;
+  font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif; cursor: default; }
+
+#root { position: fixed; inset: 0; opacity: 0; transition: opacity 0.35s ease; }
+#root.noanim { transition: none; }
+
+/* Unlocked: a translucent panel with an accent border, a grip, Lock and x. */
+#panel { display: none; position: absolute; inset: 0; border-radius: 12px; background: rgba(12, 12, 16, 0.59);
+  border: 2px solid var(--acc-edge); }
+#root.unlocked #panel { display: block; cursor: move; }
+.bar { position: absolute; left: 0; right: 0; top: 4px; height: calc(var(--bar) - 6px); display: flex; align-items: center;
+  padding: 0 8px 0 12px; gap: 6px; }
+.grip { display: grid; grid-template-columns: repeat(2, 3px); gap: 3px; margin-right: 8px; }
+.grip i { width: 3px; height: 3px; border-radius: 50%; background: rgba(230, 230, 230, 0.86); }
+.hint { flex: 1; min-width: 0; font-size: 12px; font-weight: 600; color: rgba(230, 230, 230, 0.9); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; }
+.bar button { all: unset; box-sizing: border-box; height: 100%; border-radius: 5px; cursor: pointer; display: grid; place-items: center; }
+#lock { padding: 0 9px; background: var(--acc); color: #0a0a0a; font-size: 12px; font-weight: 600; }
+#close { aspect-ratio: 1; background: rgba(255, 255, 255, 0.16); }
+#close svg { width: 40%; height: 40%; fill: none; stroke: rgba(240, 240, 240, 1); stroke-width: 1.8; stroke-linecap: round; }
+#lock:hover, #close:hover { filter: brightness(1.15); }
+
+#stage { position: absolute; left: var(--pad); right: var(--pad); top: calc(var(--bar) + var(--pad)); bottom: var(--pad);
+  pointer-events: none; }
+/* Crisp dark outline plus a soft blur, for bright backgrounds. A filter (not
+   text-shadow) so the karaoke fill keeps its shadow. */
+.scene { position: absolute; inset: 0; display: flex; flex-direction: column;
+  filter: drop-shadow(0 0 1px rgba(0, 0, 0, 0.95)) drop-shadow(0 0 3px rgba(0, 0, 0, 0.85)) drop-shadow(0 1px 6px rgba(0, 0, 0, 0.7));
+  will-change: transform, opacity; }
+.cur { flex: 1; min-height: 0; display: flex; flex-direction: column; justify-content: flex-end; font-weight: 700;
+  font-size: var(--px); color: var(--acc); }
+.txt { width: 100%; text-align: center; line-height: 1.3; overflow-wrap: anywhere; }
+.txt.clamp { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.nxt { flex: none; height: var(--nlh); margin-top: var(--gap); line-height: var(--nlh); font-size: var(--npx); font-weight: 600;
+  text-align: center; color: rgba(235, 235, 235, 0.7); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gap .txt { display: flex; justify-content: center; gap: 0.55em; }
+.gap .on { color: var(--acc); }
+.gap .off { color: rgba(245, 245, 245, 0.59); }
+
+/* Word-timed lines: white, filled with the accent as they are sung. */
+.k { color: rgb(245, 245, 245); }
+.k.on { color: var(--acc); }
+.k.part { color: transparent; -webkit-background-clip: text; background-clip: text;
+  background-image: linear-gradient(90deg, var(--acc) calc(var(--f) * 100%), rgb(245, 245, 245) calc(var(--f) * 100%)); }
