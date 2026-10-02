@@ -28,6 +28,20 @@ pub struct Ctx {
     pub config: Arc<Config>,
     pub app: tauri::AppHandle,
     pub data_dir: PathBuf,
+    /// All features, for calling one from another (set once at startup).
+    pub features: std::sync::OnceLock<Vec<Arc<dyn Feature>>>,
+}
+
+impl Ctx {
+    /// Call another feature's action, e.g. ctx.call("core", "toggle_rpc", json!({})).
+    pub fn call(self: &Arc<Self>, feature: &str, action: &str, args: Value) -> Result<Value, String> {
+        let f = self
+            .features
+            .get()
+            .and_then(|fs| fs.iter().find(|f| f.name() == feature).cloned())
+            .ok_or_else(|| format!("no feature {feature}"))?;
+        f.call(self, action, args)
+    }
 }
 
 pub trait Feature: Send + Sync {

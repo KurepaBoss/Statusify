@@ -31,6 +31,8 @@ pub enum Event {
     LyricsChanged,
     Paused,
     Resumed,
+    /// statusify.cfg was changed (Engine::config_changed); re-read settings.
+    ConfigChanged,
 }
 
 #[derive(Default)]
@@ -89,6 +91,11 @@ impl Engine {
             on_change: Box::new(on_change),
             events: broadcast::channel(256).0,
         })
+    }
+
+    /// Call after writing statusify.cfg so every feature re-reads it.
+    pub fn config_changed(&self) {
+        self.emit(Event::ConfigChanged);
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {

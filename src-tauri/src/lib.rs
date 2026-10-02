@@ -106,8 +106,9 @@ pub fn run() {
             });
             let config = Arc::new(config::Config::open(&dir));
             let outbox = bridge::Outbox::default();
-            let ctx = Arc::new(Ctx { engine: engine.clone(), outbox: outbox.clone(), config, app: handle, data_dir: dir.clone() });
+            let ctx = Arc::new(Ctx { engine: engine.clone(), outbox: outbox.clone(), config, app: handle, data_dir: dir.clone(), features: Default::default() });
             let feats = features::all();
+            let _ = ctx.features.set(feats.clone());
             app.manage(App { ctx: ctx.clone(), features: feats.clone() });
 
             let port: u16 = std::env::var("STATUSIFY_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8765);
