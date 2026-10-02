@@ -7,6 +7,9 @@ mod features;
 mod lrclib;
 mod lyrics;
 mod presence;
+mod shell_hotkeys;
+mod shell_tray;
+mod shell_window;
 mod state;
 
 use engine::Engine;
@@ -90,6 +93,11 @@ pub fn run() {
     log(&format!("Statusify-rs {} · data in {}", env!("CARGO_PKG_VERSION"), dir.display()));
 
     tauri::Builder::default()
+        // Shell plugins (single-instance first: a second launch only focuses the first).
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| shell_window::show_main(app)))
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             let handle = app.handle().clone();
