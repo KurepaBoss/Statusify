@@ -642,7 +642,7 @@ impl Pipeline {
         // Discord: a private pipe, a private Link, exactly lib.rs::start_discord's wiring.
         let prefix = format!(r"\\.\pipe\statusify-bench-{tag}-");
         let discord = FakeDiscord::spawn(prefix.clone(), o.discord_open);
-        let link: &'static discord::Link = Box::leak(Box::new(discord::Link::new(discord::RETRY_FAILED, discord::RETRY_DROPPED, discord::PIPE_TIMEOUT)));
+        let link: &'static discord::Link = Box::leak(Box::new(discord::Link::new(discord::RETRY, discord::PIPE_TIMEOUT)));
         let (tx, rx) = mpsc::unbounded_channel();
         let e = engine.clone();
         tasks.push(tokio::spawn(discord::run_on(link, Box::leak(prefix.into_boxed_str()), "123".into(), rx, move |st| match st {
@@ -1104,7 +1104,7 @@ fn bench_d_discord_reconnect() {
             let (n, r) = h.await.unwrap();
             out.insert(n.into(), r);
         }
-        out.insert("constants_ms".into(), json!({"retry_dropped": discord::RETRY_DROPPED.as_millis(), "retry_failed": discord::RETRY_FAILED.as_millis(), "pipe_timeout": discord::PIPE_TIMEOUT.as_millis(), "settle": presence::CALIBRATION.as_millis()}));
+        out.insert("constants_ms".into(), json!({"retry_first": discord::RETRY.first.as_millis(), "retry_cap_pipe_missing": discord::RETRY.cap_missing.as_millis(), "retry_cap_other": discord::RETRY.cap_other.as_millis(), "pipe_timeout": discord::PIPE_TIMEOUT.as_millis(), "settle_unknown_lyrics": presence::CALIBRATION.as_millis(), "settle_known_lyrics": presence::KNOWN_SETTLE.as_millis(), "settle_resume": presence::RESUME_SETTLE.as_millis()}));
         out.insert("machine_cpu_pct_during".into(), json!(load.pct()));
         report("d_discord_pipe_recovery", Value::Object(out));
     });

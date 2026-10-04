@@ -7,7 +7,7 @@
 //! Failures are logged and kept in `Link::error` for the UI.
 
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use futures_util::FutureExt;
@@ -42,10 +42,42 @@ pub const PIPE_PREFIX: &str = r"\\.\pipe\discord-ipc-";
 /// stopped reading (a hung client, or a game holding the pipe): drop the
 /// pipe and reconnect (statusify_rpc.PIPE_TIMEOUT_S).
 pub const PIPE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Retry cadence (main.py _backend): after a failed connect or handshake,
-/// and after a connection that worked and then dropped.
-pub const RETRY_FAILED: Duration = Duration::from_secs(15);
-pub const RETRY_DROPPED: Duration = Duration::from_secs(5);
+/// When to try again after a failed connect, a failed handshake or a
+/// connection that dropped (main.py _backend waited a flat 5 s / 15 s): `first`,
+/// doubling up to `cap_missing` while there is no pipe to open (opening one is
+/// a cheap syscall, and Discord restarts and updates are common) and up to
+/// `cap_other` while there is a pipe that does not work. A connection that
+/// lasted `stable` starts the sequence over; a shorter one does not, so a
+/// Discord that hangs up at once is not redialled in a tight loop.
+#[derive(Clone, Copy, Debug)]
+pub struct Retry {
+    pub first: Duration,
+    pub cap_missing: Duration,
+    pub cap_other: Duration,
+    pub stable: Duration,
+}
+
+pub const RETRY: Retry = Retry {
+    first: Duration::from_millis(250),
+    cap_missing: Duration::from_secs(2),
+    cap_other: Duration::from_secs(5),
+    stable: Duration::from_secs(10),
+};
+/// While the same failure goes on it is logged this often.
+const LOG_EVERY: Duration = Duration::from_secs(30);
+
+fn backoff(first: Duration, cap: Duration, attempt: u32) -> Duration {
+    first.saturating_mul(1 << attempt.min(16)).min(cap)
+}
+
+/// True when something may be logged now (and notes that it was).
+fn due(last: &mut Option<Instant>, every: Duration) -> bool {
+    let now = last.is_none_or(|t| t.elapsed() >= every);
+    if now {
+        *last = Some(Instant::now());
+    }
+    now
+}
 
 fn open_pipe(prefix: &str) -> Option<NamedPipeClient> {
     (0..10).find_map(|i| ClientOptions::new().open(format!("{prefix}{i}")).ok())
@@ -59,19 +91,17 @@ pub struct Link {
     reconnect: Notify,
     connected: AtomicBool,
     error: Mutex<String>,
-    retry_failed: Duration,
-    retry_dropped: Duration,
+    retry: Retry,
     timeout: Duration,
 }
 
 impl Link {
-    pub const fn new(retry_failed: Duration, retry_dropped: Duration, timeout: Duration) -> Link {
+    pub const fn new(retry: Retry, timeout: Duration) -> Link {
         Link {
             reconnect: Notify::const_new(),
             connected: AtomicBool::new(false),
             error: Mutex::new(String::new()),
-            retry_failed,
-            retry_dropped,
+            retry,
             timeout,
         }
     }
@@ -106,7 +136,7 @@ impl Link {
 }
 
 /// The app's one Discord connection.
-pub static LINK: Link = Link::new(RETRY_FAILED, RETRY_DROPPED, PIPE_TIMEOUT);
+pub static LINK: Link = Link::new(RETRY, PIPE_TIMEOUT);
 
 pub enum Status {
     Connected(String),
@@ -114,7 +144,9 @@ pub enum Status {
 }
 
 enum Ended {
-    /// Could not open the pipe, or the handshake failed.
+    /// There is no Discord pipe to open.
+    Missing,
+    /// The pipe opened, but the handshake failed.
     Failed(String),
     /// The connection worked, then dropped.
     Dropped,
@@ -138,9 +170,13 @@ pub async fn run(app_id: String, rx: mpsc::UnboundedReceiver<Update>, status: im
 
 pub async fn run_on(link: &Link, prefix: &str, app_id: String, mut rx: mpsc::UnboundedReceiver<Update>, status: impl Fn(Status) + Send + 'static) {
     let mut nonce: u64 = 0;
+    // Failed tries since the last stable connection; when a failure was last logged.
+    let mut attempt: u32 = 0;
+    let mut logged: Option<Instant> = None;
     loop {
+        let mut up_since = None;
         let ended = match open_pipe(prefix) {
-            None => Ended::Failed("Discord IPC pipe not found".into()),
+            None => Ended::Missing,
             Some(pipe) => {
                 let (mut rd, mut wr) = tokio::io::split(pipe);
                 let hs = frame(OP_HANDSHAKE, &json!({"v": 1, "client_id": app_id}));
@@ -157,6 +193,8 @@ pub async fn run_on(link: &Link, prefix: &str, app_id: String, mut rx: mpsc::Unb
                         let _ = link.reconnect.notified().now_or_never();
                         link.connected.store(true, Ordering::Relaxed);
                         link.clear_error();
+                        up_since = Some(Instant::now());
+                        logged = None;
                         status(Status::Connected(user));
                         // Reader: drain replies; log errors; ends when the pipe dies.
                         let mut reader = tokio::spawn(async move {
@@ -207,22 +245,38 @@ pub async fn run_on(link: &Link, prefix: &str, app_id: String, mut rx: mpsc::Unb
                 }
             }
         };
+        if up_since.is_some_and(|t| t.elapsed() >= link.retry.stable) {
+            attempt = 0;
+        }
+        let r = &link.retry;
         let wait = match ended {
-            Ended::Failed(e) => {
-                let secs = link.retry_failed.as_secs();
-                crate::log(&format!("RPC unavailable: {e}  — retrying in {secs}s"));
-                link.set_error(&format!("Discord unreachable: {e} (retrying in {secs}s)"));
-                link.retry_failed
-            }
-            Ended::Dropped => {
-                let secs = link.retry_dropped.as_secs();
-                crate::log(&format!("RPC disconnected — reconnecting in {secs}s"));
-                link.set_error(&format!("Discord pipe closed (reconnecting in {secs}s)"));
-                link.retry_dropped
-            }
             Ended::Requested => {
                 crate::log("Reconnect requested — re-handshaking");
                 Duration::ZERO
+            }
+            ended => {
+                let (cap, failure) = match ended {
+                    Ended::Missing => (r.cap_missing, Some("Discord IPC pipe not found".to_string())),
+                    Ended::Failed(e) => (r.cap_other, Some(e)),
+                    _ => (r.cap_other, None),
+                };
+                match failure {
+                    Some(e) => {
+                        if due(&mut logged, LOG_EVERY) {
+                            crate::log(&format!("RPC unavailable: {e}  — retrying"));
+                        }
+                        link.set_error(&format!("Discord unreachable: {e} (retrying)"));
+                    }
+                    None => {
+                        if due(&mut logged, LOG_EVERY) {
+                            crate::log("RPC disconnected — reconnecting");
+                        }
+                        link.set_error("Discord pipe closed (reconnecting)");
+                    }
+                }
+                let wait = backoff(r.first, cap, attempt);
+                attempt = attempt.saturating_add(1);
+                wait
             }
         };
         // Not connected: drop updates meanwhile; retry after `wait`
@@ -247,12 +301,17 @@ mod tests {
     use super::*;
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 
-    fn link(failed_ms: u64, dropped_ms: u64, timeout_ms: u64) -> &'static Link {
-        Box::leak(Box::new(Link::new(
-            Duration::from_millis(failed_ms),
-            Duration::from_millis(dropped_ms),
-            Duration::from_millis(timeout_ms),
-        )))
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn link_with(retry: Retry, timeout_ms: u64) -> &'static Link {
+        Box::leak(Box::new(Link::new(retry, ms(timeout_ms))))
+    }
+
+    /// A link retrying after `first_ms`, doubling up to `cap_ms`.
+    fn link(first_ms: u64, cap_ms: u64, timeout_ms: u64) -> &'static Link {
+        link_with(Retry { first: ms(first_ms), cap_missing: ms(cap_ms), cap_other: ms(cap_ms), stable: Duration::from_secs(10) }, timeout_ms)
     }
 
     fn prefix(tag: &str) -> String {
@@ -329,7 +388,7 @@ mod tests {
     #[tokio::test]
     async fn missing_pipe_is_reported_and_retried_slowly() {
         let p = prefix("none");
-        let l = link(60_000, 10, 5000);
+        let l = link(60_000, 60_000, 5000);
         let (_tx, _st) = start(l, &p);
         wait_for(|| l.error().contains("Discord IPC pipe not found")).await;
         assert!(l.error().starts_with("Discord unreachable:"));
@@ -346,7 +405,7 @@ mod tests {
     async fn rejected_handshake_is_reported() {
         let p = prefix("bad");
         let srv = server(&p, true);
-        let l = link(60_000, 10, 5000);
+        let l = link(60_000, 60_000, 5000);
         let (_tx, _st) = start(l, &p);
         srv.connect().await.unwrap();
         let (mut rd, mut wr) = tokio::io::split(srv);
@@ -389,6 +448,82 @@ mod tests {
         let _io2 = tokio::time::timeout(Duration::from_secs(5), ready(srv2)).await.expect("re-handshake at once");
         assert_eq!(st_rx.recv().await, Some(true));
         assert_eq!(l.error(), "");
+    }
+
+    #[test]
+    fn the_retry_delay_doubles_up_to_its_cap() {
+        let d = |n| backoff(ms(250), Duration::from_secs(2), n).as_millis();
+        assert_eq!((0..6).map(d).collect::<Vec<_>>(), vec![250, 500, 1000, 2000, 2000, 2000]);
+        assert_eq!(d(100_000), 2000, "no overflow");
+    }
+
+    #[test]
+    fn a_failure_is_logged_once_and_then_only_now_and_then() {
+        let mut last = None;
+        assert!(due(&mut last, Duration::from_secs(30)));
+        assert!(!due(&mut last, Duration::from_secs(30)));
+        assert!(!due(&mut last, Duration::from_secs(30)));
+        assert!(due(&mut last, Duration::ZERO));
+    }
+
+    /// Discord coming back is found within the retry cap, not after the old
+    /// flat 5 s / 15 s.
+    #[tokio::test]
+    async fn a_returning_discord_is_found_within_the_cap() {
+        let p = prefix("back");
+        let l = link(20, 60, 5000);
+        let (_tx, mut st_rx) = start(l, &p);
+        wait_for(|| l.error().contains("pipe not found")).await;
+        tokio::time::sleep(ms(300)).await; // several tries fail meanwhile
+        let srv = server(&p, true);
+        let t = Instant::now();
+        let _io = tokio::time::timeout(Duration::from_secs(2), ready(srv)).await.expect("found again");
+        assert_eq!(st_rx.recv().await, Some(true));
+        assert!(t.elapsed() < ms(400), "took {:?} with a 60 ms cap", t.elapsed());
+        assert_eq!(l.error(), "");
+    }
+
+    /// A Discord that hangs up right after every handshake is not redialled
+    /// in a tight loop: the delay keeps growing until a connection lasts.
+    #[tokio::test]
+    async fn a_discord_that_hangs_up_at_once_is_redialled_ever_more_slowly() {
+        let p = prefix("flap");
+        let l = link_with(Retry { first: ms(40), cap_missing: ms(2000), cap_other: ms(2000), stable: Duration::from_secs(60) }, 5000);
+        let mut srv = server(&p, true);
+        let (_tx, _st) = start(l, &p);
+        let mut gaps = vec![];
+        let mut hung_up: Option<Instant> = None;
+        for _ in 0..6 {
+            let (rd, wr) = ready(srv).await;
+            if let Some(t) = hung_up {
+                gaps.push(t.elapsed());
+            }
+            let next = server(&p, false); // there before the client comes back
+            hung_up = Some(Instant::now());
+            drop(rd);
+            drop(wr);
+            srv = next;
+        }
+        assert!(gaps[0] < ms(400), "the first redial is quick: {gaps:?}");
+        assert!(gaps[4] > gaps[0] * 4, "and they get slower: {gaps:?}");
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_lasted_starts_the_delays_over() {
+        let p = prefix("stable");
+        let l = link_with(Retry { first: ms(40), cap_missing: ms(1000), cap_other: ms(1000), stable: ms(150) }, 5000);
+        let (_tx, _st) = start(l, &p);
+        // No Discord for a while: the delay has grown to hundreds of ms.
+        tokio::time::sleep(ms(700)).await;
+        let srv = server(&p, true);
+        let (rd, wr) = tokio::time::timeout(Duration::from_secs(3), ready(srv)).await.expect("connected");
+        tokio::time::sleep(ms(300)).await; // longer than `stable`
+        let next = server(&p, false);
+        let t = Instant::now();
+        drop(rd);
+        drop(wr);
+        let _io = tokio::time::timeout(Duration::from_secs(3), ready(next)).await.expect("back");
+        assert!(t.elapsed() < ms(300), "redialled after {:?}, not the grown delay", t.elapsed());
     }
 
     #[tokio::test]
