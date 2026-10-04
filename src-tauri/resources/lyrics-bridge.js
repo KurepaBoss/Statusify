@@ -25,10 +25,15 @@
     // copy injected into Spotify byte-for-byte, so any edit (this bump
     // included) makes it offer `spicetify apply`. 2.1: word/syllable timing,
     // queue + next-track lyric prefetch, player state, volume/skip-to, beats.
-    const BRIDGE_VERSION = "2.1.0";
+    // 2.2: track changes, pause and resume are reported the moment Spotify
+    // announces them (not on the next 500 ms poll), a lyric request that hangs
+    // is abandoned after 5-6 s, and the reconnect after a dropped socket backs
+    // off from 250 ms instead of waiting a flat 3 s.
+    const BRIDGE_VERSION = "2.2.0";
 
     let ws             = null;
     let reconnectTimer = null;
+    let reconnectAttempt = 0;
     let lastTrackUri   = "";   // tracks what we last sent a track_change for
     // Remembers why the last Spicy attempt failed, so the fallback can say so
     // instead of silently downgrading.
@@ -44,6 +49,7 @@
         ws.onopen = async () => {
             console.log("[LyricsBridge] Connected.");
             clearTimeout(reconnectTimer);
+            reconnectAttempt = 0;
             lastTrackUri = "";
             send({ type: "hello", version: BRIDGE_VERSION });
             sendPlayerState(true);
@@ -156,7 +162,8 @@
 
         ws.onclose = () => {
             ws = null;
-            reconnectTimer = setTimeout(connect, 3000);
+            reconnectAttempt++;
+            reconnectTimer = setTimeout(connect, Math.min(3000, 250 * 2 ** (reconnectAttempt - 1)));
         };
 
         ws.onerror = () => {
@@ -389,7 +396,14 @@
         return { mode: "synced", synced, plain: [] };
     }
 
-    async function fetchSpicyLyrics(trackUri, quiet = false) {
+    // A lyric request that has not answered by then is abandoned. The color-lyrics
+    // call used to hang ~30 s and the retry doubled it (a 'none' verdict ~66 s in).
+    const SPICY_TIMEOUT_MS  = 6000;
+    const COSMOS_TIMEOUT_MS = 5000;
+
+    // `pass` is filled in for the caller: timedOut when a request hung,
+    // noToken when Spicy could not even be asked.
+    async function fetchSpicyLyrics(trackUri, quiet = false, pass = {}) {
         // quiet: a background prefetch — no log lines, and it must not
         // overwrite lastSpicyError, which belongs to the playing track.
         const note = (m) => { if (!quiet) lastSpicyError = m; };
@@ -398,6 +412,7 @@
         const token   = getSpotifyToken();
         note("");
         if (!token) {
+            pass.noToken = true;
             note("no Spotify auth token yet");
             console.warn("[LyricsBridge] No Spotify token.");
             dbg("Spicy skipped — no Spotify auth token yet");
@@ -405,6 +420,7 @@
         }
         try {
             const resp = await fetch("https://api.spicylyrics.org/query", {
+                signal:  AbortSignal.timeout(SPICY_TIMEOUT_MS),
                 method:  "POST",
                 headers: {
                     "Content-Type":        "application/json",
@@ -480,6 +496,7 @@
             }
             return result;
         } catch(e) {
+            if (e?.name === "TimeoutError") pass.timedOut = true;
             note(e.message || "network error");
             console.warn("[LyricsBridge] Spicy fetch failed:", e.message);
             dbg(`Spicy fetch error: ${e.message}`);
@@ -499,8 +516,16 @@
         const deadline = Date.now() + RESOLVER_WAIT_MS;
         let noted = false;
         for (;;) {
+            let timer;
             try {
-                return await Spicetify.CosmosAsync.get(url);
+                // One request that hangs is given up on; a quick "Resolver not
+                // found" still falls through to the polling below.
+                return await Promise.race([
+                    Spicetify.CosmosAsync.get(url),
+                    new Promise((_, rej) => {
+                        timer = setTimeout(() => rej(Object.assign(new Error("color-lyrics request timed out"), { timedOut: true })), COSMOS_TIMEOUT_MS);
+                    }),
+                ]);
             } catch (e) {
                 if (!/Resolver not found/i.test(e?.message || "") || Date.now() >= deadline) throw e;
                 if (!noted) {
@@ -512,11 +537,13 @@
                 // A prefetch (quiet) is for a track that isn't playing yet;
                 // just give up rather than wait on a cold router.
                 if (quiet || Spicetify.Player.data?.item?.uri !== trackUri) return null;
+            } finally {
+                clearTimeout(timer);
             }
         }
     }
 
-    async function fetchSpotifyLyrics(trackUri, quiet = false) {
+    async function fetchSpotifyLyrics(trackUri, quiet = false, pass = {}) {
         const trackId = trackUri.split(":").pop();
         const dbg = (m) => { if (!quiet) send({ type: "lyrics_debug", message: m }); };
         try {
@@ -553,6 +580,7 @@
                 };
             }
         } catch(e) {
+            if (e?.timedOut) pass.timedOut = true;
             dbg(`Spotify lyrics error: ${e.message}`);
             return null;
         }
@@ -568,10 +596,10 @@
     const LYRIC_RETRY_MS  = 3000;
 
     // One pass over both lyric sources. Returns { lyrics, source } or null.
-    async function fetchLyricsOnce(trackUri, quiet = false) {
+    async function fetchLyricsOnce(trackUri, quiet = false, pass = {}) {
         // Try Spicy first; fall back to Spotify's own color-lyrics API if Spicy
         // returns nothing (song not in their catalogue, network error, etc.).
-        let lyrics = await fetchSpicyLyrics(trackUri, quiet);
+        let lyrics = await fetchSpicyLyrics(trackUri, quiet, pass);
         if (lyrics) return { lyrics, source: "Spicy" };
 
         // Never downgrade silently. Falling back to Spotify used to be
@@ -580,7 +608,7 @@
         if (!quiet)
             send({ type: "lyrics_debug",
                    message: `Spicy unavailable (${lastSpicyError || "unknown"}) — falling back to Spotify` });
-        lyrics = await fetchSpotifyLyrics(trackUri, quiet);
+        lyrics = await fetchSpotifyLyrics(trackUri, quiet, pass);
         return lyrics ? { lyrics, source: "Spotify (Spicy fallback)" } : null;
     }
 
@@ -615,6 +643,7 @@
             sendPlayerState(false);   // liked differs per track
 
             let found = null;
+            let attempts = 0;
             for (let attempt = 0; attempt < LYRIC_ATTEMPTS; attempt++) {
                 if (attempt > 0) {
                     console.log(`[LyricsBridge] No lyrics yet, retrying in ${LYRIC_RETRY_MS}ms...`);
@@ -627,13 +656,18 @@
                         return;
                     }
                 }
-                found = await fetchLyricsOnce(trackUri);
+                const pass = {};
+                attempts++;
+                found = await fetchLyricsOnce(trackUri, false, pass);
                 if (found) break;
+                // The retry is for an auth token that was not ready yet. A
+                // request that hung is not that, and would only hang again.
+                if (pass.timedOut && !pass.noToken) break;
             }
 
             if (!found) {
                 send({ type: "lyrics_debug",
-                       message: `No lyrics found for "${title}" after ${LYRIC_ATTEMPTS} attempts` });
+                       message: `No lyrics found for "${title}" after ${attempts} attempt${attempts === 1 ? "" : "s"}` });
             }
 
             // Store lyrics in memory for the skip_instrumental feature.
@@ -849,6 +883,11 @@
     }
 
     setInterval(tick, 500);
-    Spicetify.Player.addEventListener("songchange", () => { lastTrackUri = ""; currentLyrics = null; });
+    Spicetify.Player.addEventListener("songchange", () => { lastTrackUri = ""; currentLyrics = null; tick(); });
+    // Both events come straight from Spotify's own player update (not a
+    // timer), so a track change, pause or resume is reported at once instead
+    // of on the next tick. The 500 ms interval stays as the heartbeat and
+    // notices seeks, which have no event.
+    Spicetify.Player.addEventListener("onplaypause", () => { tick(); });
     connect();
 })();
