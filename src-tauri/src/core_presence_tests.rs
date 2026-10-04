@@ -76,15 +76,15 @@ impl Sim {
 }
 
 #[test]
-fn waits_out_the_settle_time_then_publishes_the_sung_line() {
+fn known_lyrics_wait_a_short_settle_then_publish_the_sung_line() {
     let mut sim = Sim::new();
     let mut s = snap("spotify:track:a", sheet(&[(0, "first"), (6000, "second"), (12000, "third")]), 30000);
     let set = Settings::default();
-    sim.play(0, &mut s, 0, 1400, &set);
-    assert!(sim.sends.is_empty(), "nothing inside the 1.5 s settle time");
-    sim.play(1450, &mut s, 1450, 12000, &set);
+    sim.play(0, &mut s, 0, 350, &set);
+    assert!(sim.sends.is_empty(), "nothing inside the 0.4 s settle time");
+    sim.play(400, &mut s, 400, 12000, &set);
     let (t, a) = &sim.sends[0];
-    assert!(*t >= 1500 && *t <= 1550);
+    assert!(*t >= 400 && *t <= 450, "sent at {t}");
     let a = a.as_ref().unwrap();
     assert_eq!(a["state"], "first");
     assert_eq!(a["type"], 2);
@@ -233,4 +233,192 @@ fn no_lyrics_publishes_title_only() {
     let mut s = snap("spotify:track:a", Lyrics::none(), 30000);
     sim.play(0, &mut s, 0, 3000, &Settings::default());
     assert_eq!(sim.states(), vec!["— "]);
+}
+
+#[test]
+fn unknown_lyrics_keep_the_long_settle_and_publish_as_soon_as_they_arrive() {
+    // Nothing known: the first frame still waits 1.5 s, and is title-only
+    // when no lyrics ever come.
+    let mut sim = Sim::new();
+    let mut s = snap("spotify:track:a", Lyrics::none(), 30000);
+    let set = Settings::default();
+    sim.play(0, &mut s, 0, 1400, &set);
+    assert!(sim.sends.is_empty());
+    sim.play(1450, &mut s, 1450, 500, &set);
+    assert!(sim.sends[0].0 >= 1500 && sim.sends[0].0 <= 1550);
+    assert_eq!(sim.states(), vec!["— "]);
+
+    // The bridge answers inside the settle window: the first frame carries
+    // the sung line, as soon as the lyrics are there, not at 1.5 s.
+    let mut sim = Sim::new();
+    let mut s = snap("spotify:track:a", Lyrics::none(), 30000);
+    let t = sim.play(0, &mut s, 0, 750, &set);
+    assert!(sim.sends.is_empty());
+    s.lyrics = sheet(&[(0, "first"), (6000, "second")]);
+    sim.play(t, &mut s, t as i64, 1500, &set);
+    assert_eq!(sim.states(), vec!["first"]);
+    assert!(sim.sends[0].0 >= 800 && sim.sends[0].0 <= 900, "sent at {}", sim.sends[0].0);
+}
+
+/// `ms` of `uri` playing from its start, ticked every 50 ms from `t`.
+fn track_for(sim: &mut Sim, t: &mut u64, uri: &str, ms: u64, l: &Lyrics, set: &Settings) {
+    let mut s = snap(uri, l.clone(), 30000);
+    let mut p = 0;
+    while p < ms {
+        sim.at(*t, &mut s, p as i64, set);
+        *t += 50;
+        p += 50;
+    }
+}
+
+#[test]
+fn a_skip_burst_publishes_only_the_track_it_ends_on() {
+    let l = sheet(&[(0, "first"), (6000, "second")]);
+    let set = Settings::default();
+    // Skipping faster than the settle: nothing goes out until the last
+    // track has played 1.5 s (the burst keeps the long wait even though
+    // every track's lyrics are known).
+    let mut sim = Sim::new();
+    let mut t = 0;
+    for k in 0..4 {
+        track_for(&mut sim, &mut t, &format!("spotify:track:{k}"), 350, &l, &set);
+    }
+    let mut last = snap("spotify:track:4", l.clone(), 30000);
+    sim.play(t, &mut last, 0, 3000, &set);
+    assert_eq!(sim.sends.len(), 1);
+    let (at, a) = &sim.sends[0];
+    assert!(*at >= 1400 + 1500 - 50 && *at <= 1400 + 1500 + 100, "sent at {at}");
+    assert_eq!(a.as_ref().unwrap()["details_url"], "https://open.spotify.com/track/4");
+}
+
+#[test]
+fn a_burst_costs_at_most_the_first_frame_and_a_quiet_change_is_fast_again() {
+    let l = sheet(&[(0, "first"), (6000, "second")]);
+    let set = Settings::default();
+    let mut sim = Sim::new();
+    let mut t = 0;
+    // The first change after a quiet spell has the short wait, so a skip
+    // 0.7 s later has already cost one frame; the rest of the burst has not.
+    for k in 0..3 {
+        track_for(&mut sim, &mut t, &format!("spotify:track:{k}"), 700, &l, &set);
+    }
+    let mut last = snap("spotify:track:3", l.clone(), 30000);
+    let t_end = sim.play(t, &mut last, 0, 2500, &set);
+    assert_eq!(sim.sends.len(), 2, "{:?}", sim.sends.iter().map(|s| s.0).collect::<Vec<_>>());
+    assert!(sim.sends[0].0 <= 450);
+    assert!(sim.sends[1].0 >= 3 * 700 + 1450);
+    // Long after the burst a new track is quick again.
+    let t5 = t_end + 5000;
+    let mut t = t5;
+    track_for(&mut sim, &mut t, "spotify:track:late", 1000, &l, &set);
+    let (at, _) = sim.sends.last().unwrap();
+    assert!(*at >= t5 + 400 && *at <= t5 + 450, "sent at {at}, track began {t5}");
+}
+
+#[test]
+fn resuming_the_same_track_waits_only_the_debounce() {
+    let mut sim = Sim::new();
+    let mut s = snap("spotify:track:a", sheet(&[(0, "first"), (6000, "second")]), 30000);
+    let set = Settings::default();
+    let t = sim.play(0, &mut s, 0, 2000, &set);
+    assert_eq!(sim.sends.len(), 1);
+    s.is_playing = false;
+    sim.at(t, &mut s, 2000, &set);
+    assert!(sim.sends[1].1.is_none(), "paused: cleared");
+    // paused for a while, then the same track plays on
+    s.is_playing = true;
+    let resumed = t + 10_000;
+    sim.play(resumed, &mut s, 2000, 1000, &set);
+    let (at, a) = &sim.sends[2];
+    assert!(*at >= resumed + 300 && *at <= resumed + 350, "sent at {at}, resumed at {resumed}");
+    assert_eq!(a.as_ref().unwrap()["state"], "first");
+    assert_eq!(sim.sends.len(), 3);
+}
+
+#[test]
+fn another_track_after_a_pause_is_a_new_track_not_a_resume() {
+    let mut sim = Sim::new();
+    let mut a = snap("spotify:track:a", Lyrics::none(), 30000);
+    let set = Settings::default();
+    let t = sim.play(0, &mut a, 0, 2000, &set);
+    a.is_playing = false;
+    sim.at(t, &mut a, 2000, &set);
+    // a different track starts from the pause, lyrics not known yet
+    let mut b = snap("spotify:track:b", Lyrics::none(), 30000);
+    let began = t + 10_000;
+    sim.play(began, &mut b, 0, 2500, &set);
+    let (at, _) = sim.sends.last().unwrap();
+    assert!(*at >= began + 1500, "sent at {at}, track began {began}");
+}
+
+#[test]
+fn pause_spam_publishes_nothing_until_playback_settles() {
+    let mut sim = Sim::new();
+    let mut s = snap("spotify:track:a", sheet(&[(0, "first")]), 30000);
+    let set = Settings::default();
+    let mut t = sim.play(0, &mut s, 0, 2000, &set);
+    assert_eq!(sim.sends.len(), 1);
+    // play/pause toggled every 200 ms, five times
+    for _ in 0..5 {
+        s.is_playing = false;
+        for _ in 0..4 {
+            sim.at(t, &mut s, 2000, &set);
+            t += 50;
+        }
+        s.is_playing = true;
+        for _ in 0..4 {
+            sim.at(t, &mut s, 2000, &set);
+            t += 50;
+        }
+    }
+    assert_eq!(sim.sends.len(), 2, "one clear, nothing else: {:?}", sim.sends.iter().map(|s| s.1.is_some()).collect::<Vec<_>>());
+    sim.play(t, &mut s, 2000, 600, &set);
+    assert_eq!(sim.sends.len(), 3);
+}
+
+fn lines_every_5s() -> Lyrics {
+    let words: Vec<String> = (0..12).map(|i| format!("l{i}")).collect();
+    let v: Vec<(i64, &str)> = words.iter().enumerate().map(|(i, w)| (i as i64 * 5000, w.as_str())).collect();
+    sheet(&v)
+}
+
+#[test]
+fn a_single_seek_is_published_at_once() {
+    let mut sim = Sim::new();
+    let mut s = snap("spotify:track:a", lines_every_5s(), 60000);
+    let set = Settings::default();
+    let t = sim.play(0, &mut s, 0, 2000, &set);
+    sim.at(t, &mut s, 31_000, &set);
+    let (at, a) = sim.sends.last().unwrap();
+    assert_eq!(*at, t);
+    assert_eq!(a.as_ref().unwrap()["state"], "l6");
+}
+
+#[test]
+fn a_seek_burst_publishes_only_where_it_ends() {
+    let mut sim = Sim::new();
+    let mut s = snap("spotify:track:a", lines_every_5s(), 60000);
+    let set = Settings::default();
+    let t = sim.play(0, &mut s, 0, 2000, &set);
+    // dragging the bar: five seeks 300 ms apart
+    let mut t = t;
+    let mut last = 0;
+    for pos in [31_000, 51_000, 11_000, 36_000, 21_000] {
+        sim.at(t, &mut s, pos, &set);
+        last = t;
+        t += 300;
+    }
+    // ... and the bar is let go: playback goes on from there
+    t = last + 50;
+    let mut p = 21_050;
+    while t < last + 1500 {
+        sim.at(t, &mut s, p, &set);
+        t += 50;
+        p += 50;
+    }
+    assert_eq!(sim.states(), vec!["l0", "l6", "l4"], "the first seek goes out at once, the rest only the destination");
+    let (at, _) = sim.sends.last().unwrap();
+    assert!(*at >= last + 500 && *at <= last + 600, "destination sent at {at}, last seek at {last}");
+    assert_eq!(sim.dropped, 0, "lines jumped over are not dropped lines");
+    assert_eq!(sim.rl, 0, "and the hold is not a rate-limit wait");
 }

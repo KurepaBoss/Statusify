@@ -5,9 +5,10 @@
 //! 5-per-20-s SET_ACTIVITY limit, then acts on the plan's first update. The
 //! loop also handles: the RPC switch (clear once on the falling edge), pause
 //! (clear, or a "⏸ Paused" presence with show_paused_rpc), the blacklist, the
-//! 1.5 s settle time after a track change (rapid skips would burn the budget),
-//! the per-track lyric offset, instrumental markers, and counting lines the
-//! song moved past before their words reached Discord.
+//! settle time after a track change (rapid skips would burn the budget), the
+//! hold after a burst of seeks, the per-track lyric offset, instrumental
+//! markers, and counting lines the song moved past before their words reached
+//! Discord.
 //!
 //! `Presence::tick` is pure (snapshot + clock + settings in, effects out) so
 //! it is tested headless; `run_loop` drives it against the engine.
@@ -28,8 +29,21 @@ pub const MAX_STATE: usize = 128;
 /// A seek, a stall or a big offset change moves playback off the clock a
 /// plan was made on; past this much drift, plan again from here.
 pub const PLAN_DRIFT_MS: f64 = 1500.0;
-/// After a track change nothing is sent for this long (rapid skips).
+/// After a track change nothing is sent for this long (rapid skips) when its
+/// lyrics are not known yet, so the bridge's answer usually lands before the
+/// first frame, and during a skip burst.
 pub const CALIBRATION: Duration = Duration::from_millis(1500);
+/// The same wait once the lyrics are known (pinned, prefetched, cached, or
+/// they have just arrived) and the change is the first in a while.
+pub const KNOWN_SETTLE: Duration = Duration::from_millis(400);
+/// Resuming the track that was paused only debounces pause/play spam.
+pub const RESUME_SETTLE: Duration = Duration::from_millis(300);
+/// A track change this soon after the previous one is part of a skip burst.
+pub const BURST_WINDOW: Duration = Duration::from_millis(3000);
+/// A seek this soon after the previous one is a drag, not a click: the
+/// destination is published once the position has been still for SEEK_SETTLE.
+pub const SEEK_BURST: Duration = Duration::from_millis(2000);
+pub const SEEK_SETTLE: Duration = Duration::from_millis(500);
 pub const DEFAULT_INSTRUMENTAL: &str = "🎵 ─ ─ ─ ─ ─ ─ ─ ─ ─ 🎵";
 pub const LISTEN_LABEL: &str = "Listen on Spotify";
 pub const PAUSED_TEXT: &str = "\u{23f8} Paused";
@@ -193,12 +207,41 @@ pub enum Effect {
 
 type UnitKey = Option<(Kind, i64)>;
 
+/// Why the first frame of a track (or of a resume) waits.
+#[derive(Clone, Copy, Debug)]
+enum Settle {
+    /// A new track: KNOWN_SETTLE once its lyrics are known, else CALIBRATION.
+    Track,
+    /// A new track soon after another one: skipping, so CALIBRATION.
+    Burst,
+    /// The paused track plays on.
+    Resume,
+}
+
+impl Settle {
+    fn wait(self, lyrics_known: bool) -> Duration {
+        match self {
+            Settle::Track if lyrics_known => KNOWN_SETTLE,
+            Settle::Track | Settle::Burst => CALIBRATION,
+            Settle::Resume => RESUME_SETTLE,
+        }
+    }
+}
+
 pub struct Presence {
     fresh: bool,
     rl: VecDeque<Instant>,
     last_uri: Option<String>,
     was_playing: bool,
-    calibration_until: Option<Instant>,
+    /// When the current track (or resume) began, and why it waits.
+    settle: Option<(Instant, Settle)>,
+    /// When the last new track began (not a resume): burst detection.
+    last_change: Option<Instant>,
+    /// The track that was playing when playback paused.
+    resume_uri: Option<String>,
+    last_jump: Option<Instant>,
+    /// Nothing is published before this: a seek burst is still going on.
+    hold_until: Option<Instant>,
     rpc_was_enabled: bool,
     /// What Discord shows for this track as texts (plan::TITLE / plan::GAP
     /// stand for the title-only presence and the instrumental marker). Not
@@ -225,7 +268,11 @@ impl Presence {
             rl: VecDeque::new(),
             last_uri: None,
             was_playing: false,
-            calibration_until: None,
+            settle: None,
+            last_change: None,
+            resume_uri: None,
+            last_jump: None,
+            hold_until: None,
             rpc_was_enabled: enabled,
             shown: vec![],
             upcoming: None,
@@ -244,10 +291,22 @@ impl Presence {
     fn reset_track_state(&mut self) {
         self.last_uri = None;
         self.was_playing = false;
-        self.calibration_until = None;
+        self.settle = None;
+        self.last_jump = None;
+        self.hold_until = None;
         self.shown.clear();
         self.upcoming = None;
         self.cur_key = None;
+    }
+
+    /// Nothing is sent before this: the settle after a track change or a
+    /// resume, or the hold during a burst of seeks.
+    fn gate_until(&self, lyrics_known: bool) -> Option<Instant> {
+        let settle = self.settle.map(|(since, kind)| since + kind.wait(lyrics_known));
+        match (settle, self.hold_until) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     fn prune(&mut self, now: Instant) {
@@ -321,6 +380,7 @@ impl Presence {
         }
         if !snap.is_playing {
             if self.was_playing {
+                self.resume_uri = self.last_uri.clone();
                 let mut cleared = false;
                 if s.show_paused && snap.track.is_some() {
                     if self.avail(now) {
@@ -354,18 +414,34 @@ impl Presence {
             return out;
         }
         if self.last_uri.as_deref() != Some(track.uri.as_str()) {
+            let resumed = self.resume_uri.take().is_some_and(|u| u == track.uri);
             self.last_uri = Some(track.uri.clone());
             self.shown.clear();
             self.upcoming = None;
             self.cur_key = None;
-            self.calibration_until = Some(now + CALIBRATION);
+            self.last_jump = None;
+            self.hold_until = None;
+            let kind = if resumed {
+                Settle::Resume
+            } else {
+                let burst = self.last_change.is_some_and(|t| now.saturating_duration_since(t) < BURST_WINDOW);
+                self.last_change = Some(now);
+                if burst { Settle::Burst } else { Settle::Track }
+            };
+            self.settle = Some((now, kind));
         }
+        let known = !snap.lyrics.is_none();
 
         let pos = (snap.estimated_position(now_ms) + s.offset_ms) as f64;
         let since_anchor = now.saturating_duration_since(self.plan_anchor.1).as_secs_f64() * 1000.0;
         let jumped = self.plan_src.is_some() && (pos - self.plan_anchor.0 - since_anchor).abs() > PLAN_DRIFT_MS;
         if jumped {
             self.cur_key = None; // a seek: lines jumped over were not dropped
+            let drag = self.last_jump.is_some_and(|t| now.saturating_duration_since(t) < SEEK_BURST);
+            self.last_jump = Some(now);
+            if drag {
+                self.hold_until = Some(now + SEEK_SETTLE);
+            }
         }
         let src_changed = self
             .plan_src
@@ -381,7 +457,7 @@ impl Presence {
                 self.plan_src = Some((snap.lyrics.clone(), snap.duration_ms));
             }
             let hist: Vec<f64> = self.rl.iter().map(|x| pos - now.duration_since(*x).as_secs_f64() * 1000.0).collect();
-            let wait = self.calibration_until.map_or(0.0, |c| c.saturating_duration_since(now).as_secs_f64() * 1000.0);
+            let wait = self.gate_until(known).map_or(0.0, |c| c.saturating_duration_since(now).as_secs_f64() * 1000.0);
             let lim = Limits { calls: RATE_CALLS, window_ms: RATE_WINDOW.as_secs_f64() * 1000.0, max_state: MAX_STATE, ..Default::default() };
             self.upcoming = Some(plan::plan(&self.units, pos, &hist, &self.shown, pos + wait, lim));
             self.plan_anchor = (pos, now);
@@ -412,7 +488,7 @@ impl Presence {
         }
         if pos < ev.t {
             // The sung line is not on Discord and the budget says wait.
-            let calibrated = self.calibration_until.is_none_or(|c| now >= c);
+            let calibrated = self.gate_until(known).is_none_or(|c| now >= c);
             let noted = Some((self.last_uri.clone(), key));
             if self.cur_line.is_some() && !self.cur_seen && calibrated && self.rl_noted != noted {
                 self.rl_noted = noted;
