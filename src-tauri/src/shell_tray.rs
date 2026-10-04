@@ -230,8 +230,9 @@ impl Tray {
                     }
                 }
             });
-        if let Some(icon) = app.default_window_icon() {
-            b = b.icon(icon.clone());
+        // The logo cut at the tray's own size; the window icon (32 px) is the fallback.
+        if let Some(icon) = crate::app_icon::tray_icon().or_else(|| app.default_window_icon().cloned()) {
+            b = b.icon(icon);
         }
         let icon = b.build(app)?;
         Ok(Handles { icon, mini, topmost, overlay, lock, last: Mutex::new((false, false, ctx.config.get_bool("preferences", "always_on_top", false), true)), last_tip: Mutex::new(String::new()) })

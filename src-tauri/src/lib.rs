@@ -1,3 +1,4 @@
+mod app_icon;
 mod bridge;
 mod config;
 mod db;
@@ -129,9 +130,15 @@ pub fn run() {
     ));
     log(&format!("Statusify-rs {} · data in {}", env!("CARGO_PKG_VERSION"), dir.display()));
 
+    // The taskbar identity must be set before the first window exists.
+    let context = tauri::generate_context!();
+    app_icon::set_app_user_model_id(&context.config().identifier);
+
     tauri::Builder::default()
         // Shell plugins (single-instance first: a second launch only focuses the first).
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| shell_window::show_main(app)))
+        .plugin(app_icon::plugin())
+        .on_window_event(app_icon::on_window_event)
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .plugin(tauri_plugin_dialog::init())
@@ -195,6 +202,6 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![snapshot, recent_plays, player, seek, call])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
