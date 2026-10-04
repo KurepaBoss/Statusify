@@ -878,13 +878,17 @@ fn bench_a_track_change() {
     mt().block_on(async {
         let load = LoadProbe::start();
         let mut out = serde_json::Map::new();
-        let cases: [(&str, LyricsPlan, bool); 4] = [
-            ("prefetched_bridge_answers_600ms", LyricsPlan::PrefetchedThen(600), true),
-            ("fresh_bridge_answers_800ms", LyricsPlan::After(800), true),
-            ("fresh_bridge_answers_2500ms", LyricsPlan::After(2500), true),
-            ("no_lyrics_anywhere", LyricsPlan::After(100), false),
+        // The settle gate depends on whether another change happened in the last
+        // 3 s (a skip burst), so the change comes either ~4 s after the previous
+        // one (quiet: the usual way a track ends or is skipped) or ~2 s after it.
+        let cases: [(&str, LyricsPlan, bool, u64); 5] = [
+            ("prefetched_bridge_answers_600ms", LyricsPlan::PrefetchedThen(600), true, 3500),
+            ("fresh_bridge_answers_800ms", LyricsPlan::After(800), true, 3500),
+            ("fresh_bridge_answers_2500ms", LyricsPlan::After(2500), true, 3500),
+            ("no_lyrics_anywhere", LyricsPlan::After(100), false, 3500),
+            ("prefetched_bridge_answers_600ms_2s_after_previous_change", LyricsPlan::PrefetchedThen(600), true, 1500),
         ];
-        for (name, plan, has_lyrics) in cases {
+        for (name, plan, has_lyrics, quiet_ms) in cases {
             let mk = || has_lyrics.then(|| Sheet::evenly(20, 6000, 0));
             let (mut ws_hop, mut total, mut first_with_lyric, mut first_is_title) = (vec![], vec![], vec![], 0);
             let mut frames_in_4s = vec![];
@@ -892,7 +896,7 @@ fn bench_a_track_change() {
             for rep in 0..reps {
                 let p = Pipeline::start(track_with(1, mk()), LyricsPlan::After(100), Opts::default()).await;
                 p.wait_first_frame().await;
-                sleep(1500).await;
+                sleep(quiet_ms).await;
                 let next = track_with(2 + rep, mk());
                 if matches!(plan, LyricsPlan::PrefetchedThen(_)) {
                     p.prefetch(&next);
@@ -920,7 +924,7 @@ fn bench_a_track_change() {
                        "reps": reps, "frames_sent_in_first_4s": stats(&frames_in_4s), "first_frame_was_title_only": first_is_title, "first_frame_carried_a_lyric_line_ms": stats(&first_with_lyric)}),
             );
         }
-        out.insert("settle_constant_ms".into(), json!(presence::CALIBRATION.as_millis()));
+        out.insert("settle_ms".into(), json!({"unknown_lyrics_or_burst": presence::CALIBRATION.as_millis(), "known_lyrics": presence::KNOWN_SETTLE.as_millis()}));
         out.insert("machine_cpu_pct_during".into(), json!(load.pct()));
         report("a_track_change_downstream", Value::Object(out));
     });

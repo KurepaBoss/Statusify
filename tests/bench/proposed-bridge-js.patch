@@ -1,3 +1,4 @@
+# SUPERSEDED: this prototype is implemented (and extended) in src-tauri/resources/lyrics-bridge.js 2.2; it no longer applies.
 # PROTOTYPE, not applied anywhere. Four bridge-JS changes measured with tests/bench
 # (BENCH_BRIDGE_JS=<patched file> tests/bench/run.sh js_e2e js_lyrics_hang):
 #  1. songchange / onplaypause call tick() at once instead of waiting for the 500 ms poll
