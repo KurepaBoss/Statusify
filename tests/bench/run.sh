@@ -47,4 +47,6 @@ for b in "${benches[@]}"; do
   echo "== bench_$b" >&2
   cargo test --release --lib "bench_$b" -- --ignored --nocapture --test-threads=1 2>>"${out%.jsonl}.stderr.log" | grep '^BENCH_RESULT ' || true
 done
+# each pipeline keeps a SQLite file open in a temp dir until the process exits
+rm -rf "${TEMP:-/tmp}"/statusify-bench-* 2>/dev/null || true
 echo "results: $out"
