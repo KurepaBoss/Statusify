@@ -1,0 +1,148 @@
+name: Release
+
+# Cut a release by pushing a tag that matches the app's version:
+#   git tag v3.0.0 && git push origin v3.0.0
+#
+# The run builds the NSIS installer, then creates the GitHub Release with
+#   Statusify-Setup.exe                 (the stable name the README links to)
+#   Statusify_<version>_x64-setup.exe   (the same file, versioned)
+#   SHA256SUMS.txt
+# and uses the README's "What's New in v<version>" section as the release
+# body. It fails, before building anything slow, if that section is missing,
+# empty, unfinished or has relative links, or if the tag and the version in
+# the repository disagree.
+#
+# Run by hand from the Actions tab, it does everything except publish: the
+# installer and notes are left as a workflow artifact, for checking that a
+# change still packages before committing to a tag.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the release and upload its assets
+
+# Never cancel a release halfway; a re-run of the same tag queues behind it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # The pushed tag, or (manual runs) the version the repository says it is.
+      - name: Work out the tag
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $tag = $env:GITHUB_REF_NAME
+          } else {
+            $tag = 'v' + (Get-Content package.json -Raw | ConvertFrom-Json).version
+          }
+          "TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Release tag: $tag"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Check that the versions agree
+        run: node scripts/check-version-sync.mjs --strict
+
+      - name: Check that the tag matches the version
+        run: |
+          $ver = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($env:TAG -ne "v$ver") {
+            throw "Tag $($env:TAG) does not match the app version v$ver. Bump the version, or move the tag."
+          }
+
+      # The release body. Fails loudly: no section, an empty one, a leftover
+      # {{PLACEHOLDER}} or a relative link all stop the release here.
+      - name: Take the release notes from the README
+        run: node scripts/extract_release_notes.mjs "$env:TAG" --out release-notes.md
+
+      # A broken installer is found by users downloading it, so gate the
+      # build on the same checks the Tests workflow runs.
+      - name: Build the frontend
+        run: npm run build
+
+      - name: Frontend and release-script tests
+        run: node --test
+
+      - name: Backend tests
+        working-directory: src-tauri
+        run: cargo test --release
+
+      # bundle.targets in tauri.conf.json is just "nsis". Tauri names the
+      # installer <productName>_<version>_<arch>-setup.exe.
+      - name: Build the installer
+        run: npx tauri build
+
+      - name: Name the assets and write the checksums
+        run: |
+          $ver = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $dir = 'src-tauri/target/release/bundle/nsis'
+          $built = @(Get-ChildItem -Path $dir -Filter '*-setup.exe')
+          if ($built.Count -ne 1) {
+            throw "Expected exactly one installer in $dir, found $($built.Count): $($built.Name -join ', ')"
+          }
+          $versioned = "Statusify_${ver}_x64-setup.exe"
+          if ($built[0].Name -ne $versioned) {
+            throw "The bundler produced $($built[0].Name), expected $versioned"
+          }
+          if ($built[0].Length -lt 1MB) { throw "The installer is only $($built[0].Length) bytes" }
+
+          New-Item -ItemType Directory -Force release-assets | Out-Null
+          Copy-Item $built[0].FullName "release-assets/$versioned"
+          Copy-Item $built[0].FullName 'release-assets/Statusify-Setup.exe'
+
+          # "<hash>  <name>" per line with LF endings, so `sha256sum -c` accepts it too.
+          $lines = foreach ($name in 'Statusify-Setup.exe', $versioned) {
+            $hash = (Get-FileHash "release-assets/$name" -Algorithm SHA256).Hash.ToLower()
+            "$hash  $name"
+          }
+          [IO.File]::WriteAllText("$PWD/release-assets/SHA256SUMS.txt", ($lines -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+          Get-Content release-assets/SHA256SUMS.txt
+
+      - name: Keep the assets with the run
+        uses: actions/upload-artifact@v4
+        with:
+          name: Statusify-release
+          path: |
+            release-assets/*
+            release-notes.md
+          if-no-files-found: error
+
+      # Only for a pushed tag. If a release for the tag already exists (a
+      # re-run) it is updated rather than duplicated.
+      - name: Publish the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Statusify ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: |
+            release-assets/Statusify-Setup.exe
+            release-assets/Statusify_*_x64-setup.exe
+            release-assets/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false

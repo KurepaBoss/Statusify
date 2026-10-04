@@ -1,0 +1,58 @@
+name: Tests
+
+# Run everything on every push and pull request, not only when a release is
+# tagged, so a regression shows up on the commit that caused it.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch makes the older run pointless.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Windows: the backend uses named pipes, the registry and global hotkeys,
+    # and the app only ever ships for Windows.
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # Cheap, so first: the version in Cargo.toml, tauri.conf.json, package.json,
+      # both lockfiles and the README must all say the same thing.
+      - name: Check that the versions agree
+        run: node scripts/check-version-sync.mjs --strict
+
+      # Type-checks the frontend and bundles it into dist/, which the Rust
+      # crate embeds at compile time, so this has to run before cargo.
+      - name: Build the frontend
+        run: npm run build
+
+      # Node 24 runs the .ts modules the tests import directly.
+      - name: Frontend and release-script tests
+        run: node --test
+
+      - name: Backend tests
+        working-directory: src-tauri
+        run: cargo test --release

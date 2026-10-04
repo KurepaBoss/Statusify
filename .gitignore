@@ -2,4 +2,27 @@ node_modules/
 dist/
 src-tauri/target/
 src-tauri/gen/
+
+# Personal data the app writes into its data folder. A development run with
+# STATUSIFY_DATA_DIR pointed inside the repo must never commit any of it:
+# .env holds the Discord Application ID, history.db the listening history.
+.env
+.env.*
+!.env.example
+statusify.cfg
+statusify.cfg.tmp
+history.db
+history.db-wal
+history.db-shm
+history.json*
+translations.db*
+np_timing.db*
+.artcache/
+exports/
+
+# Editors, OS
+.idea/
+.DS_Store
+Thumbs.db
+
 *.log
