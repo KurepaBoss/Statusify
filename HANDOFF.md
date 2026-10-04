@@ -29,6 +29,13 @@ TypeScript + CSS frontend (GPU-composited in WebView2). Started 2026-10-02.
 - Isolated test run while the old app is live: data dir = a *copy* of history.db
   (use sqlite backup, WAL is open), `STATUSIFY_PORT=8799`, no DISCORD_APP_ID, and
   drive it with a fake bridge (websockets client sending track_change/position/lyrics).
+- A test exe with the SAME identifier hands off to the live app (single-instance plugin: it would focus/unhide the live
+  window and exit). Build test copies with `TAURI_CONFIG='{"identifier":"com.statusify.test"}'` (the mutex, webview data
+  folder and AppUserModelID all follow the identifier), and give them an empty `APPDATA` so the Spicetify folder is never touched.
+- Icon: `src-tauri/icons/icon.ico` is compiled into the exe (title bar, taskbar, tray, Explorer). `build.rs` watches
+  `icons/`, so swapping it re-embeds (before, the Tauri placeholder stayed baked in). `src/app_icon.rs` sets the small and
+  big icon of every window at its own DPI, the tray icon at the tray size, and the AppUserModelID (the tauri identifier,
+  which the NSIS shortcuts carry too).
 - The old app holds 8765; the new one shows "Port 8765 is in use" instead of fighting it.
   To go live: stop the old app (between songs), set STATUSIFY_DATA_DIR to
   `Desktop\Statusify-1.2.0`, start statusify-rs.exe. No bridge change needed.
