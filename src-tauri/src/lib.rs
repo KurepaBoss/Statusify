@@ -1,4 +1,6 @@
 mod bridge;
+#[cfg(test)]
+mod bench_bridge;
 mod config;
 mod db;
 mod discord;
