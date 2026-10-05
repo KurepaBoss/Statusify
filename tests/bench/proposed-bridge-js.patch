@@ -1,0 +1,48 @@
+# SUPERSEDED: this prototype is implemented (and extended) in src-tauri/resources/lyrics-bridge.js 2.2; it no longer applies.
+# PROTOTYPE, not applied anywhere. Four bridge-JS changes measured with tests/bench
+# (BENCH_BRIDGE_JS=<patched file> tests/bench/run.sh js_e2e js_lyrics_hang):
+#  1. songchange / onplaypause call tick() at once instead of waiting for the 500 ms poll
+#  2. color-lyrics (Cosmos) request abandoned after 5 s
+#  3. Spicy request abandoned after 6 s (AbortSignal.timeout)
+#  4. WebSocket reconnect backoff 250 ms .. 3 s instead of a flat 3 s
+# Any edit makes Statusify offer `spicetify apply` (it compares the file byte-for-byte),
+# so do not apply while the user is listening. Apply with: git apply --ignore-whitespace <this file>
+--- a/src-tauri/resources/lyrics-bridge.js
++++ b/src-tauri/resources/lyrics-bridge.js
+@@ -31,2 +31,3 @@
+     let reconnectTimer = null;
++    let reconnectAttempt = 0;
+     let lastTrackUri   = "";   // tracks what we last sent a track_change for
+@@ -46,2 +47,3 @@
+             clearTimeout(reconnectTimer);
++            reconnectAttempt = 0;
+             lastTrackUri = "";
+@@ -158,3 +160,4 @@
+             ws = null;
+-            reconnectTimer = setTimeout(connect, 3000);
++            reconnectAttempt++;
++            reconnectTimer = setTimeout(connect, Math.min(3000, 250 * 2 ** (reconnectAttempt - 1)));
+         };
+@@ -407,2 +410,3 @@
+             const resp = await fetch("https://api.spicylyrics.org/query", {
++                signal:  AbortSignal.timeout(6000),
+                 method:  "POST",
+@@ -495,2 +499,3 @@
+     // out early if the user moves on to another track.
++    const COSMOS_TIMEOUT_MS = 5000;   // a single request that hangs is abandoned after this
+     const RESOLVER_WAIT_MS  = 30000;
+@@ -502,3 +507,6 @@
+             try {
+-                return await Spicetify.CosmosAsync.get(url);
++                return await Promise.race([
++                    Spicetify.CosmosAsync.get(url),
++                    new Promise((_, rej) => setTimeout(() => rej(new Error("color-lyrics request timed out")), COSMOS_TIMEOUT_MS)),
++                ]);
+             } catch (e) {
+@@ -851,3 +859,5 @@
+     setInterval(tick, 500);
+-    Spicetify.Player.addEventListener("songchange", () => { lastTrackUri = ""; currentLyrics = null; });
++    Spicetify.Player.addEventListener("songchange", () => { lastTrackUri = ""; currentLyrics = null; tick(); });
++    // onplaypause is dispatched by Spicetify from Spotify's own player "update" event (not a timer).
++    Spicetify.Player.addEventListener("onplaypause", () => { tick(); });
+     connect();
