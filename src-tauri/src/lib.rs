@@ -66,10 +66,8 @@ pub fn start_discord(engine: &Arc<Engine>, id: &str) {
     let (tx, rx) = mpsc::unbounded_channel();
     let e = engine.clone();
     let conn = tauri::async_runtime::spawn(discord::run(id.to_string(), rx, move |st| match st {
-        discord::Status::Connected(u) => {
-            log(&format!("RPC handshake OK  ·  {u}"));
-            e.update(|s| s.discord_user = Some(u));
-        }
+        // (discord::run logs the handshake: once per outage, not per READY)
+        discord::Status::Connected(u) => e.update(|s| s.discord_user = Some(u)),
         discord::Status::Disconnected => e.update(|s| s.discord_user = None),
     }));
     let presence = tauri::async_runtime::spawn(presence::run_loop(engine.clone(), tx));

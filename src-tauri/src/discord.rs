@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use futures_util::FutureExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use tokio::sync::{mpsc, Notify};
 
@@ -79,6 +79,40 @@ fn due(last: &mut Option<Instant>, every: Duration) -> bool {
     now
 }
 
+/// What the connection says about itself, and when. A Discord that keeps
+/// hanging up must not write a line per cycle: an outage is logged once and
+/// then at most every LOG_EVERY (whatever happened in between, a handshake
+/// that worked included), and a handshake is announced only when it is the
+/// first or ends an outage that was logged.
+struct ConnLog {
+    last: Option<Instant>,
+    owes_ready: bool,
+    first: bool,
+}
+
+impl Default for ConnLog {
+    fn default() -> Self {
+        ConnLog { last: None, owes_ready: false, first: true }
+    }
+}
+
+impl ConnLog {
+    /// A failed try or a dropped connection: say so now?
+    fn outage(&mut self) -> bool {
+        let say = due(&mut self.last, LOG_EVERY);
+        self.owes_ready |= say;
+        say
+    }
+
+    /// A handshake worked: say so now?
+    fn ready(&mut self) -> bool {
+        let say = self.first || self.owes_ready;
+        self.first = false;
+        self.owes_ready = false;
+        say
+    }
+}
+
 fn open_pipe(prefix: &str) -> Option<NamedPipeClient> {
     (0..10).find_map(|i| ClientOptions::new().open(format!("{prefix}{i}")).ok())
 }
@@ -93,6 +127,8 @@ pub struct Link {
     error: Mutex<String>,
     retry: Retry,
     timeout: Duration,
+    /// How many lines about the connection have been logged (tests).
+    log_lines: AtomicU64,
 }
 
 impl Link {
@@ -103,7 +139,19 @@ impl Link {
             error: Mutex::new(String::new()),
             retry,
             timeout,
+            log_lines: AtomicU64::new(0),
         }
+    }
+
+    /// Say something about the connection in the log.
+    fn say(&self, msg: &str) {
+        self.log_lines.fetch_add(1, Ordering::Relaxed);
+        crate::log(msg);
+    }
+
+    #[cfg(test)]
+    pub fn log_lines(&self) -> u64 {
+        self.log_lines.load(Ordering::Relaxed)
     }
 
     /// Why the presence is not reaching Discord, "" when it is (or no
@@ -161,18 +209,19 @@ async fn timed<T>(limit: Duration, what: &str, f: impl std::future::Future<Outpu
 }
 
 /// Keep a connection to Discord alive forever, sending the newest update.
-/// Nothing is replayed after a reconnect: the presence loop starts over
-/// (fresh rate ledger, empty screen) the moment it sees the connection, and
-/// a stale replay would spend a frame the ledger never saw.
+/// Nothing is replayed after a reconnect: the presence loop starts over with
+/// an empty screen the moment it sees the connection (its rate ledger is kept:
+/// Discord counts frames, not connections), and a stale replay would spend a
+/// frame the ledger never saw.
 pub async fn run(app_id: String, rx: mpsc::UnboundedReceiver<Update>, status: impl Fn(Status) + Send + 'static) {
     run_on(&LINK, PIPE_PREFIX, app_id, rx, status).await
 }
 
 pub async fn run_on(link: &Link, prefix: &str, app_id: String, mut rx: mpsc::UnboundedReceiver<Update>, status: impl Fn(Status) + Send + 'static) {
     let mut nonce: u64 = 0;
-    // Failed tries since the last stable connection; when a failure was last logged.
+    // Failed tries since the last stable connection; what has been logged.
     let mut attempt: u32 = 0;
-    let mut logged: Option<Instant> = None;
+    let mut conn_log = ConnLog::default();
     loop {
         let mut up_since = None;
         let ended = match open_pipe(prefix) {
@@ -194,7 +243,9 @@ pub async fn run_on(link: &Link, prefix: &str, app_id: String, mut rx: mpsc::Unb
                         link.connected.store(true, Ordering::Relaxed);
                         link.clear_error();
                         up_since = Some(Instant::now());
-                        logged = None;
+                        if conn_log.ready() {
+                            link.say(&format!("RPC handshake OK  ·  {user}"));
+                        }
                         status(Status::Connected(user));
                         // Reader: drain replies; log errors; ends when the pipe dies.
                         let mut reader = tokio::spawn(async move {
@@ -214,7 +265,9 @@ pub async fn run_on(link: &Link, prefix: &str, app_id: String, mut rx: mpsc::Unb
                                 // A write Discord never takes must not wedge
                                 // the loop: no reconnect could ever run then.
                                 if let Err(e) = timed(link.timeout, "write", wr.write_all(&frame(OP_FRAME, &msg))).await {
-                                    crate::log(&format!("Pipe error: {e}"));
+                                    if conn_log.outage() {
+                                        link.say(&format!("Pipe error: {e}"));
+                                    }
                                     break Ended::Dropped;
                                 }
                             }
@@ -262,14 +315,14 @@ pub async fn run_on(link: &Link, prefix: &str, app_id: String, mut rx: mpsc::Unb
                 };
                 match failure {
                     Some(e) => {
-                        if due(&mut logged, LOG_EVERY) {
-                            crate::log(&format!("RPC unavailable: {e}  — retrying"));
+                        if conn_log.outage() {
+                            link.say(&format!("RPC unavailable: {e}  — retrying"));
                         }
                         link.set_error(&format!("Discord unreachable: {e} (retrying)"));
                     }
                     None => {
-                        if due(&mut logged, LOG_EVERY) {
-                            crate::log("RPC disconnected — reconnecting");
+                        if conn_log.outage() {
+                            link.say("RPC disconnected — reconnecting");
                         }
                         link.set_error("Discord pipe closed (reconnecting)");
                     }
@@ -458,6 +511,28 @@ mod tests {
     }
 
     #[test]
+    fn a_flapping_connection_is_logged_once_per_30_s_not_once_per_cycle() {
+        let t0 = Instant::now();
+        let mut log = ConnLog::default();
+        assert!(log.ready(), "the first handshake is announced");
+        // 20 cycles, one a second: hang up, handshake again
+        let mut lines = 0;
+        for _ in 0..20 {
+            if log.outage() {
+                lines += 1;
+            }
+            if log.ready() {
+                lines += 1;
+            }
+        }
+        assert_eq!(lines, 2, "the outage, and the handshake that ended it");
+        // outside the window a new outage is logged again
+        log.last = Some(t0 - Duration::from_secs(31));
+        assert!(log.outage());
+        assert!(log.ready());
+    }
+
+    #[test]
     fn a_failure_is_logged_once_and_then_only_now_and_then() {
         let mut last = None;
         assert!(due(&mut last, Duration::from_secs(30)));
@@ -506,6 +581,26 @@ mod tests {
         }
         assert!(gaps[0] < ms(400), "the first redial is quick: {gaps:?}");
         assert!(gaps[4] > gaps[0] * 4, "and they get slower: {gaps:?}");
+    }
+
+    /// The same hang-up loop, end to end: the log gets the outage once and
+    /// its end once, not a line per cycle.
+    #[tokio::test]
+    async fn a_discord_that_keeps_hanging_up_writes_a_few_log_lines_not_one_per_cycle() {
+        let p = prefix("flaplog");
+        let l = link_with(Retry { first: ms(20), cap_missing: ms(100), cap_other: ms(100), stable: Duration::from_secs(60) }, 5000);
+        let mut srv = server(&p, true);
+        let (_tx, _st) = start(l, &p);
+        for _ in 0..8 {
+            let (rd, wr) = ready(srv).await;
+            let next = server(&p, false);
+            drop(rd);
+            drop(wr);
+            srv = next;
+        }
+        let (_rd, _wr) = ready(srv).await;
+        wait_for(|| l.is_connected()).await;
+        assert!(l.log_lines() <= 3, "{} lines for 9 handshakes and 8 hang-ups", l.log_lines());
     }
 
     #[tokio::test]

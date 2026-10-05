@@ -9,10 +9,15 @@
 //! away. Every connection is pinged, and dropped once nothing at all, not
 //! even a pong, has arrived for IDLE_TIMEOUT (the browser answers pings from
 //! its network stack, so a quiet but alive Spotify is never mistaken for dead).
+//! A connection that takes over from the newest one is asked for the state and
+//! has TAKEOVER_ANSWER to say anything: a half-open socket left behind by a
+//! reload is dropped in seconds, not after the idle timeout, and never keeps
+//! the app showing a bridge that is not there.
 
 use crate::engine::Engine;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -31,19 +36,27 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Give the extension's onmessage handler a turn to wire up first.
 const REQUEST_STATE_DELAY: Duration = Duration::from_millis(300);
+/// A connection that has just become the bridge again (the newest one left)
+/// is asked for the state; a live bridge answers at once. One that says
+/// nothing within this long is a dead socket.
+pub const TAKEOVER_ANSWER: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy)]
 pub struct Timing {
     pub handshake: Duration,
     pub ping: Duration,
     pub idle: Duration,
+    pub answer: Duration,
 }
 
 impl Default for Timing {
     fn default() -> Self {
-        Timing { handshake: HANDSHAKE_TIMEOUT, ping: PING_EVERY, idle: IDLE_TIMEOUT }
+        Timing { handshake: HANDSHAKE_TIMEOUT, ping: PING_EVERY, idle: IDLE_TIMEOUT, answer: TAKEOVER_ANSWER }
     }
 }
+
+/// What a connection task does with a message from its peer.
+type Handler = Arc<dyn Fn(&Arc<Engine>, &Value) + Send + Sync>;
 
 struct Slot {
     id: u64,
@@ -99,6 +112,10 @@ pub async fn serve(listener: TcpListener, engine: Arc<Engine>, outbox: Outbox) {
 }
 
 pub async fn serve_with(listener: TcpListener, engine: Arc<Engine>, outbox: Outbox, timing: Timing) {
+    serve_handling(listener, engine, outbox, timing, Arc::new(|e, v| e.handle(v))).await
+}
+
+async fn serve_handling(listener: TcpListener, engine: Arc<Engine>, outbox: Outbox, timing: Timing, handler: Handler) {
     let mut id = 0;
     loop {
         let sock = match listener.accept().await {
@@ -109,7 +126,7 @@ pub async fn serve_with(listener: TcpListener, engine: Arc<Engine>, outbox: Outb
             }
         };
         id += 1;
-        tokio::spawn(connection(sock, id, engine.clone(), outbox.clone(), timing));
+        tokio::spawn(connection(sock, id, engine.clone(), outbox.clone(), timing, handler.clone()));
     }
 }
 
@@ -117,7 +134,34 @@ async fn send(ws: &mut WebSocketStream<TcpStream>, m: Message) -> bool {
     matches!(tokio::time::timeout(WRITE_TIMEOUT, ws.send(m)).await, Ok(Ok(())))
 }
 
-async fn connection(sock: TcpStream, id: u64, engine: Arc<Engine>, outbox: Outbox, t: Timing) {
+/// A connection's place in the outbox. Dropping it, however the task ends (a
+/// panic in the handler included), frees the slot, so a dead connection can
+/// never stay the bridge or leave `bridge_connected` set.
+struct Lease {
+    outbox: Outbox,
+    engine: Arc<Engine>,
+    id: u64,
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            crate::log("[Bridge] a connection task panicked, releasing its slot");
+        }
+        // Never panic in here: during an unwind that would abort the process.
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            if self.outbox.release(self.id) {
+                self.engine.update(|s| s.bridge_connected = false);
+                // One that spoke up meanwhile has already set it.
+                if self.outbox.connected() {
+                    self.engine.update(|s| s.bridge_connected = true);
+                }
+            }
+        }));
+    }
+}
+
+async fn connection(sock: TcpStream, id: u64, engine: Arc<Engine>, outbox: Outbox, t: Timing, handler: Handler) {
     let Ok(Ok(mut ws)) = tokio::time::timeout(t.handshake, tokio_tungstenite::accept_async(sock)).await else { return };
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
     // Handed to the outbox with the first message.
@@ -128,12 +172,20 @@ async fn connection(sock: TcpStream, id: u64, engine: Arc<Engine>, outbox: Outbo
     tokio::pin!(request);
     let mut requested = false;
     let mut last_rx = Instant::now();
+    // Set when the state is requested of a connection that took over: it must
+    // answer by then.
+    let mut answer_by: Option<Instant> = None;
+    let mut lease: Option<Lease> = None;
     let why = loop {
         tokio::select! {
             out = out_rx.recv() => match out {
                 Some(v) => {
+                    let asks = v.get("type").and_then(|x| x.as_str()) == Some("request_state");
                     if !send(&mut ws, Message::text(v.to_string())).await {
                         break "write failed";
+                    }
+                    if asks {
+                        answer_by = Some(Instant::now() + t.answer);
                     }
                 }
                 None => break "gone",
@@ -141,16 +193,21 @@ async fn connection(sock: TcpStream, id: u64, engine: Arc<Engine>, outbox: Outbo
             m = ws.next() => {
                 let Some(Ok(m)) = m else { break "closed" };
                 last_rx = Instant::now();
+                answer_by = None;
                 let Message::Text(text) = m else { continue };
                 let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
                 if let Some(tx) = pending_tx.take() {
                     let n = outbox.install(id, tx);
+                    lease = Some(Lease { outbox: outbox.clone(), engine: engine.clone(), id });
                     crate::log(&if n > 1 { format!("[Bridge] connected ({n} connections, the newest is used)") } else { "[Bridge] connected".into() });
                     engine.update(|s| s.bridge_connected = true);
                 }
                 if outbox.is_current(id) {
-                    engine.handle(&v);
+                    handler(&engine, &v);
                 }
+            }
+            _ = async { tokio::time::sleep_until(answer_by.unwrap()).await }, if answer_by.is_some() => {
+                break "no answer after taking over";
             }
             _ = &mut request, if !requested => {
                 requested = true;
@@ -168,15 +225,9 @@ async fn connection(sock: TcpStream, id: u64, engine: Arc<Engine>, outbox: Outbo
             }
         }
     };
-    if pending_tx.is_none() {
-        if outbox.release(id) {
-            engine.update(|s| s.bridge_connected = false);
-            // One that spoke up meanwhile has already set it.
-            if outbox.connected() {
-                engine.update(|s| s.bridge_connected = true);
-            }
-        }
+    if lease.is_some() {
         crate::log(&format!("[Bridge] disconnected ({why})"));
+        // (the lease frees the slot as it goes out of scope)
     } else if why == "silent" {
         crate::log("[Bridge] dropped a connection that never spoke");
     }
@@ -356,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dead_peer_is_noticed_and_a_quiet_one_that_answers_pings_is_kept() {
-        let timing = Timing { handshake: Duration::from_secs(3), ping: Duration::from_millis(100), idle: Duration::from_millis(400) };
+        let timing = Timing { handshake: Duration::from_secs(3), ping: Duration::from_millis(100), idle: Duration::from_millis(400), ..Timing::default() };
         let (port, e, out) = up(timing).await;
 
         // Alive but quiet: it reads (so pings are answered) and says nothing.
@@ -376,5 +427,98 @@ mod tests {
         until("the silent peer is dropped", || !e.snapshot().bridge_connected).await;
         assert!(!out.send(json!({})));
         drop(dead);
+    }
+
+    #[tokio::test]
+    async fn a_half_open_older_connection_is_dropped_in_seconds_when_it_takes_over() {
+        // Pings and the idle timeout are far off: only the takeover deadline
+        // can drop A here.
+        let timing = Timing { ping: Duration::from_secs(30), idle: Duration::from_secs(60), answer: Duration::from_millis(300), ..Timing::default() };
+        let (port, e, out) = up(timing).await;
+        let mut a = client(port).await;
+        a.send(hello()).await.unwrap();
+        a.send(track("A")).await.unwrap();
+        until("A is the bridge", || title(&e) == "A").await;
+        let mut b = client(port).await;
+        b.send(hello()).await.unwrap();
+        b.send(track("B")).await.unwrap();
+        until("B is the bridge", || title(&e) == "B").await;
+        // B leaves (a reload). A is asked for the state, and is not read from
+        // by this test: a half-open socket. It must not stay the bridge.
+        drop(b);
+        until("the app knows nobody is there", || !e.snapshot().bridge_connected).await;
+        assert!(!out.send(json!({})));
+        drop(a);
+    }
+
+    #[tokio::test]
+    async fn an_older_connection_that_answers_after_taking_over_is_kept() {
+        let timing = Timing { ping: Duration::from_secs(30), idle: Duration::from_secs(60), answer: Duration::from_millis(600), ..Timing::default() };
+        let (port, e, out) = up(timing).await;
+        let mut a = client(port).await;
+        a.send(hello()).await.unwrap();
+        a.send(track("A")).await.unwrap();
+        until("A is the bridge", || title(&e) == "A").await;
+        let mut b = client(port).await;
+        b.send(hello()).await.unwrap();
+        b.send(track("B")).await.unwrap();
+        until("B is the bridge", || title(&e) == "B").await;
+        drop(b);
+        // A hears the request and answers like the extension does
+        let asked = read_for(&mut a, 300).await;
+        assert!(asked.iter().any(|m| m.contains("request_state")), "{asked:?}");
+        a.send(track("A again")).await.unwrap();
+        until("A is the bridge again", || title(&e) == "A again").await;
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(e.snapshot().bridge_connected, "it answered, so it stays");
+        assert!(out.send(json!({"type": "player", "action": "next"})));
+        assert!(read_for(&mut a, 300).await.iter().any(|m| m.contains("\"next\"")));
+    }
+
+    #[tokio::test]
+    async fn a_panic_in_the_handler_still_frees_the_connection() {
+        let mut e = Engine::new(None, |_| {});
+        Arc::get_mut(&mut e).unwrap().lrclib_enabled = AtomicBool::new(false);
+        let l = bind(0).await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let out = Outbox::default();
+        let handler: Handler = Arc::new(|eng, v| {
+            if v["title"] == "boom" {
+                panic!("a bug in the handler");
+            }
+            eng.handle(v);
+        });
+        tokio::spawn(serve_handling(l, e.clone(), out.clone(), Timing::default(), handler));
+        let mut a = client(port).await;
+        a.send(hello()).await.unwrap();
+        until("A is the bridge", || e.snapshot().bridge_connected).await;
+        assert!(out.send(json!({"type": "player", "action": "next"})));
+        a.send(track("boom")).await.unwrap();
+        until("the slot is freed and the app knows", || !e.snapshot().bridge_connected).await;
+        assert!(!out.send(json!({})), "no stale slot is left to send to");
+        // and the next connection is the bridge as if nothing happened
+        let mut b = client(port).await;
+        b.send(hello()).await.unwrap();
+        b.send(track("fine")).await.unwrap();
+        until("B is the bridge", || title(&e) == "fine").await;
+        assert!(e.snapshot().bridge_connected);
+    }
+
+    #[tokio::test]
+    async fn a_bridge_that_connects_and_drops_over_and_over_leaves_nothing_behind() {
+        let (port, e, out) = up(Timing::default()).await;
+        for i in 0..30 {
+            let mut c = client(port).await;
+            c.send(hello()).await.unwrap();
+            c.send(track(&format!("T{i}"))).await.unwrap();
+            until("it is the bridge", || title(&e) == format!("T{i}")).await;
+            drop(c);
+            // every third one is replaced before the server has noticed it go
+            if i % 3 != 0 {
+                until("noticed gone", || !e.snapshot().bridge_connected).await;
+            }
+        }
+        until("all gone", || !e.snapshot().bridge_connected).await;
+        assert!(!out.send(json!({})), "no slot is left behind");
     }
 }
