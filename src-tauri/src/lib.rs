@@ -9,6 +9,7 @@ mod engine;
 mod features;
 mod lrclib;
 mod lyrics;
+mod panic_log;
 mod presence;
 mod shell_hotkeys;
 mod shell_tray;
@@ -131,6 +132,8 @@ async fn call(app: tauri::State<'_, App>, feature: String, action: String, args:
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // First, so that a panic anywhere (the release build aborts on one) leaves a line in the log.
+    panic_log::install();
     let resolved = datadir::choose();
     let dir = resolved.dir.clone();
     let made = datadir::prepare(&dir);
