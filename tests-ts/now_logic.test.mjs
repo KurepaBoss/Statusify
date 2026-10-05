@@ -295,3 +295,55 @@ test("a long save path keeps its end", () => {
   assert.equal(s.length, 52);
   assert.ok(s.startsWith("\u2026") && p.endsWith(s.slice(1)));
 });
+
+test("the Discord pill is green only when presence is on and Discord is connected", () => {
+  // The bug: presence switched on (the default) but no Discord connected still said "On Discord".
+  const noDiscord = L.rpcPill(true, null, true);
+  assert.equal(noDiscord.state, "waiting");
+  assert.notEqual(noDiscord.label, "On Discord");
+  assert.equal(L.rpcPill(true, "", true).state, "waiting", "an empty user name is not a connection");
+  assert.equal(L.rpcPill(true, undefined, true).state, "waiting");
+
+  const on = L.rpcPill(true, "kurepa", true);
+  assert.deepEqual([on.state, on.label], ["on", "On Discord"]);
+  assert.ok(on.title.includes("kurepa"));
+
+  // The user's own pause wins over everything, even a live connection.
+  assert.deepEqual(L.rpcPill(false, "kurepa", true).state, "off");
+  assert.equal(L.rpcPill(false, null, true).label, "Not sharing");
+  assert.equal(L.rpcPill(false, null, false).label, "Not sharing");
+});
+
+test("the Discord pill says why it is waiting", () => {
+  // First run: nothing to connect with yet.
+  const first = L.rpcPill(true, null, false);
+  assert.equal(first.state, "waiting");
+  assert.equal(first.label, "No App ID");
+  assert.ok(first.title.includes("Settings"));
+  // An App ID but no Discord: the reason from the connection, if there is one.
+  const why = L.rpcPill(true, null, true, "Discord isn't running");
+  assert.equal(why.label, "Discord not connected");
+  assert.ok(why.title.includes("Discord isn't running"));
+  assert.ok(L.rpcPill(true, null, true, "  ").title.includes("Open Discord"));
+  // Before the core feature has reported (rpcEnabled unknown) a live connection still reads as on.
+  assert.equal(L.rpcPill(undefined, "kurepa", true).state, "on");
+  assert.equal(L.rpcPill(undefined, null, undefined).state, "waiting");
+});
+
+test("the bridge warning reaches the footer, after the engine's own notes", () => {
+  const warn = "Spotify is running but the lyrics bridge isn't connected — click to repair";
+  const n = L.footerNotice("", "", warn);
+  assert.deepEqual(n, { text: warn, fix: true });
+  // A failed button press or a note outranks it (and is not a repair button).
+  assert.deepEqual(L.footerNotice("Spotify isn't connected, so it can't be controlled from here", "", warn).fix, false);
+  assert.equal(L.footerNotice("", "Port 8765 is in use — is the old Statusify still running?", warn).text.startsWith("Port 8765"), true);
+  assert.equal(L.footerNotice("", "", "").text, "");
+  assert.equal(L.footerNotice("", "", "").fix, false);
+});
+
+test("only the bridge's own messages are clickable, and not while a repair runs", () => {
+  assert.equal(L.footerNotice("", "", "Lyrics bridge out of date in Spotify — click here to repair").fix, true);
+  assert.equal(L.footerNotice("", "", "Repairing — follow the window that just opened (Spotify will restart)").fix, false);
+  assert.equal(L.footerNotice("", "No Discord Application ID yet. Add one in Settings, under Discord, to show your status.", "").fix, false);
+  assert.equal(L.footerNotice("", "Hotkey ctrl+alt+n is taken by another app", "").fix, false);
+});

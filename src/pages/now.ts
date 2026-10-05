@@ -288,10 +288,11 @@ function renderHeader(s: Snapshot) {
   elLike.classList.toggle("on", liked);
   const g = liked ? "heart" : "heart_o";
   if (elLike.dataset.g !== g) { elLike.dataset.g = g; elLike.innerHTML = icon(g); }
-  const rpcOn = ex("core")?.rpc_enabled;
-  const on = rpcOn === undefined ? !!s.discord_user : !!rpcOn;
-  elRpc.classList.toggle("on", on);
-  setText(elRpc.querySelector("span")!, on ? "On Discord" : "Not sharing");
+  const pill = L.rpcPill(ex("core")?.rpc_enabled, s.discord_user, ex("shell")?.app_id_set, ex("core")?.discord_error);
+  elRpc.classList.toggle("on", pill.state === "on");
+  elRpc.classList.toggle("waiting", pill.state === "waiting");
+  elRpc.title = pill.title;
+  setText(elRpc.querySelector("span")!, pill.label);
 }
 
 // ── Sheet model ─────────────────────────────────────────────
@@ -417,11 +418,10 @@ function renderFooter(s: Snapshot) {
   }
   renderRight();
 
-  const err = localErr || s.note || "";
+  const { text: err, fix: fixable } = L.footerNotice(localErr, s.note || "", String(ex("core")?.bridge_warning || ""));
   setText(elErr, err);
-  const fixable = !!err && /bridge|spicetify|repair|update/i.test(err) && !localErr;
   elErr.classList.toggle("click", fixable);
-  elErr.title = fixable ? "Click to repair" : "";
+  elErr.title = fixable ? "Click to repair the Spotify connection" : "";
 }
 
 /** Right of the status row: dropped lines, and "Rate limited · Ns" counting down

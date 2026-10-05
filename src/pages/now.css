@@ -51,6 +51,8 @@
 .np .np-rpc i { width: 7px; height: 7px; border-radius: 50%; background: rgb(var(--fgc) / 0.35); }
 .np .np-rpc.on { color: rgb(var(--fgc) / 0.95); }
 .np .np-rpc.on i { background: var(--acc); }
+.np .np-rpc.waiting { color: rgb(var(--fgc) / 0.8); }
+.np .np-rpc.waiting i { background: #e0a030; }
 .np .np-rpc:focus-visible,
 .np .ib:focus-visible,
 .np .np-like:focus-visible,

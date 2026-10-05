@@ -5,11 +5,12 @@
 //! The window, tray and hotkey mechanics live in src/shell_*.rs; this file is
 //! the feature the frontend and other features call.
 //!
-//! Actions: get_state, set_autostart {enabled}, set_hotkeys {skip, toggle,
-//! skip_instr, overlay}, center_window, create_shortcut, add_profile {name,
-//! app_id}, delete_profile {name}, switch_profile {app_id}, set_app_id
-//! {app_id} (both apply live, no restart), restart_app, reconnect_rpc, show_window,
-//! hide_to_tray, toggle_fullscreen, exit_fullscreen, quit.
+//! Actions: get_state, set_autostart {enabled}, remove_legacy_startup,
+//! open_data_dir, set_hotkeys {skip, toggle, skip_instr, overlay},
+//! center_window, create_shortcut, add_profile {name, app_id}, delete_profile
+//! {name}, switch_profile {app_id}, set_app_id {app_id} (both apply live, no
+//! restart), restart_app, reconnect_rpc, show_window, hide_to_tray,
+//! toggle_fullscreen, exit_fullscreen, quit.
 
 use super::{Ctx, Feature};
 use crate::{shell_hotkeys as hk, shell_tray::Tray, shell_window as win};
@@ -134,6 +135,13 @@ fn reconnect_discord(ctx: &Arc<Ctx>) -> Result<String, String> {
 }
 
 // ── Start with Windows ───────────────────────────────────────────
+//
+// This app's switch owns one thing: its own HKCU Run entry (autostart.rs,
+// "StatusifyDesktop"). The old Python app has a switch of its own, a
+// Startup-folder shortcut plus a cleanup of a Run value called "Statusify".
+// The two never touch each other's entry. If both are on, both start at boot
+// and whichever gets port 8765 first wins; the Settings page says so and
+// offers to turn the old one off (only when asked: remove_legacy_startup).
 
 /// The Startup-folder shortcut the Python app creates
 /// (statusify_startup._startup_lnk_path), under the given %APPDATA%.
@@ -145,45 +153,55 @@ fn legacy_startup_lnk() -> Option<std::path::PathBuf> {
     std::env::var_os("APPDATA").map(|a| legacy_startup_lnk_in(std::path::Path::new(&a)))
 }
 
-/// Start with Windows is on when either launcher exists: this app's Run entry
-/// or the Python app's shortcut (which would start the old app at boot).
-pub fn startup_enabled(plugin_on: bool, legacy_lnk: bool) -> bool {
-    plugin_on || legacy_lnk
-}
-
-/// Delete the old shortcut so two launchers never fight over port 8765.
-/// Returns whether one was removed.
+/// Delete the old app's Startup shortcut. Returns whether one was removed.
 pub fn remove_legacy_lnk(lnk: &std::path::Path) -> bool {
     std::fs::remove_file(lnk).is_ok()
 }
 
-fn autostart_now(ctx: &Ctx) -> bool {
-    startup_enabled(ctx.app.autolaunch().is_enabled().unwrap_or(false), legacy_startup_lnk().is_some_and(|p| p.exists()))
+/// The old Python app is set to start with Windows too.
+fn legacy_startup_on() -> bool {
+    legacy_startup_lnk().is_some_and(|p| p.exists())
 }
 
-/// Turn Start with Windows on or off, migrating away from the Python shortcut.
+fn autostart_now(ctx: &Ctx) -> bool {
+    ctx.app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+/// Turn this app's Start with Windows entry on or off. Only that entry.
 fn set_autostart(ctx: &Ctx, on: bool) -> Result<bool, String> {
     let al = ctx.app.autolaunch();
     if on {
         al.enable().map_err(|e| format!("Could not change start with Windows: {e}"))?;
-        // Enabling here replaces the Python app's launcher.
-        if legacy_startup_lnk().is_some_and(|p| remove_legacy_lnk(&p)) {
-            crate::log("Replaced the old Startup shortcut with this app's own entry");
-        }
-    } else {
-        // Nothing to remove is not an error (Python ignored FileNotFoundError too).
-        if al.is_enabled().unwrap_or(false) {
-            al.disable().map_err(|e| format!("Could not change start with Windows: {e}"))?;
-        }
-        if let Some(p) = legacy_startup_lnk() {
-            if p.exists() && !remove_legacy_lnk(&p) {
-                return Err("Could not remove the old Startup shortcut".into());
-            }
-        }
+    } else if al.is_enabled().unwrap_or(false) {
+        // Nothing to remove is not an error.
+        al.disable().map_err(|e| format!("Could not change start with Windows: {e}"))?;
     }
     let now = autostart_now(ctx);
     crate::log(&format!("Launch with Windows {}", if now { "enabled" } else { "disabled" }));
     Ok(now)
+}
+
+/// The first builds of this app registered as "Statusify" (the name the Python
+/// app's switch deletes). Move that entry to this app's own name, once.
+fn migrate_startup_entry(ctx: &Ctx) {
+    use crate::autostart::{migrate_legacy, Migration, RunKeys};
+    let Ok(exe) = std::env::current_exe() else { return };
+    let r = migrate_legacy(&RunKeys::real(), &exe, || ctx.app.autolaunch().enable().map_err(|e| e.to_string()));
+    match r {
+        Migration::Moved => crate::log("Start with Windows: moved this app's entry to its own name (StatusifyDesktop)"),
+        Migration::DroppedDuplicate => crate::log("Start with Windows: removed a duplicate entry"),
+        Migration::Failed(e) => crate::log(&format!("Start with Windows: could not move the old entry: {e}")),
+        Migration::NothingToDo | Migration::NotOurs => {}
+    }
+}
+
+/// Open the data folder in Explorer.
+fn open_data_dir(ctx: &Ctx) -> Result<(), String> {
+    std::process::Command::new("explorer.exe")
+        .arg(&ctx.data_dir)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not open the folder: {e}"))
 }
 
 // ── Desktop shortcut / restart ───────────────────────────────────
@@ -302,8 +320,11 @@ impl Inner {
         json!({
             "version": env!("CARGO_PKG_VERSION"),
             "data_dir": ctx.data_dir.to_string_lossy(),
+            "data_dir_mode": crate::datadir::current_mode().map(|m| m.id()),
+            "data_dir_label": crate::datadir::current_mode().map(|m| m.label()),
             "tray": self.tray.exists(),
             "autostart": autostart_now(ctx),
+            "legacy_startup": legacy_startup_on(),
             "hotkeys": hotkeys,
             "hotkey_defaults": defaults,
             "hotkey_errors": *self.errors.lock().unwrap(),
@@ -323,6 +344,7 @@ impl Feature for Shell {
 
     fn start(&self, ctx: &Arc<Ctx>) {
         let me = self.inner.clone();
+        migrate_startup_entry(ctx);
         let have_tray = me.tray.start(ctx);
         win::watch(ctx, have_tray);
         if let Some(w) = win::main_window(&ctx.app) {
@@ -376,6 +398,15 @@ impl Feature for Shell {
                 let on = args.get("enabled").and_then(|v| v.as_bool()).ok_or("shell.set_autostart: missing enabled")?;
                 set_autostart(ctx, on).map(|now| json!(now)).inspect_err(|e| crate::log(&format!("Startup change failed: {e}")))
             }
+            "remove_legacy_startup" => {
+                // Only ever on the user's click: it turns off the OLD app's switch.
+                let removed = legacy_startup_lnk().is_some_and(|p| p.exists() && remove_legacy_lnk(&p));
+                if removed {
+                    crate::log("Removed the old Statusify's Startup shortcut (asked for in Settings)");
+                }
+                Ok(json!({"removed": removed, "legacy_startup": legacy_startup_on()}))
+            }
+            "open_data_dir" => open_data_dir(ctx).map(|_| json!(true)),
             "toggle_fullscreen" => Ok(json!(win::toggle_fullscreen(&ctx.app))),
             "exit_fullscreen" => Ok(json!(win::exit_fullscreen(&ctx.app))),
             "set_hotkeys" => {
@@ -410,7 +441,7 @@ impl Feature for Shell {
             "switch_profile" | "set_app_id" => {
                 let id = s("app_id").ok_or("missing app_id")?;
                 if !valid_app_id(&id) {
-                    return Err("App ID must be a long numeric ID (e.g. 1480612100416999474)".into());
+                    return Err("App ID must be a long numeric ID (e.g. 123456789012345678)".into());
                 }
                 write_app_id(ctx, &id)?;
                 // Takes effect now: no restart (Python needed Switch, then Reconnect).
@@ -466,7 +497,7 @@ mod tests {
 
     #[test]
     fn profile_validation_matches_the_python_dialog() {
-        let id = "1480612100416999474";
+        let id = "123456789012345678";
         assert_eq!(check_profile(" Main ", id).unwrap(), ("Main".into(), id.into()));
         assert!(check_profile("", id).unwrap_err().contains("required"));
         assert!(check_profile("x", "").unwrap_err().contains("required"));
@@ -490,9 +521,6 @@ mod tests {
         assert!(lnk.ends_with(r"Microsoft\Windows\Start Menu\Programs\Startup\Statusify.lnk") || lnk.ends_with("Startup/Statusify.lnk"));
         std::fs::create_dir_all(lnk.parent().unwrap()).unwrap();
         std::fs::write(&lnk, b"x").unwrap();
-        assert!(startup_enabled(false, lnk.exists()), "the Python shortcut counts as enabled");
-        assert!(!startup_enabled(false, false));
-        assert!(startup_enabled(true, false));
         assert!(remove_legacy_lnk(&lnk));
         assert!(!lnk.exists());
         assert!(!remove_legacy_lnk(&lnk), "already gone is not a success");

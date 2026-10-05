@@ -184,7 +184,7 @@ fn sync_enabled(ctx: &Ctx) {
 
 /// With "Remember history" off: delete what is on record (on quit, and again
 /// at startup in case the app was killed before it could).
-fn wipe_if_off(ctx: &Ctx) {
+pub(crate) fn wipe_if_off(ctx: &Ctx) {
     if history_on(ctx) {
         return;
     }

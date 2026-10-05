@@ -390,3 +390,81 @@ async fn beats_follow_the_current_track() {
     track(&e, "u2");
     assert_eq!(e.beats(), (vec![], 0.0));
 }
+
+#[tokio::test]
+async fn quitting_banks_the_play_in_progress() {
+    // The periodic save writes every 5 s of listening; quitting must not lose the rest.
+    let dir = tmpdir("quit-bank");
+    let e = stored_engine(&dir);
+    track(&e, "u1");
+    for p in (1000..=25_000).step_by(1000) {
+        e.advance(1000);
+        pos(&e, p, true);
+    }
+    assert_eq!(e.recent_plays(5)[0].listened_ms, 25_000, "the last periodic save");
+    e.advance(3_500); // quit 3.5 s after the last position update
+    e.finish_play();
+    let plays = e.recent_plays(5);
+    assert_eq!(plays.len(), 1);
+    assert_eq!(plays[0].listened_ms, 28_500);
+    // Quit paths overlap (the window's close, then the runtime's exit event): calling it again changes nothing.
+    e.finish_play();
+    assert_eq!(e.recent_plays(5)[0].listened_ms, 28_500);
+    assert_eq!(e.recent_plays(5).len(), 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn quitting_commits_a_play_that_just_passed_twenty_seconds() {
+    let dir = tmpdir("quit-commit");
+    let e = stored_engine(&dir);
+    track(&e, "u1");
+    pos(&e, 1_000, true);
+    e.advance(21_000); // no position update since: the 20 s mark passed unnoticed
+    assert!(e.recent_plays(5).is_empty());
+    e.finish_play();
+    let plays = e.recent_plays(5);
+    assert_eq!(plays.len(), 1, "it counts as a play");
+    assert_eq!(plays[0].track_uri, "u1");
+    assert_eq!(plays[0].listened_ms, 21_000);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn quitting_early_in_a_song_or_while_paused_records_nothing_new() {
+    let dir = tmpdir("quit-short");
+    let e = stored_engine(&dir);
+    track(&e, "u1");
+    pos(&e, 1_000, true);
+    e.advance(15_000);
+    e.finish_play();
+    assert!(e.recent_plays(5).is_empty(), "under 20 s is not a play");
+    // Paused at 30 s, then the app is closed ten minutes later: the paused time is not listening.
+    e.advance(15_000);
+    pos(&e, 30_000, false);
+    e.advance(600_000);
+    e.finish_play();
+    let plays = e.recent_plays(5);
+    assert_eq!(plays.len(), 1);
+    assert_eq!(plays[0].listened_ms, 30_000);
+    // Nothing playing at all
+    let none = stored_engine(&tmpdir("quit-none"));
+    none.finish_play();
+    assert!(none.recent_plays(5).is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn quitting_with_history_off_writes_nothing() {
+    let dir = tmpdir("quit-off");
+    std::fs::write(dir.join("statusify.cfg"), "[preferences]\nsave_history = false\n").unwrap();
+    let mut e = Engine::new(Some(Store::open(&dir).unwrap()), |_| {});
+    Arc::get_mut(&mut e).unwrap().lrclib_enabled = AtomicBool::new(false);
+    e.set_config(Arc::new(crate::config::Config::open(&dir)));
+    track(&e, "u1");
+    pos(&e, 1_000, true);
+    e.advance(40_000);
+    e.finish_play();
+    assert!(e.store.as_ref().unwrap().recent_plays(5).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}

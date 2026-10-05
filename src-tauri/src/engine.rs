@@ -328,7 +328,7 @@ impl Engine {
                 g.snap.is_playing = false;
                 let now = self.mono_ms();
                 g.play.pause(now);
-                self.finish_play(&mut g);
+                self.write_listened(&mut g);
                 paused = true;
             }
         }
@@ -365,7 +365,7 @@ impl Engine {
                     g.snap.is_playing = false;
                     let now = self.mono_ms();
                     g.play.pause(now);
-                    self.finish_play(&mut g);
+                    self.write_listened(&mut g);
                     drop(g);
                     self.emit(Event::Paused);
                     self.changed();
@@ -389,7 +389,7 @@ impl Engine {
     }
 
     /// Write the listening time of the play in progress.
-    fn finish_play(&self, g: &mut Inner) {
+    fn write_listened(&self, g: &mut Inner) {
         if let (Some(id), Some(st)) = (g.play.id, self.store()) {
             let ms = g.play.listened(self.mono_ms());
             if let Err(e) = st.set_listened(id, ms) {
@@ -397,6 +397,18 @@ impl Engine {
             }
             g.play.saved_ms = ms;
         }
+    }
+
+    /// The app is closing: bank the play in progress. It is committed if it
+    /// has been listened to long enough but no position update has come since
+    /// (they arrive every 500 ms, but quitting does not wait for one), and its
+    /// listening time is written, so the up-to-5 seconds the periodic save has
+    /// not reached are not lost. Called from every quit path (lib.rs shutdown);
+    /// safe to call twice, and a no-op while "Remember history" is off.
+    pub fn finish_play(&self) {
+        let mut g = self.inner.lock().unwrap();
+        self.maybe_commit(&mut g);
+        self.write_listened(&mut g);
     }
 
     /// Begin a candidate play of the current track (nothing is written yet).
@@ -433,7 +445,7 @@ impl Engine {
             let same = !uri.is_empty() && g.snap.track.as_ref().is_some_and(|t| t.uri == uri);
             self.maybe_commit(&mut g); // the previous track, if it earned it
             if !same {
-                self.finish_play(&mut g);
+                self.write_listened(&mut g);
             }
             let (artist, title) = (s(m, "artist"), s(m, "title"));
             let blacklisted = is_blacklisted(&self.blacklist(), &artist, &title);
@@ -495,7 +507,7 @@ impl Engine {
         if playing && g.snap.is_playing && dur > RESTART_EDGE_MS * 2 && est >= dur - RESTART_EDGE_MS && pos < RESTART_EDGE_MS {
             if let Some(uri) = g.snap.track.as_ref().map(|t| t.uri.clone()) {
                 self.maybe_commit(&mut g);
-                self.finish_play(&mut g);
+                self.write_listened(&mut g);
                 self.start_play(&mut g, &uri);
                 crate::log("Song started over  ·  counting a new play");
             }
@@ -511,7 +523,7 @@ impl Engine {
         if paused {
             self.maybe_commit(&mut g);
             g.play.pause(now);
-            self.finish_play(&mut g);
+            self.write_listened(&mut g);
         }
         g.snap.is_playing = playing;
         if resumed {

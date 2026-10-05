@@ -421,6 +421,53 @@ export const stepVolume = (cur: number, n: number): number => clamp(Math.round((
 
 // ── Status row ──
 
+/**
+ * The line above the status row, and whether clicking it repairs the Spicetify
+ * bridge. A message of our own (a failed button) comes first, then the engine's
+ * note (port in use, no App ID), then the bridge warning core publishes ("the
+ * lyrics bridge isn't connected", "out of date"). The bridge warning used to be
+ * published and never shown, so a first-time user with no Spicetify saw nothing
+ * at all. Only the bridge's own messages are clickable, and not the
+ * "Repairing..." progress one, so a second click cannot start a second repair.
+ */
+export function footerNotice(localErr: string, note: string, bridgeWarning: string): { text: string; fix: boolean } {
+  const text = localErr || note || bridgeWarning || "";
+  const fix = !!text && !localErr && /bridge|spicetify|repair|update/i.test(text) && !/^repairing/i.test(text);
+  return { text, fix };
+}
+
+export type RpcPill = { state: "on" | "off" | "waiting"; label: string; title: string };
+
+/**
+ * The Discord pill under the title. Green ("on") only while the presence is
+ * switched on AND Discord is connected: the switch alone used to light it, so a
+ * Statusify that could not reach Discord said "On Discord" all the same.
+ * "off" is the user's own pause; "waiting" is "wants to share, can't yet".
+ * `rpcEnabled` is undefined until the core feature has reported.
+ */
+export function rpcPill(
+  rpcEnabled: boolean | undefined,
+  discordUser: string | null | undefined,
+  appIdSet: boolean | undefined,
+  discordError?: string,
+): RpcPill {
+  if (rpcEnabled === false) {
+    return { state: "off", label: "Not sharing", title: "Your status is paused. Click to show your lyrics on Discord again." };
+  }
+  if (discordUser) {
+    return { state: "on", label: "On Discord", title: `Showing your lyrics on Discord as ${discordUser}. Click to pause.` };
+  }
+  if (appIdSet === false) {
+    return { state: "waiting", label: "No App ID", title: "Add your Discord Application ID in Settings, under Discord, to show your status." };
+  }
+  const why = (discordError ?? "").trim();
+  return {
+    state: "waiting",
+    label: "Discord not connected",
+    title: why ? `Not connected to Discord: ${why}` : "Not connected to Discord. Open Discord on this PC and Statusify connects by itself.",
+  };
+}
+
 /** "Rate limited · 12s" while the presence planner holds a line back, else "". */
 export function rateLimitLabel(untilMs: number | null | undefined, nowMs: number): string {
   const rem = (Number(untilMs) || 0) - nowMs;

@@ -232,6 +232,8 @@ pub fn quit_prepare(ctx: &Ctx) {
     if let Some(w) = main_window(&ctx.app) {
         save_geometry(&ctx.config, &w);
     }
+    // Bank the play in progress too (see lib.rs shutdown).
+    crate::shutdown(ctx);
 }
 
 /// Quit for real: remember the window, exit.
