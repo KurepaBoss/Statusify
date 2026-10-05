@@ -3,6 +3,7 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { call, onSnapshot, player, position, seek, type Snapshot } from "../api";
 import { getPrefs, initTheme, onPrefs, refreshPrefs, setPrefs, type Prefs } from "./settings_theme";
+import { availableText, changelogText, checkFailedMessage, checkMessage, installLabel, shouldAutoShow, updateDescription, type CheckResult, type UpdateInfo } from "./settings_update";
 import "./settings.css";
 
 initTheme();
@@ -45,7 +46,7 @@ function toast(msg: string, err = false) {
 const fail = (e: unknown) => toast(String((e as any)?.message ?? e), true);
 
 type DialogBtn = { text: string; kind?: "primary" | "ghost"; run?: () => boolean | void | Promise<boolean | void> };
-function dialog(title: string, body: Node[], buttons: DialogBtn[]): void {
+function dialog(title: string, body: Node[], buttons: DialogBtn[]): HTMLElement {
   const back = h("div", "set-modal");
   const box = h("div", "set-dialog");
   box.setAttribute("role", "dialog");
@@ -72,6 +73,7 @@ function dialog(title: string, body: Node[], buttons: DialogBtn[]): void {
   });
   document.body.append(back);
   (box.querySelector("input") ?? bar.querySelector<HTMLElement>(".primary"))?.focus();
+  return back;
 }
 
 // ── controls ─────────────────────────────────────────────────────
@@ -263,6 +265,70 @@ export function sleepSegment(value: unknown, label: string, custom: boolean, cho
 }
 const sleepKey = () => sleepSegment(core().sleep_value, String(core().sleep_label || ""), sleepCustomOpen, sleepChoice);
 
+// ── updates ──────────────────────────────────────────────────────
+const update = (): UpdateInfo | null => (core().update_available as UpdateInfo | null) || null;
+/** "You have v3.0.0." (nothing until the shell state, which carries the version, has arrived). */
+const youHave = () => (shell.version ? `You have v${shell.version}.` : "");
+let updateNote = "";
+let checking = false;
+let autoShownTag: string | null = null;
+const DISMISSED = "statusify.update.dismissed";
+const dismissedTag = (): string | null => {
+  try {
+    return localStorage.getItem(DISMISSED);
+  } catch {
+    return null;
+  }
+};
+const dismiss = (tag: string) => {
+  try {
+    localStorage.setItem(DISMISSED, tag);
+  } catch {
+    /* no storage here: it is simply offered again next time */
+  }
+};
+
+/** The "Check now" button: ask core (it answers from what it knows when asked twice within a minute). */
+async function checkNow() {
+  if (checking) return;
+  checking = true;
+  updateNote = "Checking…";
+  syncAll();
+  try {
+    updateNote = checkMessage(await call<CheckResult>("core", "check_update"));
+  } catch {
+    updateNote = checkFailedMessage();
+  }
+  checking = false;
+  syncAll();
+}
+
+async function installUpdate(u: UpdateInfo) {
+  toast(u.can_install ? "Downloading the update…" : "Opening the download page…");
+  try {
+    const r = await call<{ installed: boolean; open_url?: string; error?: string }>("core", "install_update");
+    if (r.installed) return; // the installer takes over and Statusify restarts
+    if (r.error) toast(r.error, true);
+    if (r.open_url) await openUrl(r.open_url);
+  } catch (e) {
+    fail(e);
+  }
+}
+
+/** "Statusify v3.1.0 is available": what changed, then Later / the release page / Install. */
+function updateDialog(u: UpdateInfo) {
+  if (document.querySelector(".set-update")) return;
+  const back = dialog(`Statusify v${u.tag} is available`, [
+    h("p", "set-dialog-text", `${youHave()} Here is what changed:`.trim()),
+    h("pre", "set-changelog", changelogText(u)),
+  ], [
+    { text: "Later", kind: "ghost", run: () => dismiss(u.tag) },
+    { text: "Release page", run: () => { void openUrl(u.url).catch(() => undefined); return false; } },
+    { text: installLabel(u), kind: "primary", run: () => void installUpdate(u) },
+  ]);
+  back.classList.add("set-update");
+}
+
 async function restartNow() {
   try {
     await call("shell", "restart_app");
@@ -310,9 +376,23 @@ function build(): HTMLElement {
       const missing = shell.app_id_set === false;
       el.hidden = !(missing || shell.needs_restart === true);
       bannerText.textContent = missing
-        ? "No Discord App ID yet, so your status is off. Add one under Discord below."
-        : "Discord App ID changed. Press Reconnect under Discord, or restart Statusify.";
+        ? "No Discord Application ID yet, so your status is off. Add one under Discord below."
+        : "The saved Discord Application ID is not the one in use yet. Press Reconnect under Discord, or restart Statusify.";
       bannerBtn.hidden = missing;
+    }),
+  );
+
+  // Banner: a newer release exists.
+  const updText = h("span");
+  const updBtn = btn("What's new", () => {
+    const u = update();
+    if (u) updateDialog(u);
+  }, "primary");
+  page.append(
+    reg(h("div", "set-banner", updText, updBtn), (el) => {
+      const u = update();
+      el.hidden = !u;
+      if (u) updText.textContent = `${availableText(u)} ${youHave()}`.trim();
     }),
   );
 
@@ -510,6 +590,7 @@ function build(): HTMLElement {
     { title: "Start minimised to the tray", ctl: prefSwitch("start_minimized") },
     {
       title: "Launch when Windows starts",
+      desc: "Starts Statusify when you sign in. This switch is separate from the old Python Statusify's.",
       ctl: sw(() => !!shell.autostart, async (v) => {
         const before = !!shell.autostart;
         shell.autostart = v;
@@ -521,9 +602,20 @@ function build(): HTMLElement {
         }
       }),
     },
+    {
+      title: "The old Statusify also starts with Windows",
+      desc: "Both would start at sign-in and compete for the connection to Spotify; only one can work at a time.",
+      ctl: btn("Turn off the old one", () => void call("shell", "remove_legacy_startup").then((r: any) => {
+        shell.legacy_startup = !!r?.legacy_startup;
+        toast(r?.removed ? "The old Statusify will no longer start with Windows" : "It was already off");
+        syncAll();
+      }, fail)),
+    },
     { title: "Window position", desc: "Move the window back to the centre of the screen.", ctl: btn("Centre", () => void call("shell", "center_window").catch(fail)) },
     { title: "Desktop shortcut", ctl: btn("Create", () => void call("shell", "create_shortcut").then(() => toast("Shortcut created on the Desktop"), fail)) },
   ]);
+  const legacyRow = [...windowCard.querySelectorAll<HTMLElement>(".set-row")].find((r) => r.textContent?.startsWith("The old Statusify"));
+  if (legacyRow) reg(legacyRow, (el) => (el.hidden = !shell.legacy_startup));
 
   // ── Discord ──
   let selectedProfile = "";
@@ -560,7 +652,13 @@ function build(): HTMLElement {
     }
     void refreshShell();
   };
+  const appIdBtn = reg(btn("Add…", () => appIdDialog(false)), (b) => (b.textContent = shell.app_id_set ? "Change…" : "Add…"));
   const discord = card([
+    {
+      title: "Application ID",
+      desc: () => (shell.active_app_id ? `In use: ${shell.active_app_id}. A change applies at once, no restart needed.` : "None yet, so your status stays off. Create one in the Discord Developer Portal."),
+      ctl: appIdBtn,
+    },
     {
       title: "Connection",
       desc: "Reconnect if your status stopped updating.",
@@ -642,6 +740,37 @@ function build(): HTMLElement {
     { full: bl },
   ]);
 
+  // ── Spotify lyrics ──
+  const spotify = card([
+    {
+      title: "Lyrics connection",
+      desc: () => (snap?.bridge_connected ? "Statusify is reading Spotify through Spicetify." : "Statusify reads Spotify, and gets the lyrics, through Spicetify."),
+      ctl: value(() => (snap?.bridge_connected ? "Connected" : "Not connected"), 100, () => !!snap?.bridge_connected),
+    },
+    {
+      title: "Set up or repair",
+      desc: "Installs Spicetify if it is missing and adds Statusify's lyrics bridge. Spotify restarts once. Needs the Spotify desktop app, not the Microsoft Store version.",
+      ctl: btn("Set up…", () => spotifySetupDialog(false)),
+    },
+  ]);
+
+  // ── Updates ──
+  const checkBtn = reg(btn("Check now", () => void checkNow()), (b) => {
+    b.disabled = checking;
+    b.textContent = checking ? "Checking…" : "Check now";
+  });
+  const newsBtn = reg(btn("What's new", () => {
+    const u = update();
+    if (u) updateDialog(u);
+  }), (b) => (b.hidden = !update()));
+  const updates = card([
+    {
+      title: "Check for updates",
+      desc: () => `${youHave()} ${updateDescription(update(), updateNote)}`.trim(),
+      ctl: group(newsBtn, checkBtn),
+    },
+  ]);
+
   // ── Diagnostics ──
   logBox = h("div", "set-log");
   logBox.tabIndex = 0;
@@ -657,7 +786,14 @@ function build(): HTMLElement {
     el.hidden = !logShown();
     logBtn.textContent = logShown() ? "Hide" : "Show";
   });
-  const diag = h("div", "set-card-wrap", card([{ title: "Log", desc: "What Statusify has been doing. Useful when something's wrong.", ctl: logBtn }]), logCard);
+  const diag = h("div", "set-card-wrap", card([
+    {
+      title: "Data folder",
+      desc: () => `${shell.data_dir ?? ""}${shell.data_dir_label ? `  ·  ${shell.data_dir_label}` : ""}`,
+      ctl: btn("Open", () => void call("shell", "open_data_dir").catch(fail)),
+    },
+    { title: "Log", desc: "What Statusify has been doing. Useful when something's wrong.", ctl: logBtn },
+  ]), logCard);
 
   page.append(
     section("Lyrics"), lyricsCard,
@@ -665,8 +801,10 @@ function build(): HTMLElement {
     section("Playback"), playback,
     section("Window and startup"), windowCard,
     section("Discord"), discord,
+    section("Spotify lyrics", "Lyrics and what's playing come from the Spotify desktop app, through Spicetify."), spotify,
     section("Global hotkeys", "Work while other apps have focus. Saved when you press Enter or click away."), hotkeys,
     section("History and privacy"), privacy,
+    section("Updates"), updates,
     section("Diagnostics"), diag,
     reg(h("p", "set-foot"), (e) => (e.textContent = `Statusify ${shell.version ?? ""}  ·  data in ${shell.data_dir ?? ""}`)),
     toastEl,
@@ -679,7 +817,7 @@ function addProfileDialog() {
   const name = h("input", "set-input block");
   name.placeholder = "e.g. Main";
   const id = h("input", "set-input block");
-  id.placeholder = "e.g. 1480612100416999474";
+  id.placeholder = "e.g. 123456789012345678";
   id.inputMode = "numeric";
   const err = h("div", "set-dialog-err");
   dialog("Add a Discord profile", [h("label", "set-label", "Name", name), h("label", "set-label", "Application ID", id), err], [
@@ -700,24 +838,38 @@ function addProfileDialog() {
   ]);
 }
 
-function firstRunDialog() {
+/**
+ * The Discord Application ID, which Statusify shows your music through. On the
+ * very first run it opens by itself ("Welcome"), and once the ID is saved it
+ * goes on to the Spotify step.
+ */
+function appIdDialog(firstRun: boolean) {
   const id = h("input", "set-input block");
-  id.placeholder = "e.g. 1480612100416999474";
+  id.placeholder = "e.g. 123456789012345678";
   id.inputMode = "numeric";
+  id.value = String(shell.active_app_id ?? "");
   const err = h("div", "set-dialog-err");
-  const link = h("a", "set-link", "Open Discord Developer Portal ↗");
+  const link = h("a", "set-link", "Open the Discord Developer Portal ↗");
   link.href = "#";
   link.addEventListener("click", (e) => {
     e.preventDefault();
     void openUrl("https://discord.com/developers/applications").catch(() => undefined);
   });
-  dialog("Welcome to Statusify", [
-    h("p", "set-dialog-text", "Paste your Discord Application ID below. Create one free at discord.com/developers/applications."),
+  const steps = h("ol", "set-steps",
+    h("li", "", "In the Developer Portal, click New Application."),
+    h("li", "", 'Name it what your status should say, for example "Spotify". Discord shows "Listening to Spotify".'),
+    h("li", "", "Open General Information, copy the Application ID and paste it below."));
+  dialog(firstRun ? "Welcome to Statusify" : "Discord Application ID", [
+    h("p", "set-dialog-text", firstRun
+      ? "Statusify shows the song you're playing, with synced lyrics, on your Discord profile. First, Discord needs an application to show it through. It's free and takes a minute."
+      : "Statusify shows your music through a Discord application of your own."),
+    steps,
     link,
     id,
     err,
+    h("p", "set-dialog-text small", "The Discord desktop app has to be running for your status to appear."),
   ], [
-    { text: "Later", kind: "ghost" },
+    { text: firstRun ? "Later" : "Cancel", kind: "ghost" },
     {
       text: "Save and continue",
       kind: "primary",
@@ -731,6 +883,32 @@ function firstRunDialog() {
         }
         // The connection starts straight away; no restart needed.
         window.setTimeout(() => toast("Saved. Connecting to Discord…"), 50);
+        if (firstRun && !snap?.bridge_connected) window.setTimeout(() => spotifySetupDialog(true), 400);
+      },
+    },
+  ]);
+}
+
+/** Spicetify and the lyrics bridge: what it does, then run the setup script in its own window. */
+function spotifySetupDialog(firstRun: boolean) {
+  const err = h("div", "set-dialog-err");
+  dialog(firstRun ? "Now connect Spotify" : "Set up Spotify lyrics", [
+    h("p", "set-dialog-text", "Statusify reads what's playing, and gets the lyrics, from the Spotify desktop app through Spicetify."),
+    h("p", "set-dialog-text", "Setup installs Spicetify if it's missing and adds Statusify's lyrics bridge. A window shows its progress, and Spotify restarts once at the end. It needs the Spotify app from spotify.com, not the Microsoft Store version."),
+    err,
+  ], [
+    { text: firstRun ? "Not now" : "Cancel", kind: "ghost" },
+    {
+      text: "Set up (restarts Spotify)",
+      kind: "primary",
+      run: async () => {
+        try {
+          await call("core", "repair_bridge");
+        } catch (e) {
+          err.textContent = String(e);
+          return false;
+        }
+        window.setTimeout(() => toast("Setup started. Follow the window that just opened."), 50);
       },
     },
   ]);
@@ -851,13 +1029,20 @@ export function mount(root: HTMLElement) {
       sleepChoice = null;
     }
     lastSleepLabel = label;
+    // A newer release opens its dialog by itself, once per version (not while
+    // another dialog is up, and not again after Later or Escape).
+    const u = update();
+    if (u && u.tag !== autoShownTag && shouldAutoShow(u, dismissedTag()) && !document.querySelector(".set-modal")) {
+      autoShownTag = u.tag;
+      updateDialog(u);
+    }
     syncAll();
   });
   call<{ code: string; name: string }[]>("settings", "languages").then((l) => (languages = l)).finally(syncAll).catch(() => undefined);
   call<string[]>("settings", "fonts").then((f) => (fonts = f)).finally(syncAll).catch(() => undefined);
   void refreshPrefs();
   void refreshShell().then(() => {
-    if (shell.app_id_set === false) firstRunDialog();
+    if (shell.app_id_set === false) appIdDialog(true);
   });
   bindKeys();
 }

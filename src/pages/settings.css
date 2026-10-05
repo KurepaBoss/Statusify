@@ -51,7 +51,7 @@
 .set-row + .set-full, .set-full + .set-full { border-top: 0; }
 .set-left { min-width: 0; flex: 1; }
 .set-title { font-size: 14px; font-weight: 600; }
-.set-desc { font-size: 12px; color: var(--dim); margin-top: 2px; line-height: 1.35; }
+.set-desc { font-size: 12px; color: var(--dim); margin-top: 2px; line-height: 1.35; overflow-wrap: anywhere; user-select: text; }
 .set-note { font-size: 12px; color: var(--danger); margin-top: 3px; }
 .set-ctl { flex: none; display: flex; align-items: center; }
 .set-group { display: flex; align-items: center; gap: 6px; }
@@ -158,6 +158,12 @@
 .set-link { display: inline-block; color: var(--accent); font-size: 13px; text-decoration: underline; cursor: pointer; }
 .set-dialog-err { min-height: 18px; font-size: 12px; color: var(--danger); margin-top: 6px; }
 .set-dialog-btns { display: flex; justify-content: flex-end; gap: 6px; margin-top: 10px; }
+.set-dialog-text.small { font-size: 12px; margin: 4px 0 0; }
+.set-steps { margin: 0 0 8px; padding-left: 20px; font-size: 13px; color: var(--dim); line-height: 1.4; }
+.set-steps li { margin-bottom: 3px; }
+.set-dialog { max-height: calc(100vh - 32px); overflow-y: auto; }
+.set-changelog { max-height: 220px; overflow: auto; margin: 4px 0 0; padding: 10px 12px; border-radius: 8px; font: inherit; font-size: 12px;
+  line-height: 1.45; white-space: pre-wrap; color: var(--dim); background: color-mix(in srgb, var(--fg) 6%, transparent); user-select: text; }
 
 @media (max-width: 460px) {
   .set-row { flex-wrap: wrap; }

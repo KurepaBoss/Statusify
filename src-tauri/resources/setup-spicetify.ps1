@@ -1,8 +1,9 @@
 <#
     Installs Spicetify (if needed) and wires Statusify's lyrics bridge into
-    Spotify. Run by Statusify-Setup.exe; also safe to run by hand, and safe to
-    re-run — every step checks before it acts, so it doubles as a repair tool
-    after a Spotify update wipes Spicetify.
+    Spotify. Run by Statusify itself (Settings > Spotify lyrics > Set up, or by
+    clicking the repair message on the Lyrics page); also safe to run by hand, and
+    safe to re-run — every step checks before it acts, so it doubles as a repair
+    tool after a Spotify update wipes Spicetify.
 
     Usage:  setup-spicetify.ps1 -Bridge <path\to\lyrics-bridge.js>
             setup-spicetify.ps1 -Uninstall
@@ -175,6 +176,6 @@ if ($out -match "(?i)\berror\b") {
 $injected = Join-Path $env:APPDATA "Spotify\Apps\xpui\extensions\$BridgeName"
 if ((Test-Path $injected) -and
     (Get-FileHash $injected).Hash -eq (Get-FileHash $Bridge).Hash) {
-    Finish 0 "All done. Spotify now has the Statusify bridge - start Statusify and play a song."
+    Finish 0 "All done. Spotify now has the Statusify bridge - play a song and Statusify picks it up."
 }
 Finish 1 "Apply finished, but the bridge isn't inside Spotify yet. Close Spotify completely and run this again."

@@ -8,7 +8,7 @@
 //!   track_offset_is_song, global_delay_ms, sleep_label, sleep_remaining_s,
 //!   sleep_value, in_instrumental, instrumental_gap {start_ms,end_ms}|null,
 //!   dropped_lines, rate_limited_until_ms, blacklisted, lrclib_enabled,
-//!   update_available ({tag,url,changelog,setup}|null), bridge_warning,
+//!   update_available ({tag,url,changelog,setup:{url,sums_url,name}|null}|null), bridge_warning,
 //!   bridge_outdated, discord_error ("" or why the presence is not reaching
 //!   Discord: pipe missing, handshake rejected, pipe closed) }
 //!
@@ -16,7 +16,8 @@
 //! set_track_offset {ms|null, global?}; nudge_track_offset {delta_ms, global?};
 //! clear_track_offset; set_global_delay {ms}; sleep_set {value};
 //! skip_instrumental; blacklist_current; unblacklist {artist?, title?};
-//! check_update; install_update; repair_bridge; test_presence; reconnect_rpc.
+//! check_update (the user's button: {status, update, wait_s?}); install_update;
+//! repair_bridge; test_presence; reconnect_rpc.
 
 use super::{Ctx, Feature};
 use crate::bridge::Outbox;
@@ -34,6 +35,9 @@ const TICK: Duration = Duration::from_millis(200);
 const HEALTH_EVERY: Duration = Duration::from_secs(15);
 const REPAIR_SNOOZE: Duration = Duration::from_secs(120);
 const REPAIR_DEADLINE: Duration = Duration::from_secs(300);
+/// How often the app looks whether an update check is due (the check itself
+/// only goes out every maint::AUTO_EVERY_MS).
+const UPDATE_POLL: Duration = Duration::from_secs(30 * 60);
 const OUTDATED_MSG: &str = "Lyrics bridge out of date in Spotify — click here to repair";
 const REPAIRING_MSG: &str = "Repairing — follow the window that just opened (Spotify will restart)";
 
@@ -50,6 +54,9 @@ struct Runtime {
     bridge_was_connected: bool,
     repair_until: Option<Instant>,
     last_extras: Option<Value>,
+    /// When the update check may go out (core_maint::UpdateGate), and whether one is in flight.
+    gate: maint::UpdateGate,
+    update_busy: bool,
 }
 
 /// What the core actions work on (no Tauri handle, so they are testable).
@@ -259,7 +266,7 @@ pub fn act(env: &Env, action: &str, args: &Value) -> Result<Value, String> {
         "test_presence" => {
             let running = e.core.with(|c| c.presence_running);
             if !running {
-                return Err("No DISCORD_APP_ID in .env — presence is off".into());
+                return Err("No Discord Application ID yet, so there is nothing to test. Add one under Discord first.".into());
             }
             if e.snapshot().discord_user.is_none() {
                 return Err("Not connected to Discord — cannot send test".into());
@@ -326,6 +333,29 @@ fn install_bridge(e: &Engine, appdata: &std::path::Path) {
         }
         Err(m) => crate::log(&m),
     }
+}
+
+/// This install can replace itself: it came from Setup.exe (the uninstaller is
+/// beside the exe) and the release carries an installer with its checksums.
+fn can_self_install(update: &Value) -> bool {
+    !update["setup"].is_null() && std::env::current_exe().ok().and_then(|p| p.parent().map(maint::is_installed)).unwrap_or(false)
+}
+
+/// The update gate as the config file left it: when a check last succeeded.
+/// While the last one found a newer release, the next start asks again (once)
+/// instead of waiting out the interval, so an update that was found is shown
+/// with its installer details, and one that has since been installed stops
+/// being remembered.
+fn update_gate_from(config: &Config) -> maint::UpdateGate {
+    let last = config.get("updates", "last_check").and_then(|v| v.trim().parse::<i64>().ok()).map(|s| s * 1000);
+    let newer = config.get("updates", "latest_tag").is_some_and(|tag| match (maint::parse_tag(&tag), maint::parse_tag(maint::APP_VERSION)) {
+        (Some(t), Some(cur)) => t > cur,
+        _ => false,
+    });
+    if !newer && config.get("updates", "latest_tag").is_some() {
+        config.remove("updates", "latest_tag");
+    }
+    maint::UpdateGate::new(if newer { None } else { last })
 }
 
 /// A failed download / verify / launch falls back to the release page
@@ -448,21 +478,77 @@ impl Core {
         }
     }
 
-    fn check_update(&self, ctx: &Ctx) -> Result<Value, String> {
-        let client = crate::lrclib::client();
-        let res = tauri::async_runtime::block_on(maint::check_update(&client, maint::RELEASES_URL, maint::APP_VERSION));
-        match res {
-            Ok(u) => {
-                if let Some(u) = &u {
-                    crate::log(&format!("Update available: v{}", u["tag"].as_str().unwrap_or("?")));
-                }
-                ctx.engine.core.with(|c| c.update = u.clone());
-                self.push(ctx);
-                Ok(u.unwrap_or(Value::Null))
+    /// Check GitHub for a newer release. `manual`: the user pressed the button
+    /// (answered at once from what is known if one just ran); otherwise this is
+    /// the background check, which only goes out when it is due. Never nags: a
+    /// failure is logged and returned, the UI decides whether to show it.
+    ///
+    /// Returns {status: available | up_to_date | skipped | throttled | busy,
+    /// update, wait_s?, failed?, rate_limited?} (the last two say why a
+    /// throttled check is waiting: the previous request failed, or GitHub's
+    /// rate limit is in force). The update is also published as extras["core"].update_available.
+    fn check_update(&self, ctx: &Ctx, manual: bool) -> Result<Value, String> {
+        let url = std::env::var("STATUSIFY_RELEASES_URL").ok().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| maint::RELEASES_URL.to_string());
+        let res = tauri::async_runtime::block_on(self.run_update_check(&ctx.engine, &ctx.config, &url, maint::APP_VERSION, now_ms(), manual));
+        self.push(ctx);
+        res
+    }
+
+    /// The check itself, with everything it needs passed in (tests drive it
+    /// against a fake server and a fake clock).
+    async fn run_update_check(&self, engine: &Engine, config: &Config, url: &str, current: &str, now: i64, manual: bool) -> Result<Value, String> {
+        let known = || engine.core.with(|c| c.update.clone());
+        {
+            let mut rt = self.rt.lock().unwrap();
+            if rt.update_busy {
+                return Ok(json!({"status": "busy", "update": known()}));
             }
-            Err(err) => {
-                crate::log(&format!("Update check failed: {err}"));
-                Err(format!("Update check failed: {err}"))
+            if manual {
+                let wait = rt.gate.manual_wait_ms(now);
+                if wait > 0 {
+                    let (failed, limited) = rt.gate.why_waiting(now);
+                    return Ok(json!({"status": "throttled", "wait_s": (wait + 999) / 1000, "failed": failed, "rate_limited": limited, "update": known()}));
+                }
+            } else if !rt.gate.auto_due(now) {
+                return Ok(json!({"status": "skipped", "update": known()}));
+            }
+            rt.update_busy = true;
+            rt.gate.begin(now);
+        }
+        let res = maint::check_update(&crate::lrclib::client(), url, current).await;
+        let mut rt = self.rt.lock().unwrap();
+        rt.update_busy = false;
+        match res {
+            Ok(update) => {
+                rt.gate.record_ok(now);
+                drop(rt);
+                // Tell the UI whether "Install update" can really install (else it opens the page).
+                let update = update.map(|mut u| {
+                    u["can_install"] = json!(can_self_install(&u));
+                    u
+                });
+                config.set("updates", "last_check", &(now / 1000).to_string());
+                match &update {
+                    Some(u) => {
+                        let tag = u["tag"].as_str().unwrap_or("?");
+                        crate::log(&format!("Update available: v{tag} (this is v{current})"));
+                        config.set("updates", "latest_tag", tag);
+                    }
+                    None => {
+                        crate::log(&format!("Update check: v{current} is the latest release"));
+                        if config.get("updates", "latest_tag").is_some() {
+                            config.remove("updates", "latest_tag");
+                        }
+                    }
+                }
+                engine.core.with(|c| c.update = update.clone());
+                Ok(json!({"status": if update.is_some() { "available" } else { "up_to_date" }, "update": update}))
+            }
+            Err(e) => {
+                rt.gate.record_err(now, &e);
+                drop(rt);
+                crate::log(&format!("Update check failed: {}", e.message));
+                Err(format!("Update check failed: {}", e.message))
             }
         }
     }
@@ -474,7 +560,7 @@ impl Core {
         let u = ctx.engine.core.with(|c| c.update.clone()).ok_or("No update available — check first")?;
         let url = u["url"].as_str().unwrap_or("").to_string();
         let app_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(PathBuf::from)).unwrap_or_default();
-        let (Some(setup), Some(sha)) = (u["setup"]["url"].as_str(), u["setup"]["sha256_url"].as_str()) else {
+        let (Some(setup), Some(sums), Some(name)) = (u["setup"]["url"].as_str(), u["setup"]["sums_url"].as_str(), u["setup"]["name"].as_str()) else {
             return Ok(json!({"installed": false, "open_url": url}));
         };
         if !maint::is_installed(&app_dir) {
@@ -482,14 +568,14 @@ impl Core {
         }
         let client = crate::lrclib::client();
         let dest = std::env::temp_dir().join("statusify-update");
-        let res = tauri::async_runtime::block_on(maint::download_verified(&client, setup, sha, &dest))
-            .and_then(|path| {
-                crate::log(&format!("Update v{} downloaded and verified — installing", u["tag"].as_str().unwrap_or("?")));
-                maint::launch_silent_update(&path).map_err(|err| format!("could not start the installer: {err}"))
-            });
+        let res = tauri::async_runtime::block_on(maint::download_verified(&client, setup, sums, name, &dest)).and_then(|path| {
+            crate::log(&format!("Update v{} downloaded and verified — installing", u["tag"].as_str().unwrap_or("?")));
+            maint::launch_silent_update(&path).map_err(|err| format!("could not start the installer: {err}"))
+        });
         match res {
             Ok(()) => {
-                ctx.app.exit(0);
+                // Same as any other quit: bank the play in progress and the window.
+                crate::shell_window::quit(ctx);
                 Ok(json!({"installed": true}))
             }
             Err(err) => Ok(update_failed(&err, &url)),
@@ -537,6 +623,7 @@ impl Feature for Core {
         // ticker owns its own handle to the shared runtime state.
         let me = Arc::new(Core { rt: Mutex::new(Runtime::default()) });
         CORE.set(me.clone()).ok();
+        me.rt.lock().unwrap().gate = update_gate_from(&ctx.config);
         let c = ctx.clone();
         tokio::spawn(async move {
             if let Some(a) = std::env::var_os("APPDATA").map(PathBuf::from) {
@@ -558,12 +645,18 @@ impl Feature for Core {
                 }
             }
         });
-        // Check for updates once the UI has settled.
+        // Updates: check once the UI has settled and again whenever one is
+        // due. check_update() declines by itself when it is not (it never asks
+        // GitHub more than every 6 hours, counting across restarts).
         let c = ctx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            if let Some(core) = CORE.get().cloned() {
-                let _ = tokio::task::spawn_blocking(move || core.check_update(&c)).await;
+            loop {
+                if let Some(core) = CORE.get().cloned() {
+                    let c = c.clone();
+                    let _ = tokio::task::spawn_blocking(move || core.check_update(&c, false)).await;
+                }
+                tokio::time::sleep(UPDATE_POLL).await;
             }
         });
     }
@@ -571,7 +664,7 @@ impl Feature for Core {
     fn call(&self, ctx: &Arc<Ctx>, action: &str, args: Value) -> Result<Value, String> {
         let core = CORE.get().cloned();
         let res = match (action, &core) {
-            ("check_update", Some(c)) => return c.check_update(ctx),
+            ("check_update", Some(c)) => return c.check_update(ctx, true),
             ("install_update", Some(c)) => return c.install_update(ctx),
             ("repair_bridge", Some(c)) => return c.repair_bridge(ctx),
             ("check_update" | "install_update" | "repair_bridge", None) => Err("core is not started yet".into()),
@@ -737,7 +830,7 @@ mod tests {
     async fn bridge_commands_need_a_bridge_and_test_presence_needs_discord() {
         let t = T::new("");
         assert!(t.act("skip_instrumental", json!({})).is_err());
-        assert!(t.act("test_presence", json!({})).unwrap_err().contains("DISCORD_APP_ID"));
+        assert!(t.act("test_presence", json!({})).unwrap_err().contains("Application ID"));
         t.engine.core.with(|c| c.presence_running = true);
         assert!(t.act("test_presence", json!({})).unwrap_err().contains("Not connected"));
         t.engine.update(|s| s.discord_user = Some("me".into()));
@@ -832,5 +925,143 @@ mod tests {
         assert_eq!(migrate_offset_keys(&c), 1);
         assert_eq!(c.section("offsets"), vec![("abc".to_string(), "100".to_string())]);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn rels() -> Vec<u8> {
+        use crate::engine::maint::test_http::release;
+        serde_json::to_vec(&json!([release("v3.1.0", "- faster", true), release("v3.0.0", "first", true), release("v2.2.0", "python", false)])).unwrap()
+    }
+
+    #[tokio::test]
+    async fn update_check_never_nags_and_asks_rarely() {
+        use crate::engine::maint::test_http::serve;
+        use std::sync::atomic::Ordering::SeqCst;
+        let (base, hits) = serve(vec![("/releases", 200, vec![], rels())]).await;
+        let url = format!("{base}/releases");
+        let t = T::new("");
+        let core = Core::default();
+        let t0 = 1_800_000_000_000i64;
+        let shown = |t: &T| state_json(&t.engine, &t.config)["update_available"].clone();
+
+        // First start, nothing known: the background check goes out and finds 3.1.0.
+        let r = core.run_update_check(&t.engine, &t.config, &url, "3.0.0", t0, false).await.unwrap();
+        assert_eq!(r["status"], "available");
+        assert_eq!(shown(&t)["tag"], "3.1.0");
+        assert_eq!(shown(&t)["url"], "https://github.com/KurepaBoss/Statusify/releases/tag/v3.1.0");
+        assert_eq!(shown(&t)["changelog"], "• v3.1.0\n  - faster");
+        assert_eq!(shown(&t)["setup"]["name"], "Statusify_3.1.0_x64-setup.exe");
+        // The test exe is not an installed copy, so the dialog offers the page, not a silent install.
+        assert_eq!(shown(&t)["can_install"], false);
+        assert_eq!(hits.load(SeqCst), 1);
+        // What it learned is kept for the next start.
+        assert_eq!(t.config.get("updates", "last_check").as_deref(), Some("1800000000"));
+        assert_eq!(t.config.get("updates", "latest_tag").as_deref(), Some("3.1.0"));
+
+        // An hour later the background check stays quiet: no request, the answer is kept.
+        let r = core.run_update_check(&t.engine, &t.config, &url, "3.0.0", t0 + 3_600_000, false).await.unwrap();
+        assert_eq!(r["status"], "skipped");
+        assert_eq!(hits.load(SeqCst), 1);
+        // The user's button 10 s after a check is answered from what is known.
+        let r = core.run_update_check(&t.engine, &t.config, &url, "3.0.0", t0 + 10_000, true).await.unwrap();
+        assert_eq!(r["status"], "throttled");
+        assert_eq!(r["wait_s"], 50);
+        assert_eq!((r["failed"].clone(), r["rate_limited"].clone()), (json!(false), json!(false)), "the last check worked");
+        assert_eq!(r["update"]["tag"], "3.1.0");
+        assert_eq!(hits.load(SeqCst), 1);
+        // A minute on, it asks again.
+        let r = core.run_update_check(&t.engine, &t.config, &url, "3.0.0", t0 + 61_000, true).await.unwrap();
+        assert_eq!(r["status"], "available");
+        assert_eq!(hits.load(SeqCst), 2);
+        // 6 hours after that, the background check is due again.
+        let r = core.run_update_check(&t.engine, &t.config, &url, "3.0.0", t0 + 61_000 + maint::AUTO_EVERY_MS, false).await.unwrap();
+        assert_eq!(r["status"], "available");
+        assert_eq!(hits.load(SeqCst), 3);
+
+        // Once this app is 3.1.0 (the release itself) or newer, there is nothing to show, and the stale note goes.
+        let later = t0 + 3 * maint::AUTO_EVERY_MS;
+        let r = core.run_update_check(&t.engine, &t.config, &url, "3.1.0", later, false).await.unwrap();
+        assert_eq!(r["status"], "up_to_date");
+        assert!(shown(&t).is_null());
+        assert!(t.config.get("updates", "latest_tag").is_none());
+        let r = core.run_update_check(&t.engine, &t.config, &url, "9.9.9", later + maint::AUTO_EVERY_MS, false).await.unwrap();
+        assert_eq!(r["status"], "up_to_date");
+        assert!(shown(&t).is_null());
+    }
+
+    #[tokio::test]
+    async fn update_check_fails_quietly_offline_and_respects_github_limits() {
+        use crate::engine::maint::test_http::serve;
+        use std::sync::atomic::Ordering::SeqCst;
+        let t = T::new("");
+        let core = Core::default();
+        let t0 = 1_800_000_000_000i64;
+
+        // Offline: an error to the caller (the button says so), nothing shown, no nag, backing off.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_url = format!("http://{}/releases", dead.local_addr().unwrap());
+        drop(dead);
+        let e = core.run_update_check(&t.engine, &t.config, &dead_url, "3.0.0", t0, false).await.unwrap_err();
+        assert!(e.starts_with("Update check failed"), "{e}");
+        assert!(state_json(&t.engine, &t.config)["update_available"].is_null());
+        assert!(t.config.get("updates", "last_check").is_none(), "a failed check is not a check");
+        let (base, hits) = serve(vec![("/releases", 200, vec![], rels())]).await;
+        let url = format!("{base}/releases");
+        // ... the background check waits half an hour, the button only the minute.
+        let r = core.run_update_check(&t.engine, &t.config, &url, "3.0.0", t0 + 60_000, false).await.unwrap();
+        assert_eq!(r["status"], "skipped");
+        assert_eq!(hits.load(SeqCst), 0);
+        let r = core.run_update_check(&t.engine, &t.config, &url, "3.0.0", t0 + 61_000, true).await.unwrap();
+        assert_eq!(r["status"], "available", "back online, the user can check right away");
+
+        // GitHub says the allowance is spent: neither the app nor the button asks until the reset.
+        let (base, hits) = serve(vec![("/releases", 403, vec![("x-ratelimit-remaining", "0".into()), ("retry-after", "900".into())], b"{}".to_vec())]).await;
+        let limited = format!("{base}/releases");
+        let core = Core::default();
+        let t1 = t0 + 10 * maint::AUTO_EVERY_MS;
+        assert!(core.run_update_check(&t.engine, &t.config, &limited, "3.0.0", t1, false).await.is_err());
+        assert_eq!(hits.load(SeqCst), 1);
+        let r = core.run_update_check(&t.engine, &t.config, &limited, "3.0.0", t1 + 120_000, true).await.unwrap();
+        assert_eq!(r["status"], "throttled");
+        assert_eq!(r["wait_s"], 780);
+        assert_eq!((r["failed"].clone(), r["rate_limited"].clone()), (json!(true), json!(true)));
+        let r = core.run_update_check(&t.engine, &t.config, &limited, "3.0.0", t1 + 899_000, false).await.unwrap();
+        assert_eq!(r["status"], "skipped");
+        assert_eq!(hits.load(SeqCst), 1);
+        // The 3.1.0 found earlier is still what is shown through the outage.
+        assert_eq!(state_json(&t.engine, &t.config)["update_available"]["tag"], "3.1.0");
+    }
+
+    #[tokio::test]
+    async fn one_check_at_a_time() {
+        use crate::engine::maint::test_http::serve;
+        let (base, hits) = serve(vec![("/releases", 200, vec![], rels())]).await;
+        let url = format!("{base}/releases");
+        let t = T::new("");
+        let core = Core::default();
+        core.rt.lock().unwrap().update_busy = true;
+        let r = core.run_update_check(&t.engine, &t.config, &url, "3.0.0", 1_800_000_000_000, true).await.unwrap();
+        assert_eq!(r["status"], "busy");
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn the_update_gate_starts_from_the_config_file() {
+        let now = 1_800_000_000_000i64;
+        // Checked 2 hours ago, nothing newer known: not due again for 4 hours.
+        let t = T::new(&format!("[updates]\nlast_check = {}\n", (now - 2 * 3_600_000) / 1000));
+        let g = update_gate_from(&t.config);
+        assert!(!g.auto_due(now));
+        assert!(g.auto_due(now + 4 * 3_600_000));
+        // A newer release was found last time: ask again at this start, once.
+        let t = T::new(&format!("[updates]\nlast_check = {}\nlatest_tag = 999.0.0\n", (now - 3_600_000) / 1000));
+        assert!(update_gate_from(&t.config).auto_due(now));
+        assert_eq!(t.config.get("updates", "latest_tag").as_deref(), Some("999.0.0"));
+        // That release has since been installed (it is not newer than this build): forgotten.
+        let t = T::new(&format!("[updates]\nlast_check = {}\nlatest_tag = {}\n", (now - 3_600_000) / 1000, maint::APP_VERSION));
+        assert!(!update_gate_from(&t.config).auto_due(now));
+        assert!(t.config.get("updates", "latest_tag").is_none());
+        // Never checked, or an unreadable note: due.
+        assert!(update_gate_from(&T::new("").config).auto_due(now));
+        assert!(update_gate_from(&T::new("[updates]\nlast_check = soon\n").config).auto_due(now));
     }
 }
