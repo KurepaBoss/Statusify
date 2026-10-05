@@ -1,4 +1,4 @@
-// Run with: node --test tests/
+// Run with: node --test   (no directory argument: "node --test tests/" is an error on Node 24)
 // The REAL src-tauri/resources/lyrics-bridge.js against stubs: a fake
 // Spicetify player, a fake WebSocket and fake timers. No Spotify, no sockets,
 // no network. BRIDGE_JS=<file> tests another version of the bridge (the
@@ -225,4 +225,160 @@ test("after a dropped socket the bridge reconnects after 250 ms, backs off to 3 
   assert.equal(b.sockets.length, n);
   await b.advance(40);
   assert.equal(b.sockets.length, n + 1, "a connection that opened starts the delays over");
+});
+
+// The order of things in the real Spicetify, read (not executed) in the copy
+// installed under %APPDATA%: Apps/xpui/helper/spicetifyWrapper.js adds a
+// listener for Spotify's player "update" event to Spicetify.Player.origin
+// (= Platform.PlayerAPI). The PlayerCore behind it registered its own listener
+// first, in its constructor (_events.addListener(UPDATE, ({data}) => this._state
+// = data)), so by the time the wrapper's listener runs the state that
+// isPlaying() and getProgress() read (origin._state) is already the new one.
+// The wrapper then sets Player.data and dispatches, synchronously and in this
+// order: songchange if the item's uri changed, then onplaypause if isPaused
+// changed (Player.data is null when the new state has no item). The stub above
+// is built the same way: state first, then the events. Not exercised against
+// a live Spotify (that needs spicetify apply and a restart).
+test("a song picked while paused fires songchange then onplaypause, and is one track_change, playing", async (t) => {
+  const b = await ready(t);
+  b.playing = false;
+  b.fire("onplaypause");
+  await b.advance(0);
+  assert.equal(b.of("paused").length, 1);
+  b.sent.length = 0;
+
+  // one Spotify update: the new item and isPaused false together
+  b.setTrack(2);
+  b.playing = true;
+  b.fire("songchange");
+  b.fire("onplaypause");
+  await b.advance(0);
+  const tc = b.of("track_change");
+  assert.equal(tc.length, 1);
+  assert.equal(tc[0].track_uri, "spotify:track:t2");
+  assert.ok(b.of("position").length >= 1 && b.of("position").every((p) => p.is_playing === true));
+  assert.equal(b.of("paused").length, 0, "never reported as paused");
+});
+
+test("a listener that throws cannot be left to the dispatcher: events never produce an unhandled rejection", async (t) => {
+  // The real dispatchEvent calls listeners without a try/catch, and tick()
+  // is async: a rejection inside it must not escape as an unhandled one.
+  const b = await ready(t);
+  let unhandled = 0;
+  const on = () => unhandled++;
+  process.on("unhandledRejection", on);
+  t.after(() => process.off("unhandledRejection", on));
+  b.player.getProgress = () => {
+    throw new Error("player is not ready");
+  };
+  b.fire("songchange");
+  b.fire("onplaypause");
+  await b.advance(0);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(unhandled, 0);
+});
+
+/** A Spicy request that never answers until it is aborted; records each signal. */
+function hangingSpicy(signals) {
+  return (url, init) => {
+    signals.push(init.signal);
+    return new Promise((_, rej) => init.signal.addEventListener("abort", () => rej(init.signal.reason)));
+  };
+}
+
+test("a skip burst abandons the lyric requests of every skipped track", async (t) => {
+  const signals = [];
+  const cosmosUrls = [];
+  const cosmos = (url) => {
+    cosmosUrls.push(url);
+    return quickLyrics();
+  };
+  const b = await boot(t, { fetchStub: hangingSpicy(signals), cosmos });
+  b.open();
+  await b.advance(200);
+  for (let n = 2; n <= 6; n++) {
+    b.setTrack(n);
+    b.fire("songchange");
+    await b.advance(100);
+  }
+  assert.equal(b.of("track_change").length, 6, "every change is still reported at once");
+  assert.equal(signals.length, 6, "each track started its request");
+  assert.deepEqual(signals.map((s) => s.aborted), [true, true, true, true, true, false], "only the playing track's request is still wanted");
+  // the playing track's Spicy request times out; Spotify answers for it
+  await b.advance(7000);
+  const l = b.of("lyrics");
+  assert.equal(l.length, 1, "no lyrics message for a song that is not playing");
+  assert.equal(l[0].track_uri, "spotify:track:t6");
+  assert.equal(cosmosUrls.length, 1, "and no Spotify fallback for the skipped ones");
+  assert.match(cosmosUrls[0], /\/t6\?/);
+  assert.ok(!b.of("lyrics_debug").some((m) => /Track [1-5]\b/.test(m.message)), "nothing is said about the skipped tracks");
+});
+
+test("a skipped track's hanging color-lyrics request is dropped, not waited out", async (t) => {
+  // Spicy has no lyrics, Spotify's endpoint hangs: without cancelling, every
+  // skipped track still delivers its own 'none' verdict after 5 s.
+  const b = await boot(t, { cosmos: () => new Promise(() => {}) });
+  b.open();
+  await b.advance(200);
+  for (let n = 2; n <= 6; n++) {
+    b.setTrack(n);
+    b.fire("songchange");
+    await b.advance(100);
+  }
+  await b.advance(6000);
+  const l = b.of("lyrics");
+  assert.equal(l.length, 1);
+  assert.equal(l[0].track_uri, "spotify:track:t6");
+  assert.equal(l[0].mode, "none");
+});
+
+test("skipping on and coming back to a track fetches it again", async (t) => {
+  const signals = [];
+  const b = await boot(t, { fetchStub: hangingSpicy(signals) });
+  b.open();
+  await b.advance(200);
+  b.setTrack(2);
+  b.fire("songchange");
+  await b.advance(100);
+  b.setTrack(1);
+  b.fire("songchange");
+  await b.advance(7000);
+  const l = b.of("lyrics");
+  assert.deepEqual(l.map((m) => m.track_uri), ["spotify:track:t1"], "the track that is playing gets its lyrics, once");
+  assert.equal(l[0].mode, "synced");
+  assert.equal(signals.length, 3, "track 1, track 2, track 1 again");
+});
+
+test("when the track is gone (queue ended, an ad break) its lyric request is abandoned at once", async (t) => {
+  // Spicetify's wrapper sets Player.data to null when the new state has no
+  // item, and still fires songchange: tick() has nothing to start, so only the
+  // listener can cancel the request that is still running.
+  const signals = [];
+  const b = await boot(t, { fetchStub: hangingSpicy(signals) });
+  b.open();
+  await b.advance(200);
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0].aborted, false);
+  b.player.data = null;
+  b.fire("songchange");
+  await b.advance(0);
+  assert.equal(signals[0].aborted, true);
+  await b.advance(7000);
+  assert.equal(b.of("lyrics").length, 0, "nothing is sent for a track that is no longer there");
+});
+
+test("a track change that only the 500 ms poll notices also abandons the request of the track before", async (t) => {
+  // No songchange here (a missed event): the poll starts the new track's fetch,
+  // and that start must be what cancels the old one.
+  const signals = [];
+  const b = await boot(t, { fetchStub: hangingSpicy(signals) });
+  b.open();
+  await b.advance(200);
+  assert.equal(signals.length, 1);
+  b.setTrack(2);
+  await b.advance(600);
+  assert.equal(b.of("track_change").at(-1).track_uri, "spotify:track:t2");
+  assert.equal(signals.length, 2);
+  assert.equal(signals[0].aborted, true);
+  assert.equal(signals[1].aborted, false);
 });
