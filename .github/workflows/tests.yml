@@ -32,9 +32,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # The same key as release.yml, so the tag build starts from this cache.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          shared-key: statusify-windows-release
 
       - name: Install frontend dependencies
         run: npm ci

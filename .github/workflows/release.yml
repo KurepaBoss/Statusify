@@ -31,7 +31,9 @@ concurrency:
 jobs:
   release:
     runs-on: windows-latest
-    timeout-minutes: 60
+    # A cold cache means compiling every dependency twice over with fat LTO
+    # (the tests, then the app), and the installer on top.
+    timeout-minutes: 90
     defaults:
       run:
         shell: pwsh
@@ -45,9 +47,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # The same key as tests.yml, so a tag build starts from what a Tests run saved.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          shared-key: statusify-windows-release
 
       # The pushed tag, or (manual runs) the version the repository says it is.
       - name: Work out the tag
