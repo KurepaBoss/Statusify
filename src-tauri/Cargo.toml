@@ -1,6 +1,6 @@
 [package]
 name = "statusify-rs"
-version = "0.1.0"
+version = "3.0.0"
 description = "Statusify — Spotify lyrics on your Discord profile"
 authors = ["KurepaBoss"]
 edition = "2021"
