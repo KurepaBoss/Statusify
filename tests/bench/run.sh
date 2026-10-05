@@ -23,8 +23,8 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")/../.." && pwd)"
-export PATH="$PATH:/c/Users/KurepaBoss/.cargo/bin"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-C:/Users/KurepaBoss/Desktop/statusify-work/targets/bridge}"
+export PATH="$PATH:$HOME/.cargo/bin"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$here/.bench-target}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 export CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 CARGO_PROFILE_RELEASE_STRIP=false
 unset DISCORD_APP_ID STATUSIFY_PORT STATUSIFY_DATA_DIR
