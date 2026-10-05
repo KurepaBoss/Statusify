@@ -24,8 +24,14 @@ TypeScript + CSS frontend (GPU-composited in WebView2). Started 2026-10-02.
 - Tests: `cd src-tauri && cargo test` (22 tests; fake LRCLIB HTTP server and fake
   Discord pipe — never touches the network or the real Discord profile).
 - Build: `npx tauri build --no-bundle` → `src-tauri\target\release\statusify-rs.exe` (~9 MB).
-- Env: `STATUSIFY_DATA_DIR` (history.db, .env, statusify-rs.log; default = exe dir),
-  `STATUSIFY_PORT` (default 8765), `DISCORD_APP_ID` (from `.env`).
+- Env: `STATUSIFY_DATA_DIR` (history.db, statusify.cfg, .env, statusify-rs.log; when
+  unset: the exe's folder if it already holds one of those files ("portable", this is
+  how the dev setup keeps working), else `%APPDATA%\Statusify`; see `src/datadir.rs`),
+  `STATUSIFY_PORT` (default 8765), `DISCORD_APP_ID` (from `.env`),
+  `STATUSIFY_RELEASES_URL` (test hook: where the update check looks instead of GitHub).
+- Releasing (version bump, installer, update contract): `docs/RELEASING.md`.
+  `node scripts/check-version-sync.mjs` keeps Cargo, tauri.conf, package.json and the
+  README badge equal; `scripts/package.ps1` builds the NSIS installer.
 - Isolated test run while the old app is live: data dir = a *copy* of history.db
   (use sqlite backup, WAL is open), `STATUSIFY_PORT=8799`, no DISCORD_APP_ID, and
   drive it with a fake bridge (websockets client sending track_change/position/lyrics).
