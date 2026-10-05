@@ -29,7 +29,14 @@ Version 3 is a rewrite in Rust and [Tauri](https://tauri.app). It replaces the P
 
 **Your real logo everywhere.** The Statusify icon now shows on the taskbar, in the title bar and in the tray, not a placeholder.
 
-**A faster, steadier Spotify to Discord bridge.** {{BRIDGE_NUMBERS}}
+**A faster, steadier Spotify to Discord bridge.** The chain from Statusify hearing about a change to the update reaching Discord was timed on the development PC, with a stand-in for Spotify and one for Discord's pipe, so Discord's own delay is not in these numbers. They compare against the first build of version 3; the Python app was not measured. Median times unless noted:
+
+- **Changes in Statusify itself, nothing else needed.** The first status update after a song change arrives 0.45 s later when the lyrics were fetched ahead (it was 1.57 s) and 0.87 s later when they arrive 0.8 s after the change (it was 1.59 s). When the lyrics are not known or arrive late, the first update still takes about 1.6 s, as before. Resuming after a pause longer than 1.5 s puts the status back in 0.38 s (it was 1.57 s). Scrubbing the seek bar (10 seeks in 2.5 s) sends 2 updates instead of 5 and shows the right lyric 0.6 s after the last seek, where it took 15.7 s. After Discord's pipe closes for 0.3 s the status is back in 1.2 s (it was 6.6 s), and a program that holds a connection to Statusify's port without speaking no longer blocks Spotify's bridge.
+- **Discord's limit holds under abuse.** Discord accepts 5 updates per 20 s. Statusify now counts every one of them, clearing the status included, and keeps the count across Discord reconnects. In one-minute tests of mashing pause and resume (every 0.3 to 3 s), of a Discord that hangs up right after connecting and of a Spotify connection that drops every 0.3 to 6 s, it never sent more than 5 in any 20 s; in the pause and resume tests the status was also never blank while music played. A pause or a dropped connection shorter than 1.5 s now leaves your status alone instead of clearing it and putting it back.
+- **It costs something.** A pause now takes the status down after about 1.5 s instead of at once, because a quick pause and resume should not spend updates. On songs with a lyric line every 4 s or faster, which use up all of Discord's updates, it takes 5 to 8 s (about 15 s at worst) until a slot is free.
+- **These parts need the updated Spicetify bridge, `lyrics-bridge.js` 2.2.x.** Statusify offers it, and Settings, under Spotify lyrics, has Set up… to apply it; that restarts Spotify once. With it, a song change, pause or resume reaches Statusify in about 1 ms instead of about 250 ms (95 % of them within 10 ms instead of 460 ms). A song change with lyrics ready reaches Discord in 0.46 s instead of 1.85 s, counted from Spotify's own event. When Spotify's lyrics request hangs, it is given up after 5 s instead of about a minute. The old bridge keeps working but gets none of these three, and how the first two bullets behave alongside the old bridge was not measured.
+
+The measurements and how to repeat them are in `tests/bench` in the repository.
 
 **A real installer.** `Statusify-Setup.exe` installs for your user only, with no administrator prompt. Every release also lists a SHA-256 checksum for it.
 
@@ -115,7 +122,7 @@ The installer is for you alone and asks for no administrator rights.
 **1. Create your Discord application.** Statusify shows your music through an application of your own, and there's no shared one to borrow.
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**.
 2. Give it the name you want your status to carry, for example **Spotify**.
-3. Open **General Information**, copy the **Application ID** and paste it into Statusify's *Welcome* dialog (**Save and continue**). It connects at once; no restart is needed. If you press *Later*, you can add it any time under **Settings → Discord → App profiles**: choose **Add…**, select the new profile and press **Switch to selected**.
+3. Open **General Information**, copy the **Application ID** and paste it into Statusify's *Welcome* dialog (**Save and continue**). It connects at once; no restart is needed. If you press *Later*, you can add it any time under **Settings → Discord → Application ID** (press **Add…**); while none is saved, the pill under the song title says *No App ID*.
 
 <div align="center">
   <img src="docs/first-run.png" alt="The Welcome to Statusify dialog: paste your Discord Application ID, with a link to the Developer Portal" width="300" />
@@ -183,7 +190,7 @@ The Microsoft WebView2 engine keeps its own browser cache separately, under `%LO
 
 ## 🩺 Troubleshooting
 
-**Nothing shows on Discord.** Check, in order:
+**Nothing shows on Discord.** The pill under the song title on the Lyrics page is green (*On Discord*) only while Statusify is connected to Discord; otherwise it says *No App ID* or *Discord not connected*, and hovering it gives the reason. Check, in order:
 1. The Discord *desktop* app is running. Statusify talks to it over a local pipe, which Discord in a browser doesn't have.
 2. **Settings → Discord → Connection → Test** sends a test status. If it fails, press **Reconnect**.
 3. The line under the lyrics says no Discord Application ID has been added yet: add yours (see [First run](#first-run)).
@@ -222,7 +229,7 @@ Version 3 reads the files the Python app (2.x) wrote. They are the *same files w
 
 **To leave the data where it is** instead of copying it, set `STATUSIFY_DATA_DIR` to the old folder (`setx STATUSIFY_DATA_DIR "C:\path\to\old\folder"`, then start Statusify again). Statusify also uses data it finds next to its own exe, so a copy of the exe placed in that folder works too. Remember that uninstalling the old version removes its settings files.
 
-If you used *Launch when Windows starts* in the Python app, turning it on in version 3 replaces the old Startup shortcut, so the two never fight over the port.
+*Launch when Windows starts* is a separate switch in each app: version 3 keeps its own entry and never touches the Python app's Startup shortcut (and the Python app never touches version 3's). If both are on, both start when you sign in and race for port 8765. Settings then shows *The old Statusify also starts with Windows* with a **Turn off the old one** button, which deletes that Startup shortcut, and only when you press it.
 
 Keep a copy of your old files until you're happy with version 3. It writes the same formats, so the Python app should still be able to read them, but nobody has tested that direction.
 
@@ -278,6 +285,7 @@ A plain `cargo build` makes a development-mode exe that does **not** embed the f
 
 1. Bump the version everywhere: `package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock` and `src-tauri/tauri.conf.json`. Update the README's header, its badge and its *What's New* section (it holds only the latest release's notes).
 2. `node scripts/check-version-sync.mjs --strict` confirms they all agree.
+To build the installer by hand, `powershell -ExecutionPolicy Bypass -File scripts\package.ps1 -Strict` does the version check, `npm ci`, the frontend and `tauri build --bundles nsis`, and writes `release-assets\` with `Statusify-Setup.exe`, the versioned copy and `SHA256SUMS.txt` (see `docs/RELEASING.md`).
 3. Push a tag, `git tag v3.0.0 && git push origin v3.0.0`. The *Release* workflow builds the installer, publishes `Statusify-Setup.exe`, the versioned `Statusify_3.0.0_x64-setup.exe` and `SHA256SUMS.txt`, and uses the README's *What's New* section as the release notes. It stops with an error if that section is missing, empty, unfinished or contains relative links, or if the tag and the version disagree.
 
 ---
