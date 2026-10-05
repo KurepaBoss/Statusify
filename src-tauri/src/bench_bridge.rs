@@ -482,7 +482,9 @@ async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result<Value
 }
 
 impl FakeDiscord {
-    fn spawn(prefix: String, start_open: bool) -> FakeDiscord {
+    /// `hangup`: close the pipe this long after every READY (a Discord that
+    /// hangs up right after the handshake, over and over).
+    fn spawn(prefix: String, start_open: bool, hangup: Option<Duration>) -> FakeDiscord {
         let frames = Arc::new(Mutex::new(Vec::new()));
         let ready_at = Arc::new(Mutex::new(Vec::new()));
         let (ctl, mut rx) = mpsc::unbounded_channel::<DCmd>();
@@ -526,8 +528,11 @@ impl FakeDiscord {
                     continue;
                 }
                 r.lock().unwrap().push(Instant::now());
+                let hang = tokio::time::sleep(hangup.unwrap_or(Duration::from_secs(86_400)));
+                tokio::pin!(hang);
                 loop {
                     tokio::select! {
+                        _ = &mut hang, if hangup.is_some() => break,
                         fr = read_frame(&mut rd) => match fr {
                             Ok(v) => {
                                 if v["cmd"] == "SET_ACTIVITY" {
@@ -562,11 +567,13 @@ pub struct Opts {
     serialize: bool,
     discord_open: bool,
     start_bridge_client: bool,
+    /// The fake Discord hangs up this long after every READY.
+    discord_hangup_ms: Option<u64>,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { bridge: BridgeOpts::default(), store: true, serialize: false, discord_open: true, start_bridge_client: true }
+        Opts { bridge: BridgeOpts::default(), store: true, serialize: false, discord_open: true, start_bridge_client: true, discord_hangup_ms: None }
     }
 }
 
@@ -641,7 +648,7 @@ impl Pipeline {
 
         // Discord: a private pipe, a private Link, exactly lib.rs::start_discord's wiring.
         let prefix = format!(r"\\.\pipe\statusify-bench-{tag}-");
-        let discord = FakeDiscord::spawn(prefix.clone(), o.discord_open);
+        let discord = FakeDiscord::spawn(prefix.clone(), o.discord_open, o.discord_hangup_ms.map(Duration::from_millis));
         let link: &'static discord::Link = Box::leak(Box::new(discord::Link::new(discord::RETRY, discord::PIPE_TIMEOUT)));
         let (tx, rx) = mpsc::unbounded_channel();
         let e = engine.clone();
@@ -1159,7 +1166,11 @@ fn bench_e_bridge_drop() {
                     "drop_to_presence_back_ms": frame.map(|f| r1(ms(f.duration_since(t)))),
                     "presence_blank_for_ms": blank,
                     "first_frame_back_carried_a_lyric": lyric_back,
+                    // (every frame in the window, the song's own line changes included)
                     "frames_spent_by_the_blip": p.discord.count() - n0,
+                    // null drop_to_presence_cleared_ms with 0 clears: the blip was shorter than
+                    // presence::PAUSE_HOLD and the profile was left alone
+                    "clears_sent_by_the_blip": p.frames_since(t).iter().filter(|f| f.1.is_null()).count(),
                 }),
             );
             p.stop().await;
@@ -1523,4 +1534,353 @@ fn send_line(stdin: &mut std::process::ChildStdin, line: &str) {
     stdin.write_all(line.as_bytes()).unwrap();
     stdin.write_all(b"\n").unwrap();
     stdin.flush().unwrap();
+}
+
+// ───────────────────────── flapping: pause/resume, Discord hang-ups, bridge socket ─────────────────────────
+//
+// Each scenario runs the whole pipeline in real time and audits what reached the
+// fake Discord: SET_ACTIVITY frames, clears included, in any 20 s window (the
+// limit is 5), whether the profile was ever blank while music played, and how
+// long after the last change it ended up right. A shortened copy of each runs as
+// an ordinary test; the full 60 s versions are `bench_h_*`, `bench_i_*`,
+// `bench_j_*` (tests/bench/run.sh h_pause_flapping i_discord_hangup j_bridge_flap).
+
+/// The most frames inside any 20 s window.
+fn max_in_20s(times: &[Instant]) -> usize {
+    let w = Duration::from_secs(20);
+    (0..times.len()).map(|i| times[i..].iter().take_while(|t| t.duration_since(times[i]) < w).count()).max().unwrap_or(0)
+}
+
+/// The shortest time in which 6 consecutive frames arrived, ms: 20 000 or more
+/// means the limit held; how much more says how close to it the run went.
+fn tightest_six_ms(times: &[Instant]) -> Option<f64> {
+    (0..times.len().saturating_sub(5)).map(|i| times[i + 5].duration_since(times[i]).as_secs_f64() * 1000.0).min_by(f64::total_cmp).map(r1)
+}
+
+/// (arrival, is_clear) of every SET_ACTIVITY the fake Discord has received.
+fn frame_log(p: &Pipeline) -> Vec<(Instant, bool)> {
+    p.discord.frames.lock().unwrap().iter().map(|f| (f.at, f.is_clear())).collect()
+}
+
+impl Pipeline {
+    /// Is the profile right for what Spotify is doing now? Playing: a frame (not a
+    /// clear) whose progress bar is within 2 s of the truth. Paused: cleared.
+    fn profile_right(&self, playing: bool) -> Option<()> {
+        let g = self.discord.frames.lock().unwrap();
+        let last = g.last()?;
+        if !playing {
+            return last.is_clear().then_some(());
+        }
+        if last.is_clear() {
+            return None;
+        }
+        let truth = crate::state::now_ms() - self.spotify.lock().unwrap().pos(Instant::now()) as i64;
+        ((last.start_ms()? - truth).abs() <= 2000).then_some(())
+    }
+}
+
+/// Time spent playing, more than `margin` after the last resume, with nothing
+/// on the profile (`timeline`: when Spotify started or stopped playing).
+fn blank_while_playing_ms(timeline: &[(Instant, bool)], frames: &[(Instant, bool)], from: Instant, to: Instant, margin: Duration) -> f64 {
+    let (mut t, mut blank) = (from, 0.0);
+    while t < to {
+        let playing = timeline.iter().rev().find(|(x, _)| *x <= t).map_or(true, |(_, p)| *p);
+        let resumed = timeline.iter().rev().find(|(x, p)| *x <= t && *p).map_or(from, |(x, _)| *x);
+        let up = frames.iter().rev().find(|(x, _)| *x <= t).is_some_and(|(_, clear)| !clear);
+        if playing && !up && t.duration_since(resumed) > margin {
+            blank += 10.0;
+        }
+        t += Duration::from_millis(10);
+    }
+    blank
+}
+
+#[derive(Debug)]
+struct FlapOutcome {
+    cadence_ms: u64,
+    end_playing: bool,
+    toggles: usize,
+    frames: usize,
+    clears: usize,
+    max_in_20s: usize,
+    tightest_six_ms: Option<f64>,
+    blank_playing_ms: f64,
+    right_after_ms: Option<f64>,
+}
+
+impl FlapOutcome {
+    fn json(&self) -> Value {
+        json!({"cadence_ms": self.cadence_ms, "ends": if self.end_playing { "playing" } else { "paused" }, "toggles": self.toggles,
+               "frames_total": self.frames, "frames_clear": self.clears, "max_frames_in_any_20s": self.max_in_20s,
+               "tightest_6_frames_ms": self.tightest_six_ms, "blank_while_playing_ms": self.blank_playing_ms, "profile_right_after_last_change_ms": self.right_after_ms})
+    }
+}
+
+/// Toggle pause/resume every `cadence_ms` for `flap_ms` on a playing song, end
+/// `end_playing`, and watch the profile until it is right (at most 30 s).
+async fn run_pause_flap(cadence_ms: u64, flap_ms: u64, end_playing: bool) -> FlapOutcome {
+    let p = Pipeline::start(track_with(1, Some(Sheet::evenly(150, 4000, 0))), LyricsPlan::After(100), Opts::default()).await;
+    p.wait_first_frame().await;
+    sleep(3000).await;
+    let t0 = Instant::now();
+    let mut timeline = vec![(t0, true)];
+    let mut playing = true;
+    let toggle = |playing: &mut bool, timeline: &mut Vec<(Instant, bool)>| {
+        *playing = !*playing;
+        if *playing {
+            p.resume();
+        } else {
+            p.pause();
+        }
+        timeline.push((Instant::now(), *playing));
+    };
+    let (cadence, end) = (Duration::from_millis(cadence_ms), t0 + Duration::from_millis(flap_ms));
+    let mut next = t0 + cadence;
+    while next < end {
+        tokio::time::sleep_until(next.into()).await;
+        toggle(&mut playing, &mut timeline);
+        next += cadence;
+    }
+    tokio::time::sleep_until(end.into()).await;
+    if playing != end_playing {
+        toggle(&mut playing, &mut timeline);
+    }
+    let last_change = timeline.last().unwrap().0;
+    let right = wait_for(Duration::from_secs(30), || p.profile_right(end_playing)).await;
+    let right_at = Instant::now();
+    sleep(500).await;
+    let frames = frame_log(&p);
+    let times: Vec<Instant> = frames.iter().map(|f| f.0).collect();
+    let out = FlapOutcome {
+        cadence_ms,
+        end_playing,
+        toggles: timeline.len() - 1,
+        frames: frames.len(),
+        clears: frames.iter().filter(|f| f.1).count(),
+        max_in_20s: max_in_20s(&times),
+        tightest_six_ms: tightest_six_ms(&times),
+        blank_playing_ms: blank_while_playing_ms(&timeline, &frames, t0, right_at, Duration::from_millis(1200)),
+        right_after_ms: right.map(|_| r1(ms(right_at.duration_since(last_change)))),
+    };
+    p.stop().await;
+    out
+}
+
+#[test]
+fn pause_resume_flapping_through_the_whole_pipeline_stays_inside_the_budget() {
+    mt().block_on(async {
+        let mut hs = vec![];
+        for (cadence, end_playing) in [(300u64, true), (1000, false), (1600, true), (2000, true), (2000, false)] {
+            hs.push(tokio::spawn(run_pause_flap(cadence, 9_000, end_playing)));
+        }
+        for h in hs {
+            let r = h.await.unwrap();
+            eprintln!("{r:?}");
+            assert!(r.toggles >= 3, "{r:?}");
+            assert!(r.max_in_20s <= presence::RATE_CALLS, "more than 5 frames in 20 s: {r:?}");
+            assert_eq!(r.blank_playing_ms, 0.0, "the profile was blank while music played: {r:?}");
+            assert!(r.right_after_ms.is_some_and(|x| x <= 21_500.0), "never ended right: {r:?}");
+            if r.cadence_ms < presence::PAUSE_HOLD.as_millis() as u64 {
+                // every pause is shorter than the hold; only the last one, when
+                // the run ends paused, goes on long enough to clear
+                let clears = if r.end_playing { 0 } else { 1 };
+                assert_eq!(r.clears, clears, "pauses shorter than the hold send no clear: {r:?}");
+            }
+        }
+    });
+}
+
+#[derive(Debug)]
+struct HangupOutcome {
+    hangup_ms: u64,
+    readys: usize,
+    frames: usize,
+    clears: usize,
+    max_in_20s: usize,
+    tightest_six_ms: Option<f64>,
+}
+
+/// Discord hangs up `hangup_ms` after every READY, for `run_ms`.
+async fn run_discord_hangup(hangup_ms: u64, run_ms: u64) -> HangupOutcome {
+    let o = Opts { discord_hangup_ms: Some(hangup_ms), ..Default::default() };
+    let p = Pipeline::start(track_with(1, Some(Sheet::evenly(150, 4000, 0))), LyricsPlan::After(100), o).await;
+    sleep(run_ms).await;
+    let frames = frame_log(&p);
+    let times: Vec<Instant> = frames.iter().map(|f| f.0).collect();
+    let out = HangupOutcome {
+        hangup_ms,
+        readys: p.discord.ready_at.lock().unwrap().len(),
+        frames: frames.len(),
+        clears: frames.iter().filter(|f| f.1).count(),
+        max_in_20s: max_in_20s(&times),
+        tightest_six_ms: tightest_six_ms(&times),
+    };
+    p.stop().await;
+    out
+}
+
+#[test]
+fn a_discord_that_hangs_up_after_ready_never_gets_more_than_5_frames_per_20_s() {
+    mt().block_on(async {
+        let r = run_discord_hangup(600, 14_000).await;
+        eprintln!("{r:?}");
+        assert!(r.readys >= 5, "the test needs several cycles: {r:?}");
+        assert!(r.frames >= 3, "and some frames to count: {r:?}");
+        assert!(r.max_in_20s <= presence::RATE_CALLS, "more than 5 frames in 20 s across reconnects: {r:?}");
+    });
+}
+
+#[derive(Debug)]
+struct BridgeFlapOutcome {
+    cadence_ms: u64,
+    reconnect_ms: u64,
+    drops: usize,
+    frames: usize,
+    clears: usize,
+    max_in_20s: usize,
+    tightest_six_ms: Option<f64>,
+    right_after_ms: Option<f64>,
+}
+
+/// The bridge socket drops every `cadence_ms` (when it is up) for `flap_ms`
+/// and comes back `reconnect_ms` later. Spotify plays on throughout.
+async fn run_bridge_flap(cadence_ms: u64, reconnect_ms: u64, flap_ms: u64) -> BridgeFlapOutcome {
+    let mut o = Opts::default();
+    o.bridge.reconnect_ms = reconnect_ms;
+    let p = Pipeline::start(track_with(1, Some(Sheet::evenly(150, 4000, 0))), LyricsPlan::After(100), o).await;
+    p.wait_first_frame().await;
+    sleep(3000).await;
+    let t0 = Instant::now();
+    let mut drops = 0;
+    while t0.elapsed() < Duration::from_millis(flap_ms) {
+        if p.engine.snapshot().bridge_connected {
+            let _ = p.b().cmds.send(Cmd::DropWs);
+            drops += 1;
+        }
+        sleep(cadence_ms).await;
+    }
+    let last_change = Instant::now();
+    let right = wait_for(Duration::from_secs(30), || {
+        (p.engine.snapshot().bridge_connected && p.engine.snapshot().is_playing).then(|| p.profile_right(true)).flatten()
+    })
+    .await;
+    let right_at = Instant::now();
+    sleep(500).await;
+    // The budget is counted over every frame since the start (the first frame
+    // of the track is in the window too); the other numbers are for the flapping.
+    let all = frame_log(&p);
+    let times: Vec<Instant> = all.iter().map(|f| f.0).collect();
+    let frames: Vec<(Instant, bool)> = all.into_iter().filter(|f| f.0 >= t0).collect();
+    let out = BridgeFlapOutcome {
+        cadence_ms,
+        reconnect_ms,
+        drops,
+        frames: frames.len(),
+        clears: frames.iter().filter(|f| f.1).count(),
+        max_in_20s: max_in_20s(&times),
+        tightest_six_ms: tightest_six_ms(&times),
+        right_after_ms: right.map(|_| r1(ms(right_at.duration_since(last_change)))),
+    };
+    p.stop().await;
+    out
+}
+
+#[test]
+fn a_flapping_bridge_socket_never_gets_more_than_5_frames_per_20_s() {
+    mt().block_on(async {
+        let mut hs = vec![];
+        // blips (the app sees a pause of ~0.3 s), and a socket that stays away
+        // for 2 s: longer than the hold, so every drop costs a clear and a
+        // republish unless the budget says wait. 22 s fills the window.
+        for (cadence, reconnect, flap) in [(500u64, 250u64, 9_000u64), (1000, 250, 9_000), (2500, 2000, 22_000)] {
+            hs.push(tokio::spawn(run_bridge_flap(cadence, reconnect, flap)));
+        }
+        for h in hs {
+            let r = h.await.unwrap();
+            eprintln!("{r:?}");
+            assert!(r.drops >= 4, "{r:?}");
+            assert!(r.max_in_20s <= presence::RATE_CALLS, "more than 5 frames in 20 s: {r:?}");
+            if r.reconnect_ms <= 500 {
+                assert_eq!(r.clears, 0, "a blip of 250 ms is under the hold and sends no clear: {r:?}");
+            }
+            assert!(r.right_after_ms.is_some_and(|x| x <= 21_500.0), "never ended right: {r:?}");
+        }
+    });
+}
+
+/// (h) pause/resume flapping at several cadences for a minute, ending
+/// playing and ending paused. 12 pipelines in parallel, ~100 s.
+#[test]
+#[ignore = "benchmark"]
+fn bench_h_pause_flapping() {
+    mt().block_on(async {
+        let load = LoadProbe::start();
+        let mut hs = vec![];
+        for cadence in [300u64, 500, 1000, 1600, 2000, 3000] {
+            for end_playing in [true, false] {
+                hs.push(tokio::spawn(run_pause_flap(cadence, 60_000, end_playing)));
+            }
+        }
+        let mut outcomes = vec![];
+        for h in hs {
+            outcomes.push(h.await.unwrap());
+        }
+        let out: Vec<Value> = outcomes.iter().map(FlapOutcome::json).collect();
+        report(
+            "h_pause_flapping_60s",
+            json!({"runs": out, "constants_ms": {"pause_hold": presence::PAUSE_HOLD.as_millis(), "resume_settle": presence::RESUME_SETTLE.as_millis(), "bar_tolerance": presence::BAR_TOLERANCE.as_millis(), "bar_settle": presence::BAR_SETTLE.as_millis(), "pause_reserve_slots": presence::PAUSE_RESERVE},
+                   "machine_cpu_pct_during": load.pct()}),
+        );
+        // (the numbers are in the file first; a run that breaks the rules fails here)
+        for r in &outcomes {
+            assert!(r.max_in_20s <= presence::RATE_CALLS, "more than 5 frames in 20 s: {r:?}");
+            assert_eq!(r.blank_playing_ms, 0.0, "the profile was blank while music played: {r:?}");
+            assert!(r.right_after_ms.is_some_and(|x| x <= 21_500.0), "never ended right: {r:?}");
+        }
+    });
+}
+
+/// (i) Discord hangs up at various times after READY, for a minute.
+#[test]
+#[ignore = "benchmark"]
+fn bench_i_discord_hangup() {
+    mt().block_on(async {
+        let load = LoadProbe::start();
+        let mut hs = vec![];
+        for hangup in [150u64, 450, 600, 1000, 2000] {
+            hs.push(tokio::spawn(run_discord_hangup(hangup, 60_000)));
+        }
+        let (mut out, mut worst) = (vec![], 0);
+        for h in hs {
+            let r = h.await.unwrap();
+            worst = worst.max(r.max_in_20s);
+            out.push(json!({"hangup_after_ready_ms": r.hangup_ms, "ready_count": r.readys, "frames_total": r.frames, "frames_clear": r.clears, "max_frames_in_any_20s": r.max_in_20s, "tightest_6_frames_ms": r.tightest_six_ms}));
+        }
+        report("i_discord_hangup_after_ready_60s", json!({"runs": out, "machine_cpu_pct_during": load.pct()}));
+        assert!(worst <= presence::RATE_CALLS, "more than 5 frames in 20 s across reconnects: {worst}");
+    });
+}
+
+/// (j) the bridge socket drops over and over for a minute.
+#[test]
+#[ignore = "benchmark"]
+fn bench_j_bridge_flap() {
+    mt().block_on(async {
+        let load = LoadProbe::start();
+        let mut hs = vec![];
+        for (cadence, reconnect) in [(300u64, 250u64), (500, 250), (1000, 250), (2000, 250), (4000, 2000), (6000, 3000)] {
+            hs.push(tokio::spawn(run_bridge_flap(cadence, reconnect, 60_000)));
+        }
+        let (mut out, mut bad) = (vec![], vec![]);
+        for h in hs {
+            let r = h.await.unwrap();
+            if r.max_in_20s > presence::RATE_CALLS || !r.right_after_ms.is_some_and(|x| x <= 21_500.0) {
+                bad.push(format!("{r:?}"));
+            }
+            out.push(json!({"drop_every_ms": r.cadence_ms, "reconnect_after_ms": r.reconnect_ms, "drops": r.drops, "frames_total": r.frames, "frames_clear": r.clears,
+                            "max_frames_in_any_20s": r.max_in_20s, "tightest_6_frames_ms": r.tightest_six_ms, "profile_right_after_last_drop_ms": r.right_after_ms}));
+        }
+        report("j_bridge_socket_flapping_60s", json!({"runs": out, "machine_cpu_pct_during": load.pct()}));
+        assert!(bad.is_empty(), "more than 5 frames in 20 s, or never ended right: {bad:?}");
+    });
 }

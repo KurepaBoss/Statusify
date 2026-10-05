@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Benchmark runner for the Spotify -> bridge -> engine -> presence -> Discord pipeline.
 #
-#   tests/bench/run.sh                 # every benchmark, in order (about 12 minutes)
+#   tests/bench/run.sh                 # every benchmark, in order (about 18 minutes)
 #   tests/bench/run.sh a_track_change  # one benchmark (name after "bench_")
 #   BENCH_BRIDGE_JS=/path/to/other-bridge.js tests/bench/run.sh js_e2e   # measure another bridge
 #
@@ -38,7 +38,7 @@ mkdir -p "$(dirname "$out")"
 export STATUSIFY_BENCH_OUT="$out"
 
 if [ "$#" -gt 0 ]; then benches=("$@"); else
-  benches=(f_unit_costs a_track_change c_pause_resume_seek d_discord_reconnect e_bridge_drop b_line_jitter_and_waste f_idle_cpu js_e2e js_lyrics_hang)
+  benches=(f_unit_costs a_track_change c_pause_resume_seek d_discord_reconnect e_bridge_drop b_line_jitter_and_waste f_idle_cpu js_e2e js_lyrics_hang h_pause_flapping i_discord_hangup j_bridge_flap)
 fi
 
 cd "$here/src-tauri"
