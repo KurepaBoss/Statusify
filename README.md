@@ -25,22 +25,20 @@ Version 3 is a rewrite in Rust and [Tauri](https://tauri.app). It replaces the P
 
 ## 🆕 What's New in v3.0.0
 
-**Rewritten in Rust and Tauri.** The Python app is gone. The window now runs on the system's WebView2 with GPU-composited animation instead of a canvas redrawn in software, so the interface is much faster and the whole app is roughly 10-12 MB.
-
-**Your real logo everywhere.** The Statusify icon now shows on the taskbar, in the title bar and in the tray, not a placeholder.
+**Rewritten in Rust and Tauri.** The Python app is retired and stays on the [python-legacy branch](https://github.com/KurepaBoss/Statusify/tree/python-legacy). The window now runs on the system's WebView2 with GPU-composited animation instead of a canvas redrawn in software, so the interface is much faster and the whole app is roughly 10-12 MB.
 
 **A faster, steadier Spotify to Discord bridge.** The chain from Statusify hearing about a change to the update reaching Discord was timed on the development PC, with a stand-in for Spotify and one for Discord's pipe, so Discord's own delay is not in these numbers. They compare against the first build of version 3; the Python app was not measured. Median times unless noted:
 
 - **Changes in Statusify itself, nothing else needed.** The first status update after a song change arrives 0.45 s later when the lyrics were fetched ahead (it was 1.57 s) and 0.87 s later when they arrive 0.8 s after the change (it was 1.59 s). When the lyrics are not known or arrive late, the first update still takes about 1.6 s, as before. Resuming after a pause longer than 1.5 s puts the status back in 0.38 s (it was 1.57 s). Scrubbing the seek bar (10 seeks in 2.5 s) sends 2 updates instead of 5 and shows the right lyric 0.6 s after the last seek, where it took 15.7 s. After Discord's pipe closes for 0.3 s the status is back in 1.2 s (it was 6.6 s), and a program that holds a connection to Statusify's port without speaking no longer blocks Spotify's bridge.
 - **Discord's limit holds under abuse.** Discord accepts 5 updates per 20 s. Statusify now counts every one of them, clearing the status included, and keeps the count across Discord reconnects. In one-minute tests of mashing pause and resume (every 0.3 to 3 s), of a Discord that hangs up right after connecting and of a Spotify connection that drops every 0.3 to 6 s, it never sent more than 5 in any 20 s; in the pause and resume tests the status was also never blank while music played. A pause or a dropped connection shorter than 1.5 s now leaves your status alone instead of clearing it and putting it back.
-- **It costs something.** A pause now takes the status down after about 1.5 s instead of at once, because a quick pause and resume should not spend updates. On songs with a lyric line every 4 s or faster, which use up all of Discord's updates, it takes 5 to 8 s (about 15 s at worst) until a slot is free.
+- **It costs something.** A pause now takes the status down after about 1.6 s instead of at once, because a quick pause and resume should not spend updates. On songs with a lyric line every 4 s or faster, which is most songs with vocals and uses up all of Discord's updates, it takes 5 to 8 s (about 15 s at worst) until a slot is free. Turning the status off (`Ctrl+Alt+S`, or the Discord pill on the Lyrics page) and clearing it when a blacklisted song starts now wait for a free update as well. That costs nothing when a slot is free; if all five were just used, as on a fast song, the old status can stay up on Discord for up to about 20 s.
 - **These parts need the updated Spicetify bridge, `lyrics-bridge.js` 2.2.x.** Statusify offers it, and Settings, under Spotify lyrics, has Set up… to apply it; that restarts Spotify once. With it, a song change, pause or resume reaches Statusify in about 1 ms instead of about 250 ms (95 % of them within 10 ms instead of 460 ms). A song change with lyrics ready reaches Discord in 0.46 s instead of 1.85 s, counted from Spotify's own event. When Spotify's lyrics request hangs, it is given up after 5 s instead of about a minute. The old bridge keeps working but gets none of these three, and how the first two bullets behave alongside the old bridge was not measured.
 
 The measurements and how to repeat them are in `tests/bench` in the repository.
 
 **A real installer.** `Statusify-Setup.exe` installs for your user only, with no administrator prompt. Every release also lists a SHA-256 checksum for it.
 
-**Python version 2.x is kept.** It lives on the [python-legacy branch](https://github.com/KurepaBoss/Statusify/tree/python-legacy), and its releases and tags (v1.x and v2.x) stay on the [Releases page](https://github.com/KurepaBoss/Statusify/releases). Your history, settings and lyric cache carry over to version 3; see [Migrating from the Python version](https://github.com/KurepaBoss/Statusify#-migrating-from-the-python-version).
+**Python version 2.x is kept.** It lives on the [python-legacy branch](https://github.com/KurepaBoss/Statusify/tree/python-legacy), and its releases and tags (v1.x and v2.x) stay on the [Releases page](https://github.com/KurepaBoss/Statusify/releases). Your history, settings and lyric cache can come with you. Nothing is moved automatically: copy four files before you uninstall the old version (see [Migrating from the Python version](https://github.com/KurepaBoss/Statusify#-migrating-from-the-python-version)).
 
 Notes for v2.2.0 and earlier are on the [Releases page](https://github.com/KurepaBoss/Statusify/releases).
 
@@ -63,8 +61,8 @@ Notes for v2.2.0 and earlier are on the [Releases page](https://github.com/Kurep
 - 🔎 **Wrong lyrics? Search…** finds another version on LRCLIB and pins it to the song; *Use Spotify's lyrics again* undoes it.
 - 🌍 **Romanised or translated lines** under each lyric. Hangul, Cyrillic and Greek are romanised offline; other scripts and all translations use Google Translate (see [Privacy](#-privacy)).
 - 🖼️ **Share a line as an image.** Save it as a PNG, or copy it to the clipboard.
-- 📂 **History.** Every play saved after 20 seconds of listening, grouped by day with each session's listening time, badges for synced and plain lyrics, and search across titles, artists and the lyrics themselves. A song's lyrics open as a sheet you can copy or export as a timestamped `.lrc` or plain `.txt`.
-- 📊 **Stats.** Songs and listening time this session, top artists over seven days and all time, a 26-week plays-per-day heatmap, top songs, recently played, and a monthly **Wrapped** card you can copy or save as an image.
+- 📂 **History.** Every play saved after 20 seconds of listening, grouped by day (each day headed by its number of listening sessions and the day's total time), badges for synced and plain lyrics, and search across titles, artists and the lyrics themselves. A song's lyrics open as a sheet you can copy or export as a timestamped `.lrc` or plain `.txt`.
+- 📊 **Stats.** Songs and listening time this session, top artists over seven days and all time, a plays-per-day heatmap (4 to 53 weeks, as many as fit the window's width), top songs, recently played, and a monthly **Wrapped** card you can copy or save as an image.
 - 💊 **Mini player.** A compact pill with cover, current lyric and controls that snaps to screen edges.
 - 🪟 **Desktop overlay.** The current lyric, and optionally the next one, floating over other windows and borderless games. Clicks pass through it while it's locked; unlock it to drag it where you want.
 - 🔔 **System tray.** Left-click opens Statusify, middle-click plays or pauses, the menu has the usual controls, and the tooltip shows the song and the current lyric.
@@ -85,7 +83,7 @@ Notes for v2.2.0 and earlier are on the [Releases page](https://github.com/Kurep
   <tr>
     <td align="center"><img src="docs/wrapped.png" alt="The activity heatmap and the monthly Wrapped card" /><br><sub>Activity and Wrapped</sub></td>
     <td align="center"><img src="docs/settings.png" alt="Settings: lyric offset, LRCLIB fallback and the desktop overlay options" /><br><sub>Settings</sub></td>
-    <td align="center"><img src="docs/first-run.png" alt="The Welcome dialog asking for a Discord Application ID" /><br><sub>First run</sub></td>
+    <td align="center"><img src="docs/first-run.png" alt="The Welcome dialog: three steps for creating a Discord application and a field for its Application ID, with the No App ID pill at the top right" /><br><sub>First run</sub></td>
   </tr>
 </table>
 <p align="center">
@@ -122,10 +120,10 @@ The installer is for you alone and asks for no administrator rights.
 **1. Create your Discord application.** Statusify shows your music through an application of your own, and there's no shared one to borrow.
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**.
 2. Give it the name you want your status to carry, for example **Spotify**.
-3. Open **General Information**, copy the **Application ID** and paste it into Statusify's *Welcome* dialog (**Save and continue**). It connects at once; no restart is needed. If you press *Later*, you can add it any time under **Settings → Discord → Application ID** (press **Add…**); while none is saved, the pill under the song title says *No App ID*.
+3. Open **General Information**, copy the **Application ID** and paste it into Statusify's *Welcome* dialog (**Save and continue**). It connects at once; no restart is needed. If you press *Later*, you can add it any time under **Settings → Discord → Application ID** (press **Add…**); while none is saved, the pill beside the song title (top right) says *No App ID*.
 
 <div align="center">
-  <img src="docs/first-run.png" alt="The Welcome to Statusify dialog: paste your Discord Application ID, with a link to the Developer Portal" width="300" />
+  <img src="docs/first-run.png" alt="The Welcome to Statusify dialog: the three Developer Portal steps, a field for the Application ID, and the Later and Save and continue buttons" width="300" />
 </div>
 
 *Why that name?* Discord labels a Rich Presence activity with the name of the application that sent it, so a *Listening* activity reads **Listening to &lt;your application's name&gt;**. With **Song in the member list** on (the default) Statusify also asks Discord to show the song under your name in the member list instead of the application's name.
@@ -150,7 +148,7 @@ spicetify backup apply
 
 ### Updating
 
-**Settings → Updates → Check now** says whether a newer version exists and shows what's new in it. Statusify also checks quietly in the background. To update, download the newer `Statusify-Setup.exe` from the [Releases page](https://github.com/KurepaBoss/Statusify/releases) and run it; a copy installed with `Statusify-Setup.exe` can also fetch the installer itself, check it against the published SHA-256 and run it. Your data lives outside the install folder, so it stays.
+**Settings → Updates → Check now** says whether a newer version exists and shows what's new in it. Statusify also checks in the background, every few hours at most; when it finds a newer version it opens the same dialog by itself, once for each version (*Later* closes it, and that version then shows only in Settings). To update, download the newer `Statusify-Setup.exe` from the [Releases page](https://github.com/KurepaBoss/Statusify/releases) and run it; a copy installed with `Statusify-Setup.exe` can also fetch the installer itself, check it against the published SHA-256 and run it. Your data lives outside the install folder, so it stays.
 
 ---
 
@@ -190,7 +188,7 @@ The Microsoft WebView2 engine keeps its own browser cache separately, under `%LO
 
 ## 🩺 Troubleshooting
 
-**Nothing shows on Discord.** The pill under the song title on the Lyrics page is green (*On Discord*) only while Statusify is connected to Discord; otherwise it says *No App ID* or *Discord not connected*, and hovering it gives the reason. Check, in order:
+**Nothing shows on Discord.** The pill beside the song title on the Lyrics page is green (*On Discord*) only while Statusify is connected to Discord; otherwise it says *No App ID* or *Discord not connected*, and hovering it gives the reason. Check, in order:
 1. The Discord *desktop* app is running. Statusify talks to it over a local pipe, which Discord in a browser doesn't have.
 2. **Settings → Discord → Connection → Test** sends a test status. If it fails, press **Reconnect**.
 3. The line under the lyrics says no Discord Application ID has been added yet: add yours (see [First run](#first-run)).
@@ -224,7 +222,7 @@ Version 3 reads the files the Python app (2.x) wrote. They are the *same files w
 **What to do**
 1. **Quit the Python Statusify** (tray icon → Quit). Both apps want port 8765 and the same Discord pipe, so don't run them together.
 2. **Copy your data first.** The Python app lives in `%LOCALAPPDATA%\Programs\Statusify` if you used its installer, or in the folder you ran it from. Copy `statusify.cfg`, `.env`, `history.db` and `translations.db` (with any `history.db-wal` and `history.db-shm` beside them) into `%APPDATA%\Statusify`. **Do this before step 3**: the old uninstaller deletes `statusify.cfg` and `.env`.
-3. **Uninstall the Python version, then install version 3.** Order matters. The old uninstaller also removes the lyrics bridge from Spicetify, and version 3's bridge has the same file name (`lyrics-bridge.js`), so uninstalling afterwards switches the new one off. If you've done it in the wrong order, run the bridge setup again, or `spicetify config extensions lyrics-bridge.js` followed by `spicetify apply`.
+3. **Uninstall the Python version, then install version 3**, and only after step 2: the old uninstaller deletes your settings. The order matters for the bridge, too. The old uninstaller also removes the lyrics bridge from Spicetify, and version 3's bridge has the same file name (`lyrics-bridge.js`), so uninstalling afterwards switches the new one off. If you've done it in the wrong order, run the bridge setup again, or `spicetify config extensions lyrics-bridge.js` followed by `spicetify apply`. On the installer's last page, *Create desktop shortcut* is ticked by default and replaces any shortcut named *Statusify* that is already on your Desktop (the old app's, if you kept it); untick it to keep that one.
 4. Start Statusify. Your history, stats, offsets, blacklist and Discord profiles are all there.
 
 **To leave the data where it is** instead of copying it, set `STATUSIFY_DATA_DIR` to the old folder (`setx STATUSIFY_DATA_DIR "C:\path\to\old\folder"`, then start Statusify again). Statusify also uses data it finds next to its own exe, so a copy of the exe placed in that folder works too. Remember that uninstalling the old version removes its settings files.
@@ -256,9 +254,12 @@ Everything Statusify records stays on your PC: your history, your lyrics cache, 
 | Spicy Lyrics API | `api.spicylyrics.org` | The song's Spotify ID and **your Spotify web-player access token**, which is how that service authenticates its requests |
 | Spotify's own lyrics | `spclient.wg.spotify.com`, through Spotify's own client | What Spotify's own lyrics view sends |
 
-**Setting up Spicetify**, only if it isn't installed yet: the setup script reads `api.github.com/repos/spicetify/cli/releases/latest` and downloads the Spicetify release it names from GitHub. The installer may fetch the Microsoft Edge WebView2 Runtime from Microsoft on a PC that lacks it.
+**Setting up Spicetify**, only if it isn't installed yet: the setup script reads `api.github.com/repos/spicetify/cli/releases/latest` and downloads the Spicetify release it names from GitHub. That is always the latest release: Statusify pins no version and checks no checksum for it (Spicetify's own installer works the same way). The script also adds Spicetify's folder, `%LOCALAPPDATA%\spicetify`, to your user `PATH`. The installer may fetch the Microsoft Edge WebView2 Runtime from Microsoft on a PC that lacks it.
 
 The WebView2 engine that draws the window is Microsoft's own component, with its own network behaviour (it keeps itself updated, for one). Statusify doesn't control that.
+
+**Security notes**
+- The bridge's WebSocket listens on `127.0.0.1:8765` only, so nothing outside your PC can reach it. It does not check who connects, though: any program on your PC (in principle, also a web page open in your browser) can connect, pose as the bridge, feed Statusify made-up songs and lyrics that then show on your Discord status, and have it download a cover image from an address of its choosing. Tightening this (an origin check, and limits on where cover art may come from) is planned for a later release.
 
 ---
 

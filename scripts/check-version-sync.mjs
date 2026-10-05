@@ -16,7 +16,7 @@
 //
 // A README that has none of those is only a note by default (so the check can
 // run before the README is written); --strict, which a release should use,
-// makes a missing badge an error. Port of Statusify-1.2.0's
+// makes a missing badge an error. Port of the Python app's
 // scripts_check_version_sync.py.
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";

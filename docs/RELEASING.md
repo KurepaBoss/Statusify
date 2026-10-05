@@ -43,11 +43,26 @@ Attach all three to the GitHub release (tag `vX.Y.Z`, body = the README's
 Use `-TargetDir <dir>` to keep cargo's output out of `src-tauri\target` (for example
 while another copy of the app is running from there).
 
+## The Release workflow
+
+`.github/workflows/release.yml` runs when a `v*` tag is pushed. It checks the
+versions and the README notes first, then runs the same tests as the Tests
+workflow, builds the installer, and creates the GitHub release. Both workflows
+use one Rust build cache key (`shared-key`), so the release build can start from
+the cache a Tests run saved.
+
+Started by hand (Actions tab, *Release*, *Run workflow*) it does everything except
+create the release, and leaves the installer, `SHA256SUMS.txt` and the notes as the
+workflow artifact `Statusify-release`. Do that once before the first tag, and after
+changing the build, to see that it still packages. The first run has a cold cache
+and compiles everything with LTO, so allow most of the 90-minute limit.
+
 ## What the installer does
 
 - Per-user install (`installMode: currentUser`): no administrator prompt, into
-  `%LOCALAPPDATA%\Statusify`. A Start-menu shortcut, and the installer's finish
-  page offers the rest.
+  `%LOCALAPPDATA%\Statusify`. A Start-menu shortcut; the finish page offers to
+  start the app and to create a desktop shortcut (ticked by default; it replaces
+  an existing `Statusify` shortcut on the Desktop, such as the old Python app's).
 - Installs the WebView2 runtime through Microsoft's bootstrapper when it is missing.
 - English only; publisher `KurepaBoss`; the Statusify icon on the installer, the
   uninstaller and the exe.
@@ -98,6 +113,7 @@ nothing until GitHub's reset time after a rate-limit response.
 
 "Install update" works when the app was installed by the installer and the release
 carries `Statusify_<version>_x64-setup.exe` plus `SHA256SUMS.txt`: it downloads the
-installer, checks its SHA-256 against the checksum list, runs it with `/S /R`
-(silent, restart the app) and quits. In any other case (portable copy, missing
+installer, checks its SHA-256 against the checksum list, runs it with `/S /R /UPDATE`
+(silent, restart the app afterwards, and treat it as an update: shortcuts and the
+"launch when Windows starts" entry stay as they were) and quits. In any other case (portable copy, missing
 asset, failed check) it opens the release page instead.
