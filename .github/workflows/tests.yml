@@ -1,6 +1,6 @@
 name: Tests
 
-# Run the suite on every push and pull request, not only when a release is
+# Run everything on every push and pull request, not only when a release is
 # tagged, so a regression shows up on the commit that caused it.
 on:
   push:
@@ -8,34 +8,53 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# A newer push to the same branch makes the older run pointless.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    # Windows: the app is Windows-only (named pipes, winreg, RegisterHotKey),
-    # and the bridge tests need Node, which the runner image already has.
+    # Windows: the backend uses named pipes, the registry and global hotkeys,
+    # and the app only ever ships for Windows.
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-node@v4
         with:
-          python-version: '3.12'
-          cache: pip
+          node-version: 24
+          cache: npm
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest pyflakes -r requirements.txt
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Lint for undefined names
-        shell: pwsh
-        # pyflakes exits 1 on ANY finding (unused imports included), and pwsh
-        # doesn't expand globs for native commands, so list the files
-        # explicitly and fail only on undefined names.
-        run: |
-          $files = @("main.py") + (Get-ChildItem statusify_*.py).Name
-          $out = python -m pyflakes @files | Select-String "undefined name"
-          if ($out) { $out; exit 1 }
-          exit 0
+      # The same key as release.yml, so the tag build starts from this cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          shared-key: statusify-windows-release
 
-      - name: Run tests
-        run: pytest -q
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # Cheap, so first: the version in Cargo.toml, tauri.conf.json, package.json,
+      # both lockfiles and the README must all say the same thing.
+      - name: Check that the versions agree
+        run: node scripts/check-version-sync.mjs --strict
+
+      # Type-checks the frontend and bundles it into dist/, which the Rust
+      # crate embeds at compile time, so this has to run before cargo.
+      - name: Build the frontend
+        run: npm run build
+
+      # Node 24 runs the .ts modules the tests import directly.
+      - name: Frontend and release-script tests
+        run: node --test
+
+      - name: Backend tests
+        working-directory: src-tauri
+        run: cargo test --release

@@ -1,0 +1,65 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Statusify",
+  "version": "3.0.0",
+  "identifier": "com.statusify.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Statusify",
+        "width": 520,
+        "height": 720,
+        "minWidth": 460,
+        "minHeight": 580,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "publisher": "KurepaBoss",
+    "copyright": "Copyright (c) 2026 KurepaBoss",
+    "category": "Music",
+    "shortDescription": "Spotify lyrics on your Discord profile",
+    "longDescription": "Statusify shows the song you are playing on Spotify, with synced lyrics, as your Discord status.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "sidebarImage": "windows/sidebar.bmp",
+        "headerImage": "windows/header.bmp",
+        "languages": [
+          "English"
+        ],
+        "displayLanguageSelector": false,
+        "installerHooks": "windows/installer-hooks.nsh"
+      }
+    }
+  }
+}

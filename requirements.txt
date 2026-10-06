@@ -1,5 +1,0 @@
-python-dotenv>=1.0.0
-websockets>=12.0
-pillow>=10.0.0
-pypresence>=4.2.1
-pystray>=0.19.5

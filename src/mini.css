@@ -1,0 +1,74 @@
+/* Mini player pill (owner: windows agent). Window is 440x68 CSS px, transparent. */
+@property --hp { syntax: "<number>"; inherits: true; initial-value: 0; }
+
+:root {
+  --fg: #fff;
+  --fgsub: rgba(255, 255, 255, 0.62);
+  --fgtitle: rgba(255, 255, 255, 0.88);
+  --accent: #1db954;
+  --glyph: #fff;
+  --base: #15161b;
+  --rim: rgba(0, 0, 0, 0.5);
+  --ring: rgba(255, 255, 255, 0.16);
+  color-scheme: dark;
+}
+:root.light {
+  --fg: #12141a;
+  --fgsub: rgba(18, 20, 26, 0.62);
+  --fgtitle: rgba(18, 20, 26, 0.88);
+  --base: #e9ebf0;
+  --rim: rgba(0, 0, 0, 0.22);
+  --ring: rgba(18, 20, 26, 0.14);
+  color-scheme: light;
+}
+* { box-sizing: border-box; margin: 0; }
+html, body { width: 100%; height: 100%; background: transparent; overflow: hidden; user-select: none;
+  font: 12px/14px "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; cursor: default; }
+
+#pill { position: absolute; inset: 0; border-radius: 34px; overflow: hidden; background: var(--base); color: var(--fg);
+  --hp: 0; transition: --hp 0.2s ease 0.25s, opacity 0.45s ease; isolation: isolate; }
+#pill.hover { --hp: 1; transition: --hp 0.16s ease, opacity 0.15s ease; }
+#pill.away { opacity: 0.35; }
+
+/* Cover blurred behind everything (GPU), tinted dark like the Python gradient. */
+.bg { position: absolute; inset: -40px; background: center / cover no-repeat; opacity: 0;
+  filter: blur(26px) saturate(1.35) brightness(0.55); transition: opacity 0.5s ease; }
+.bg.on { opacity: 0.9; }
+:root.light .bg { filter: blur(26px) saturate(1.2) brightness(1.15); }
+:root.light .bg.on { opacity: 0.45; }
+.sheen { position: absolute; inset: 0; background: linear-gradient(to bottom, rgba(255, 255, 255, 0.05), rgba(0, 0, 0, 0.22)); }
+:root.light .sheen { background: linear-gradient(to bottom, rgba(255, 255, 255, 0.2), rgba(0, 0, 0, 0.06)); }
+/* Hairline rim, a touch darker than the body. */
+.rim { position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 0 0 1px var(--rim); pointer-events: none; }
+
+#cover { position: absolute; left: 8px; top: 8px; width: 52px; height: 52px; border-radius: 30%; overflow: hidden;
+  background: color-mix(in srgb, var(--base) 70%, var(--fg) 8%); display: grid; place-items: center; }
+#cover span { font-size: 26px; line-height: 1; color: color-mix(in srgb, var(--fg) 45%, var(--base)); }
+#cover img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: none; }
+#cover.has span { display: none; }
+#cover.has img { display: block; }
+
+/* Text column: x 72..380; its right end fades out under prev/next on hover. */
+#txt { position: absolute; left: 72px; top: 0; width: 308px; height: 100%;
+  -webkit-mask-image: linear-gradient(to right, #000 0, #000 calc(308px - var(--hp) * 102px), transparent calc(346px - var(--hp) * 102px));
+          mask-image: linear-gradient(to right, #000 0, #000 calc(308px - var(--hp) * 102px), transparent calc(346px - var(--hp) * 102px)); }
+#track { position: absolute; left: 0; right: 0; top: 13px; height: 14px; white-space: pre; overflow: hidden; text-overflow: ellipsis;
+  color: var(--fgsub); }
+#track b { font-weight: 600; color: var(--fgtitle); }
+#lyric { position: absolute; left: 0; right: 0; top: 30px; height: 28px; overflow: hidden; }
+.ly { position: absolute; left: 0; top: 0; width: 100%; font-size: 17px; line-height: 26px; font-weight: 700; color: var(--accent);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; will-change: transform, opacity; }
+
+.ctl { all: unset; position: absolute; display: grid; place-items: center; border-radius: 50%; cursor: pointer; fill: var(--fg); }
+.ctl svg { width: 100%; height: 100%; }
+.ctl:hover { background: var(--ring); }
+#toggle { width: 32px; height: 32px; left: 390px; top: 18px; background: var(--accent); fill: var(--glyph);
+  transform: translateX(calc(var(--hp) * -36px)); }
+#toggle:hover { background: var(--accent); box-shadow: 0 0 0 3px var(--ring); }
+#prev, #next { width: 26px; height: 26px; top: 21px; opacity: calc(var(--hp) * 0.92); pointer-events: none; }
+#prev { left: 321px; transform: scaleX(-1); }
+#next { left: 395px; }
+#pill.hover #prev, #pill.hover #next { pointer-events: auto; }
+#g-play, #g-pause { display: none; }
+#toggle.playing #g-pause { display: inline; }
+#toggle:not(.playing) #g-play { display: inline; }

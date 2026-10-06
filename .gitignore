@@ -1,60 +1,30 @@
-# Personal configuration and auth tokens. .env holds the Discord Application
-# ID, so the pattern is deliberately broad — .env.example is the one exception
-# and has to be un-ignored explicitly.
-statusify.cfg
-.env*
-.env
-!.env.example
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
 
-# Personal listening data and cached media
-history.json
-history.json.migrated
+# Personal data the app writes into its data folder. A development run with
+# STATUSIFY_DATA_DIR pointed inside the repo must never commit any of it:
+# .env holds the Discord Application ID, history.db the listening history.
+.env
+.env.*
+!.env.example
+statusify.cfg
+statusify.cfg.tmp
 history.db
 history.db-wal
 history.db-shm
-translations.db
-translations.db-wal
-translations.db-shm
-exports/
-*.jpg
-*.png
-!statusify_icon_preview.png
-*.jpeg
-
-# Compiled outputs. build/ and dist/ are PyInstaller's scratch and output
-# directories; .buildenv is the venv build_exe.ps1 creates for itself. The
-# release exe is published as a GitHub release asset, never committed.
-*.exe
-build/
-dist/
-.buildenv/
-__pycache__/
-*.pyc
-
-# IDE / editor config
-.vscode/
-.idea/
-opencode.jsonc
-
-# Generated diagnostics and caches — all of these are produced at runtime and
-# are size-capped by _rotating_write(). health.csv previously reached 17 GB.
-statusify.log
-statusify.log.old
-health.csv
-health.csv.1
-crash.log
-crash.log.1
-output.log
-output.txt
-error.txt
-stdout.log
-stderr.log
-out.txt
-grep.txt
+history.json*
+translations.db*
+np_timing.db*
 .artcache/
-.pytest_cache/
-*.bak-*
+exports/
 
-# Single-instance "show the running window" sentinel, dropped by a second
-# launch and deleted by the instance that picks it up.
-.show-request
+# Editors, OS
+.idea/
+.DS_Store
+Thumbs.db
+
+*.log
+release-assets/
+.bench-target/
