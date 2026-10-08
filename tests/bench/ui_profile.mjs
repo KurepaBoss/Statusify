@@ -22,7 +22,12 @@ const OUT = opt("out", "");
 const URL = opt("url", "http://localhost:1420/tests-ts/harness.html");
 
 function loadPlaywright() {
-  for (const p of ["playwright", "/opt/node22/lib/node_modules/playwright", "/opt/node-tools/node_modules/playwright"]) {
+  const roots = ["playwright", "/opt/node22/lib/node_modules/playwright", "/opt/node-tools/node_modules/playwright"];
+  try {
+    const g = require("node:child_process").execSync("npm root -g", { encoding: "utf8" }).trim();
+    roots.push(g + "/playwright");
+  } catch { /* no npm */ }
+  for (const p of roots) {
     try { return require(p); } catch { /* next */ }
   }
   throw new Error("playwright not found; npm i -g playwright");
@@ -139,8 +144,9 @@ async function profileOnce(browser, run) {
 }
 
 const { chromium } = loadPlaywright();
-const exe = process.env.PW_CHROMIUM || fs.readdirSync("/opt/pw-browsers").filter((d) => /^chromium-\d+$/.test(d)).map((d) => `/opt/pw-browsers/${d}/chrome-linux/chrome`).find((p) => fs.existsSync(p));
-const browser = await chromium.launch({ executablePath: exe, headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
+// Playwright's own Chromium when it has one; else the one at /opt/pw-browsers (this dev container) or $PW_CHROMIUM.
+const exe = process.env.PW_CHROMIUM || (fs.existsSync("/opt/pw-browsers") ? fs.readdirSync("/opt/pw-browsers").filter((d) => /^chromium-\d+$/.test(d)).map((d) => `/opt/pw-browsers/${d}/chrome-linux/chrome`).find((p) => fs.existsSync(p)) : undefined);
+const browser = await chromium.launch({ ...(exe ? { executablePath: exe } : {}), headless: true, args: ["--no-sandbox", "--disable-dev-shm-usage"] });
 const runs = [];
 for (let i = 0; i < RUNS; i++) runs.push(await profileOnce(browser, i + 1));
 await browser.close();
@@ -149,12 +155,12 @@ const summary = {
   seconds: SECONDS,
   runs: RUNS,
   median: {
-    style_recalcs_per_s: med((r) => r.per_second.style_recalcs),
-    layouts_per_s: med((r) => r.per_second.layouts),
-    script_ms_per_s: med((r) => r.per_second.script_ms),
-    style_ms_per_s: med((r) => r.per_second.style_ms),
-    layout_ms_per_s: med((r) => r.per_second.layout_ms),
-    task_ms_per_s: med((r) => r.per_second.task_ms),
+    frames_per_s: med((r) => r1(r.frame_gap_ms.n / r.window_s)),
+    style_recalcs_per_s: med((r) => r.trace_per_second.UpdateLayoutTree?.count_per_s ?? 0),
+    style_ms_per_s: med((r) => r.trace_per_second.UpdateLayoutTree?.ms_per_s ?? 0),
+    style_ms_per_frame: med((r) => r1(((r.trace_per_second.UpdateLayoutTree?.ms ?? 0) / Math.max(1, r.frame_gap_ms.n)) * 100) / 100),
+    layouts_per_s: med((r) => r.trace_per_second.Layout?.count_per_s ?? 0),
+    script_ms_per_s: med((r) => r.trace_per_second.FunctionCall?.ms_per_s ?? 0),
     paints_per_s: med((r) => r.trace_per_second.Paint?.count_per_s ?? 0),
     raster_tasks_per_s: med((r) => r.trace_per_second.RasterTask?.count_per_s ?? 0),
     raster_ms_per_s: med((r) => r.trace_per_second.RasterTask?.ms_per_s ?? 0),
@@ -162,6 +168,7 @@ const summary = {
     frames_over_25ms_pct: med((r) => r.frames_over_25ms_pct),
     snapshot_publish_ms: med((r) => r.snapshot_publish_ms),
     snapshot_json_bytes: med((r) => r.snapshot_json_bytes),
+    js_heap_mb: med((r) => r.js_heap_mb),
   },
   runs_detail: runs,
 };

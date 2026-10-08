@@ -5,8 +5,9 @@ name: Bench
 # numbers instead of a guess. Started by hand (Actions tab, Bench, Run
 # workflow), or by a push whose commit message contains "[bench]". The
 # results (one JSON line per benchmark) are left as the workflow artifact
-# `bench-results`; the runner is a shared 4-core VM, so read the CPU numbers
-# to within 10-15 % and trust the counts (frames, wake-ups, bytes) exactly.
+# `bench-results`, in the job summary, and as a comment on the commit; the
+# runner is a shared 4-core VM, so read the CPU numbers to within 10-15 %
+# and trust the counts (frames, wake-ups, bytes) exactly.
 on:
   workflow_dispatch:
     inputs:
@@ -18,7 +19,7 @@ on:
     branches: ['**']
 
 permissions:
-  contents: read
+  contents: write # the results go on the commit as a comment
 
 concurrency:
   group: bench-${{ github.ref }}
@@ -62,12 +63,52 @@ jobs:
           set -o pipefail
           benches="${{ github.event.inputs.benches }}"
           if [ -z "$benches" ]; then
-            benches="f_unit_costs f_idle_cpu k_presence_wakeups c_pause_resume_seek b_line_jitter_and_waste js_e2e l_bridge_js_traffic"
+            benches="f_unit_costs f_idle_cpu k_presence_wakeups c_pause_resume_seek b_line_jitter_and_waste js_e2e"
           fi
           # shellcheck disable=SC2086
           tests/bench/run.sh $benches
           echo "== results =="
           cat "$STATUSIFY_BENCH_OUT"
+
+      # The bridge's traffic and seek latency, in Node alone (no Rust).
+      - name: Bridge traffic
+        if: always()
+        shell: bash
+        run: |
+          node tests/bench/bridge_js_traffic.mjs --seconds 20 --seeks 12 --out bench-traffic.json
+          node tests/bench/bridge_js_traffic.mjs --seconds 20 --seeks 12 --no-update-events --out bench-traffic-noevents.json
+
+      # The Lyrics page in a headless Chromium (the harness under the dev
+      # server). Best effort: a missing browser must not fail the run.
+      - name: UI profile
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          npm i -g playwright@1.47.2
+          npx playwright@1.47.2 install chromium
+          npx vite --port 1420 --strictPort > vite.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://localhost:1420/tests-ts/harness.html > /dev/null && break; sleep 1; done
+          node tests/bench/ui_profile.mjs --runs 3 --seconds 20 --out bench-ui.json > /dev/null
+
+      - name: Leave the results on the commit
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Bench results for ${GITHUB_SHA::8} (run ${{ github.run_id }}, ${RUNNER_OS})"
+            echo
+            echo '```json'
+            cat bench-results.jsonl 2>/dev/null || true
+            for f in bench-traffic.json bench-traffic-noevents.json bench-ui.json; do
+              if [ -f "$f" ]; then node -e "const j=require('./$f'); console.log(JSON.stringify({file:'$f', ...(j.median ? {median:j.median} : j)}))"; fi
+            done
+            echo '```'
+          } > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" -F body=@comment.md > /dev/null || echo "could not comment on the commit"
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -76,4 +117,7 @@ jobs:
           path: |
             bench-results.jsonl
             bench-results.stderr.log
+            bench-traffic.json
+            bench-traffic-noevents.json
+            bench-ui.json
           if-no-files-found: warn
