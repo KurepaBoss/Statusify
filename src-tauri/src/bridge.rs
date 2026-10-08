@@ -243,7 +243,7 @@ mod tests {
     type Client = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
     async fn up(timing: Timing) -> (u16, Arc<Engine>, Outbox) {
-        let mut e = Engine::new(None, |_| {});
+        let mut e = Engine::new(None, |_, _| {});
         Arc::get_mut(&mut e).unwrap().lrclib_enabled = AtomicBool::new(false);
         let l = bind(0).await.unwrap();
         let port = l.local_addr().unwrap().port();
@@ -477,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_panic_in_the_handler_still_frees_the_connection() {
-        let mut e = Engine::new(None, |_| {});
+        let mut e = Engine::new(None, |_, _| {});
         Arc::get_mut(&mut e).unwrap().lrclib_enabled = AtomicBool::new(false);
         let l = bind(0).await.unwrap();
         let port = l.local_addr().unwrap().port();

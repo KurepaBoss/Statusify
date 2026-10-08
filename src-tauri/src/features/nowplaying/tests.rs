@@ -11,7 +11,7 @@ fn tmp(tag: &str) -> std::path::PathBuf {
 }
 
 fn engine() -> Arc<Engine> {
-    let mut e = Engine::new(None, |_| {});
+    let mut e = Engine::new(None, |_, _| {});
     Arc::get_mut(&mut e).unwrap().lrclib_enabled = AtomicBool::new(false);
     e
 }

@@ -701,7 +701,7 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("statusify-core-{}-{}", now_ms(), rand()));
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("statusify.cfg"), cfg).unwrap();
-            let mut engine = Engine::new(None, |_| {});
+            let mut engine = Engine::new(None, |_, _| {});
             Arc::get_mut(&mut engine).unwrap().lrclib_enabled = AtomicBool::new(false);
             let config = Config::open(&dir);
             T { engine, config, outbox: Outbox::default(), dir }
@@ -743,7 +743,7 @@ mod tests {
         let t = T::new("[preferences]\nlyric_delay_ms = -40\n");
         // One Config instance shared by the engine and the actions, as in the app.
         let cfg = Arc::new(Config::open(&t.dir));
-        let mut engine = Engine::new(None, |_| {});
+        let mut engine = Engine::new(None, |_, _| {});
         Arc::get_mut(&mut engine).unwrap().lrclib_enabled = AtomicBool::new(false);
         engine.set_config(cfg.clone());
         let env = Env { engine: &engine, config: &cfg, outbox: &t.outbox, appdata: None };
@@ -778,7 +778,7 @@ mod tests {
     async fn blacklist_follows_config_live() {
         let t = T::new("[preferences]\nblacklist = nickelback\\nfoo\n");
         let cfg = Arc::new(Config::open(&t.dir));
-        let mut engine = Engine::new(None, |_| {});
+        let mut engine = Engine::new(None, |_, _| {});
         Arc::get_mut(&mut engine).unwrap().lrclib_enabled = AtomicBool::new(false);
         engine.set_config(cfg.clone());
         let env = Env { engine: &engine, config: &cfg, outbox: &t.outbox, appdata: None };
@@ -800,7 +800,7 @@ mod tests {
     async fn lrclib_switch_follows_config() {
         let t = T::new("[preferences]\nlrclib_fallback = false\n");
         let cfg = Arc::new(Config::open(&t.dir));
-        let engine = Engine::new(None, |_| {});
+        let engine = Engine::new(None, |_, _| {});
         engine.set_config(cfg.clone());
         assert!(!engine.lrclib_enabled.load(std::sync::atomic::Ordering::Relaxed));
         cfg.set("preferences", "lrclib_fallback", "true");
@@ -862,7 +862,7 @@ mod tests {
     async fn per_track_offset_calls_between_songs_leave_the_global_alone() {
         let t = T::new("[preferences]\nlyric_delay_ms = -40\n");
         let cfg = Arc::new(Config::open(&t.dir));
-        let engine = Engine::new(None, |_| {});
+        let engine = Engine::new(None, |_, _| {});
         engine.set_config(cfg.clone());
         let env = Env { engine: &engine, config: &cfg, outbox: &t.outbox, appdata: None };
         let s = act(&env, "set_track_offset", &json!({"ms": null})).unwrap();

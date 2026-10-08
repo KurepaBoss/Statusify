@@ -193,7 +193,7 @@ mod tests {
     use std::time::Duration;
 
     fn engine() -> Arc<Engine> {
-        let mut e = Engine::new(None, |_| {});
+        let mut e = Engine::new(None, |_, _| {});
         Arc::get_mut(&mut e).unwrap().lrclib_enabled = AtomicBool::new(false);
         e.handle(&json!({"type":"track_change","track_uri":"u1","artist":"A","title":"T","duration_ms":1000}));
         e.set_lyrics(Lyrics {

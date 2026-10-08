@@ -25,7 +25,7 @@
 use crate::bridge;
 use crate::db::Store;
 use crate::discord;
-use crate::engine::{Engine, Event};
+use crate::engine::{Change, Engine, Event};
 use crate::presence;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -594,8 +594,12 @@ struct Pipeline {
     bridge: Option<FakeBridge>,
     spotify: Arc<Mutex<SimSpotify>>,
     arrivals: Arc<Mutex<Vec<Arrival>>>,
+    /// Engine changes, and the JSON they would cost sent one by one.
     emit_calls: Arc<AtomicU64>,
     emit_bytes: Arc<AtomicU64>,
+    /// What the emitter actually sends the windows, after coalescing.
+    tauri_emits: Arc<AtomicU64>,
+    tauri_bytes: Arc<AtomicU64>,
     tasks: Vec<JoinHandle<()>>,
     dir: PathBuf,
 }
@@ -611,18 +615,43 @@ impl Pipeline {
         let store = o.store.then(|| Store::open(&dir).unwrap());
         let calls = Arc::new(AtomicU64::new(0));
         let bytes = Arc::new(AtomicU64::new(0));
-        let (c2, b2, ser) = (calls.clone(), bytes.clone(), o.serialize);
-        let mut engine = Engine::new(store, move |s| {
+        let emits = Arc::new(AtomicU64::new(0));
+        let emit_bytes = Arc::new(AtomicU64::new(0));
+        let emitter = Arc::new(crate::emitter::Emitter::default());
+        let (c2, b2, em, ser) = (calls.clone(), bytes.clone(), emitter.clone(), o.serialize);
+        // Every engine change is counted (and, with `serialize`, costed as
+        // the JSON it would be sent as); the emitter behind it decides what
+        // the windows are actually sent, which is counted separately.
+        let mut engine = Engine::new(store, move |s, c| {
             if ser {
-                let j = serde_json::to_string(s).unwrap();
+                let j = match c {
+                    Change::Full => serde_json::to_string(s).unwrap(),
+                    Change::Position => s.position_json().to_string(),
+                };
                 b2.fetch_add(j.len() as u64, Ordering::Relaxed);
             }
             c2.fetch_add(1, Ordering::Relaxed);
+            em.mark(c);
         });
         // The harness measures the pipeline, not lrclib.net: no network.
         Arc::get_mut(&mut engine).unwrap().lrclib_enabled = AtomicBool::new(false);
 
         let mut tasks = Vec::new();
+        {
+            let (e, n, b) = (engine.clone(), emits.clone(), emit_bytes.clone());
+            tasks.push(tokio::spawn(async move {
+                emitter
+                    .run(crate::emitter::GAP, |c| {
+                        let j = match c {
+                            Change::Full => serde_json::to_string(&e.snapshot()).unwrap(),
+                            Change::Position => e.position_json().to_string(),
+                        };
+                        n.fetch_add(1, Ordering::Relaxed);
+                        b.fetch_add(j.len() as u64, Ordering::Relaxed);
+                    })
+                    .await
+            }));
+        }
         // Raw bridge arrivals, stamped as the engine sees them.
         let arrivals = Arc::new(Mutex::new(Vec::new()));
         {
@@ -666,7 +695,7 @@ impl Pipeline {
         let now = Instant::now();
         let spotify = Arc::new(Mutex::new(SimSpotify { track: first, playing: true, pos0: 0.0, wall0: now, plan, track_started: now }));
         let bridge = o.start_bridge_client.then(|| FakeBridge::spawn(port, spotify.clone(), o.bridge));
-        Pipeline { engine, port, link, discord, bridge, spotify, arrivals, emit_calls: calls, emit_bytes: bytes, tasks, dir }
+        Pipeline { engine, port, link, discord, bridge, spotify, arrivals, emit_calls: calls, emit_bytes: bytes, tauri_emits: emits, tauri_bytes: emit_bytes, tasks, dir }
     }
 
     fn b(&self) -> &FakeBridge {
@@ -1181,7 +1210,7 @@ fn bench_e_bridge_drop() {
         {
             let l = bridge::bind(0).await.unwrap();
             let port = l.local_addr().unwrap().port();
-            let engine = Engine::new(None, |_| {});
+            let engine = Engine::new(None, |_, _| {});
             tokio::spawn(bridge::serve(l, engine.clone(), bridge::Outbox::default()));
             let (mut a, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}")).await.unwrap();
             let _ = a.next().await; // request_state; then A goes silent: a half-open peer
@@ -1206,7 +1235,7 @@ fn bench_e_bridge_drop() {
         {
             let l = bridge::bind(0).await.unwrap();
             let port = l.local_addr().unwrap().port();
-            let engine = Engine::new(None, |_| {});
+            let engine = Engine::new(None, |_, _| {});
             tokio::spawn(bridge::serve(l, engine.clone(), bridge::Outbox::default()));
             let idle = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             sleep(100).await;
@@ -1247,16 +1276,21 @@ fn bench_f_idle_cpu() {
                 sleep(2000).await;
             }
             let (cpu0, wall0, calls0, bytes0, load) = (process_cpu_ms(), Instant::now(), p.emit_calls.load(Ordering::Relaxed), p.emit_bytes.load(Ordering::Relaxed), LoadProbe::start());
+            let (emits0, ebytes0) = (p.tauri_emits.load(Ordering::Relaxed), p.tauri_bytes.load(Ordering::Relaxed));
             sleep(30_000).await;
             let wall = ms(wall0.elapsed());
+            let secs = wall / 1000.0;
             let cpu = process_cpu_ms() - cpu0;
             let calls = p.emit_calls.load(Ordering::Relaxed) - calls0;
             let bytes = p.emit_bytes.load(Ordering::Relaxed) - bytes0;
+            let emits = p.tauri_emits.load(Ordering::Relaxed) - emits0;
+            let ebytes = p.tauri_bytes.load(Ordering::Relaxed) - ebytes0;
             out.insert(
                 name.into(),
-                json!({"window_s": r1(wall / 1000.0), "process_cpu_ms": r1(cpu), "cpu_pct_of_one_core": r1(cpu / wall * 100.0),
-                       "cpu_ms_per_second": r1(cpu / wall * 1000.0), "cpu_clock_resolution_note": "GetProcessTimes ticks at the scheduler quantum (about 15.6 ms), so a 30 s window is good to +-15.6 ms", "on_change_calls_per_s": r1(calls as f64 / (wall / 1000.0)),
+                json!({"window_s": r1(secs), "process_cpu_ms": r1(cpu), "cpu_pct_of_one_core": r1(cpu / wall * 100.0),
+                       "cpu_ms_per_second": r1(cpu / wall * 1000.0), "cpu_clock_resolution_note": "GetProcessTimes ticks at the scheduler quantum (about 15.6 ms), so a 30 s window is good to +-15.6 ms", "on_change_calls_per_s": r1(calls as f64 / secs),
                        "snapshot_json_bytes_per_call": if calls > 0 && serialize { json!(bytes / calls) } else { Value::Null },
+                       "ui_events_per_s": r1(emits as f64 / secs), "ui_event_bytes_per_s": r1(ebytes as f64 / secs),
                        "machine_cpu_pct_during": load.pct()}),
             );
             p.stop().await;
@@ -1287,16 +1321,17 @@ fn bench_k_presence_wakeups() {
                 p.pause();
                 sleep(3000).await;
             }
-            let (w0, cpu0, wall0, calls0) = (presence::WAKEUPS.load(Ordering::Relaxed), process_cpu_ms(), Instant::now(), p.emit_calls.load(Ordering::Relaxed));
+            let (w0, cpu0, wall0, calls0, emits0) = (presence::WAKEUPS.load(Ordering::Relaxed), process_cpu_ms(), Instant::now(), p.emit_calls.load(Ordering::Relaxed), p.tauri_emits.load(Ordering::Relaxed));
             sleep(20_000).await;
             let wall = ms(wall0.elapsed());
             let wake = presence::WAKEUPS.load(Ordering::Relaxed) - w0;
             let calls = p.emit_calls.load(Ordering::Relaxed) - calls0;
+            let emits = p.tauri_emits.load(Ordering::Relaxed) - emits0;
             let frames = frame_log(&p).iter().filter(|(t, _)| *t >= wall0).count();
             out.insert(
                 name.into(),
                 json!({"window_s": r1(wall / 1000.0), "presence_wakeups_per_s": r1(wake as f64 / (wall / 1000.0)), "presence_wakeups": wake,
-                       "on_change_calls_per_s": r1(calls as f64 / (wall / 1000.0)), "discord_frames_in_window": frames,
+                       "on_change_calls_per_s": r1(calls as f64 / (wall / 1000.0)), "ui_events_per_s": r1(emits as f64 / (wall / 1000.0)), "discord_frames_in_window": frames,
                        "process_cpu_ms_per_s": r1((process_cpu_ms() - cpu0) / wall * 1000.0)}),
             );
             p.stop().await;
@@ -1319,7 +1354,7 @@ fn bench_f_unit_costs() {
         plain: vec![],
         source: "Spicy".into(),
     };
-    let mut e = Engine::new(None, |_| {});
+    let mut e = Engine::new(None, |_, _| {});
     Arc::get_mut(&mut e).unwrap().lrclib_enabled = AtomicBool::new(false);
     e.handle(&json!({"type": "track_change", "track_uri": "spotify:track:x", "artist": "A", "title": "T", "duration_ms": sheet.duration_ms}));
     e.set_lyrics(lyrics.clone());

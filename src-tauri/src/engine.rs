@@ -36,6 +36,16 @@ const PREFETCH_CAP: usize = 5;
 /// same track while playing, is the song starting over (repeat one): a new play.
 const RESTART_EDGE_MS: i64 = 3_000;
 
+/// What kind of change `Engine::new`'s callback is told about. The UI gets
+/// the whole snapshot for a `Full` change; a `Position` change (a bridge
+/// position message: twice a second while playing) only moves the clock, so
+/// `Snapshot::position_json` (four fields) is all that needs to cross to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    Full,
+    Position,
+}
+
 /// What feature modules can react to (Engine::subscribe).
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -103,7 +113,7 @@ pub struct Engine {
     pub lrclib_early: Duration,
     /// LRCLIB retry backoff step (3 s, 6 s); shortened in tests.
     pub lrclib_backoff: Duration,
-    on_change: Box<dyn Fn(&Snapshot) + Send + Sync>,
+    on_change: Box<dyn Fn(&Snapshot, Change) + Send + Sync>,
     events: broadcast::Sender<Event>,
     /// statusify.cfg, once the core feature hands it over (Engine::set_config).
     config: OnceLock<Arc<Config>>,
@@ -143,7 +153,7 @@ fn lyrics_from(v: &Value, default_src: &str) -> Lyrics {
 }
 
 impl Engine {
-    pub fn new(store: Option<Store>, on_change: impl Fn(&Snapshot) + Send + Sync + 'static) -> Arc<Self> {
+    pub fn new(store: Option<Store>, on_change: impl Fn(&Snapshot, Change) + Send + Sync + 'static) -> Arc<Self> {
         Arc::new(Engine {
             inner: Mutex::new(Inner::default()),
             store,
@@ -312,9 +322,19 @@ impl Engine {
         self.inner.lock().unwrap().snap.clone()
     }
 
+    /// The clock part of the snapshot (Snapshot::position_json), without
+    /// cloning the rest.
+    pub fn position_json(&self) -> Value {
+        self.inner.lock().unwrap().snap.position_json()
+    }
+
     fn changed(&self) {
+        self.changed_with(Change::Full);
+    }
+
+    fn changed_with(&self, c: Change) {
         let s = self.snapshot();
-        (self.on_change)(&s);
+        (self.on_change)(&s, c);
     }
 
     pub fn update(&self, f: impl FnOnce(&mut Snapshot)) {
@@ -547,7 +567,8 @@ impl Engine {
         if paused {
             self.emit(Event::Paused);
         }
-        self.changed();
+        // Only the clock moved (is_playing and duration_ms ride with it).
+        self.changed_with(Change::Position);
     }
 
     fn on_lyrics(self: &Arc<Self>, m: &Value) {

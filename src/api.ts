@@ -53,5 +53,13 @@ function publish(s: Snapshot) {
   subs.forEach((cb) => cb(s));
 }
 
+/** The clock part of a snapshot: what a bridge position message changes. */
+export type PositionUpdate = Pick<Snapshot, "position_ms" | "position_at_ms" | "duration_ms" | "is_playing">;
+
 listen<Snapshot>("snapshot", (e) => publish(e.payload));
+// Twice a second while playing the backend sends only the clock (four
+// fields), not the whole snapshot; it is folded into the latest one.
+listen<PositionUpdate>("position", (e) => {
+  if (latest) publish({ ...latest, ...e.payload });
+});
 invoke<Snapshot>("snapshot").then(publish);

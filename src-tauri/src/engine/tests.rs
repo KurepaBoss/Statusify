@@ -29,7 +29,7 @@ async fn fake_lrclib(status: u16, body: &'static str) -> (String, Arc<AtomicUsiz
 const HIT: &str = r#"[{"duration":100,"syncedLyrics":"[00:01.00]hello\n[00:02.00]world"}]"#;
 
 fn engine(url: &str) -> Arc<Engine> {
-    let mut e = Engine::new(None, |_| {});
+    let mut e = Engine::new(None, |_, _| {});
     let m = Arc::get_mut(&mut e).unwrap();
     m.lrclib_url = url.into();
     m.lrclib_early = Duration::from_millis(50);
@@ -130,7 +130,7 @@ async fn prefetched_lyrics_are_used_on_track_start() {
 }
 
 fn stored_engine(dir: &std::path::Path) -> Arc<Engine> {
-    let mut e = Engine::new(Some(Store::open(dir).unwrap()), |_| {});
+    let mut e = Engine::new(Some(Store::open(dir).unwrap()), |_, _| {});
     Arc::get_mut(&mut e).unwrap().lrclib_enabled = AtomicBool::new(false);
     e
 }
@@ -326,7 +326,7 @@ async fn uri_less_lyrics_never_replace_lyrics_already_showing() {
 async fn bridge_none_verdict_is_cached_and_tries_lrclib() {
     let (url, hits) = fake_lrclib(200, "[]").await;
     let dir = tmpdir("none");
-    let mut e = Engine::new(Some(Store::open(&dir).unwrap()), |_| {});
+    let mut e = Engine::new(Some(Store::open(&dir).unwrap()), |_, _| {});
     let m = Arc::get_mut(&mut e).unwrap();
     m.lrclib_url = url;
     m.lrclib_early = Duration::from_secs(60);
@@ -458,7 +458,7 @@ async fn quitting_early_in_a_song_or_while_paused_records_nothing_new() {
 async fn quitting_with_history_off_writes_nothing() {
     let dir = tmpdir("quit-off");
     std::fs::write(dir.join("statusify.cfg"), "[preferences]\nsave_history = false\n").unwrap();
-    let mut e = Engine::new(Some(Store::open(&dir).unwrap()), |_| {});
+    let mut e = Engine::new(Some(Store::open(&dir).unwrap()), |_, _| {});
     Arc::get_mut(&mut e).unwrap().lrclib_enabled = AtomicBool::new(false);
     e.set_config(Arc::new(crate::config::Config::open(&dir)));
     track(&e, "u1");

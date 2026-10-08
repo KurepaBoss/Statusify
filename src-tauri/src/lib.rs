@@ -5,6 +5,7 @@ mod bench_bridge;
 mod config;
 mod db;
 mod discord;
+mod emitter;
 mod engine;
 mod features;
 mod lrclib;
@@ -169,9 +170,21 @@ pub fn run() {
                     None
                 }
             };
-            let h = handle.clone();
-            let engine = Engine::new(store, move |s| {
-                let _ = h.emit("snapshot", s);
+            // Changes reach the windows through the emitter: one "snapshot"
+            // per burst, a small "position" for the clock alone.
+            let emitter = Arc::new(emitter::Emitter::default());
+            let em = emitter.clone();
+            let engine = Engine::new(store, move |_, c| em.mark(c));
+            let (h, e) = (handle.clone(), engine.clone());
+            tauri::async_runtime::spawn(async move {
+                emitter
+                    .run(emitter::GAP, |c| {
+                        let _ = match c {
+                            engine::Change::Full => h.emit("snapshot", e.snapshot()),
+                            engine::Change::Position => h.emit("position", e.position_json()),
+                        };
+                    })
+                    .await
             });
             let config = Arc::new(config::Config::open(&dir));
             let outbox = bridge::Outbox::default();

@@ -31,6 +31,17 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// The fields a bridge position message changes: what the UI is sent for
+    /// an `engine::Change::Position` instead of the whole snapshot.
+    pub fn position_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "position_ms": self.position_ms,
+            "position_at_ms": self.position_at_ms,
+            "duration_ms": self.duration_ms,
+            "is_playing": self.is_playing,
+        })
+    }
+
     pub fn estimated_position(&self, now_ms: i64) -> i64 {
         let mut p = self.position_ms;
         if self.is_playing {
