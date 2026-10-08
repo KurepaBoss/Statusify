@@ -71,6 +71,10 @@ async function boot(t, { cosmos = quickLyrics, fetchStub = spicy500, token = "to
     s.onclose();
   };
   b.fire = (type) => (b.listeners[type] || []).forEach((f) => f({ type }));
+  // Spotify's PlayerAPI "update" (state first, then the listeners, see below).
+  b.apiListeners = {};
+  b.update = () => (b.apiListeners.update || []).forEach((f) => f({ data: { item: b.player.data?.item, is_paused: !b.playing } }));
+  b.api = { _events: { addListener: (type, f) => (b.apiListeners[type] ||= []).push(f) } };
   b.setTrack = (n) => {
     b.player.data = { item: item(n) };
     b.pos = 0;
@@ -92,6 +96,7 @@ async function boot(t, { cosmos = quickLyrics, fetchStub = spicy500, token = "to
     play() {},
     seek() {},
     addEventListener: (type, f) => (b.listeners[type] ||= []).push(f),
+    origin: b.api,
   };
   AbortSignal.timeout = (ms) => {
     b.abortTimeouts.push(ms);
@@ -105,7 +110,7 @@ async function boot(t, { cosmos = quickLyrics, fetchStub = spicy500, token = "to
   globalThis.Spicetify = {
     Player: b.player,
     Queue: { nextTracks: [] },
-    Platform: { AuthorizationAPI: { _tokenProvider: { _token: { accessToken: token } } }, PlayerAPI: {} },
+    Platform: { AuthorizationAPI: { _tokenProvider: { _token: { accessToken: token } } }, PlayerAPI: b.api },
     CosmosAsync: { get: cosmos },
   };
   vm.runInThisContext(SRC);
@@ -381,4 +386,127 @@ test("a track change that only the 500 ms poll notices also abandons the request
   assert.equal(signals.length, 2);
   assert.equal(signals[0].aborted, true);
   assert.equal(signals[1].aborted, false);
+});
+
+// ── 2.3: seeks by event, an adaptive heartbeat, Spicy's rate limit, lyrics memory ──
+
+test("a seek is reported when Spotify's player announces it, not on the next poll", async (t) => {
+  const b = await ready(t);
+  b.update(); // the bridge learns that this Spotify has the event
+  await b.advance(0);
+  b.sent.length = 0;
+  b.pos = 30000;
+  b.update();
+  await b.advance(0);
+  const p = b.of("position");
+  assert.equal(p.length, 1, "one position, at once");
+  assert.equal(p[0].position_ms, 30000);
+  // An update that changed nothing sends nothing.
+  b.pos += 20;
+  b.update();
+  await b.advance(0);
+  assert.equal(b.of("position").length, 1);
+});
+
+test("without the player's update event the 500 ms poll stays, playing and paused, as bridge 2.2 sent it", async (t) => {
+  const b = await ready(t);
+  b.sent.length = 0;
+  await b.advance(10000);
+  let n = b.of("position").length;
+  assert.ok(n >= 19 && n <= 21, `${n} positions in 10 s without events`);
+  b.playing = false;
+  b.fire("onplaypause");
+  await b.advance(0);
+  b.sent.length = 0;
+  await b.advance(10000);
+  n = b.of("position").length;
+  assert.ok(n >= 19 && n <= 21, `${n} positions in 10 s paused without events`);
+  // A seek while paused is noticed by the poll.
+  b.pos = 90000;
+  await b.advance(500);
+  assert.equal(b.of("position").at(-1).position_ms, 90000);
+});
+
+test("with the player's update event the poll becomes a 1 s heartbeat, 3 s paused", async (t) => {
+  const b = await ready(t);
+  let n;
+  b.update();
+  await b.advance(0);
+  b.sent.length = 0;
+  await b.advance(10000);
+  n = b.of("position").length;
+  assert.ok(n >= 9 && n <= 11, `${n} positions in 10 s with events`);
+  b.playing = false;
+  b.update();
+  b.fire("onplaypause");
+  await b.advance(0);
+  b.sent.length = 0;
+  await b.advance(12000);
+  n = b.of("position").length;
+  assert.ok(n >= 3 && n <= 5, `${n} positions in 12 s paused with events`);
+  assert.ok(b.of("position").every((p) => p.is_playing === false));
+  // A seek while paused still shows up at once.
+  b.pos = 90000;
+  b.update();
+  await b.advance(0);
+  assert.equal(b.of("position").at(-1).position_ms, 90000);
+});
+
+test("a Spicy 429 with Retry-After is not asked again until it has passed; Spotify's lyrics are used meanwhile", async (t) => {
+  let calls = 0;
+  const spicy429 = async () => { calls++; return { status: 429, headers: { get: (k) => (k === "Retry-After" ? "20" : null) }, json: async () => ({}) }; };
+  const b = await ready(t, { fetchStub: spicy429 });
+  assert.equal(calls, 1);
+  assert.equal(b.of("lyrics").length, 0);
+  b.sent.length = 0;
+  // Inside the 20 s: the next track goes straight to Spotify's lyrics.
+  await b.advance(5000);
+  b.setTrack(2);
+  b.fire("songchange");
+  await b.advance(500);
+  assert.equal(calls, 1, "Spicy not asked while rate limited");
+  let l = b.of("lyrics");
+  assert.equal(l.length, 1);
+  assert.equal(l[0].source, "Spotify (Spicy fallback)");
+  // After it: asked again.
+  await b.advance(16000);
+  b.setTrack(3);
+  b.fire("songchange");
+  await b.advance(500);
+  assert.equal(calls, 2, "Spicy asked again once the Retry-After passed");
+});
+
+test("a Spicy 429 without Retry-After waits 30 s", async (t) => {
+  let calls = 0;
+  const spicy429 = async () => { calls++; return { status: 429, headers: { get: () => null }, json: async () => ({}) }; };
+  const b = await ready(t, { fetchStub: spicy429 });
+  await b.advance(25000);
+  b.setTrack(2);
+  b.fire("songchange");
+  await b.advance(500);
+  assert.equal(calls, 1);
+  await b.advance(5000);
+  b.setTrack(3);
+  b.fire("songchange");
+  await b.advance(500);
+  assert.equal(calls, 2);
+});
+
+test("lyrics already fetched this session are not fetched again for a skip back", async (t) => {
+  let cosmos = 0;
+  const counting = () => { cosmos++; return quickLyrics(); };
+  const b = await ready(t, { cosmos: counting });
+  assert.equal(cosmos, 1);
+  b.setTrack(2);
+  b.fire("songchange");
+  await b.advance(500);
+  assert.equal(cosmos, 2);
+  b.setTrack(1);
+  b.fire("songchange");
+  await b.advance(500);
+  assert.equal(cosmos, 2, "track 1 came from memory");
+  const l = b.of("lyrics");
+  assert.equal(l.at(-1).track_uri, "spotify:track:t1");
+  assert.equal(l.at(-1).mode, "synced");
+  assert.equal(l.at(-1).source, "Spotify (Spicy fallback)", "with its original source");
 });

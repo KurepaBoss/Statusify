@@ -30,7 +30,13 @@
     // is abandoned after 5-6 s (and at once when the track has moved on), and
     // the reconnect after a dropped socket backs off from 250 ms instead of
     // waiting a flat 3 s.
-    const BRIDGE_VERSION = "2.2.0";
+    // 2.3: seeks are reported the moment Spotify's player announces them (its
+    // "update" event), the 500 ms poll becomes a 1 s heartbeat (3 s paused)
+    // once that event is seen, a position goes out only when something
+    // changed or the heartbeat is due, a Spicy Lyrics 429/503 is honoured
+    // for its Retry-After instead of being asked again on the next track,
+    // and lyrics already fetched are kept in memory for a skip back.
+    const BRIDGE_VERSION = "2.3.0";
 
     let ws             = null;
     let reconnectTimer = null;
@@ -52,6 +58,7 @@
             clearTimeout(reconnectTimer);
             reconnectAttempt = 0;
             lastTrackUri = "";
+            lastSent = null;
             send({ type: "hello", version: BRIDGE_VERSION });
             sendPlayerState(true);
             // Retry loop in case Player.data isn't populated immediately.
@@ -68,7 +75,7 @@
                     // Always send track info — don't gate on isPlaying() which can
                     // transiently return false even when music is playing.
                     await sendTrackAndLyrics(item);
-                    send({ type: "position", position_ms: posMs, duration_ms: durMs, is_playing: playing });
+                    sendPosition(Date.now(), uri, posMs, durMs, playing);
                     if (!playing) send({ type: "paused" });
                     break;
                 }
@@ -94,7 +101,7 @@
                         const durMs   = parseInt(item.metadata?.["duration"] || item.duration_ms || 0);
                         const playing = Spicetify.Player.isPlaying();
                         await sendTrackAndLyrics(item);
-                        send({ type: "position", position_ms: posMs, duration_ms: durMs, is_playing: playing });
+                        sendPosition(Date.now(), item.uri, posMs, durMs, playing);
                         if (!playing) send({ type: "paused" });
                     }
                 } else if (msg.type === "skip_track") {
@@ -415,11 +422,40 @@
         return c.signal;
     }
 
+    // ── Spicy Lyrics rate limit ──────────────────────────────────
+    // A 429 or 503 means "not now": Spicy is not asked again until the
+    // Retry-After it names has passed (30 s when it names none, never more
+    // than 10 minutes), and Spotify's own lyrics are used meanwhile. Asking
+    // again on the very next track, as before, only kept the limit tripped.
+    const SPICY_COOLDOWN_DEFAULT_MS = 30000;
+    const SPICY_COOLDOWN_MAX_MS     = 600000;
+    let spicyCooldownUntil = 0;
+
+    // Retry-After: seconds, or an HTTP date; null when absent or unreadable.
+    function retryAfterMs(resp) {
+        let v = null;
+        try { v = resp?.headers?.get?.("Retry-After") ?? null; } catch (e) {}
+        if (v === null || v === undefined || v === "") return null;
+        const secs = Number(v);
+        if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+        const at = Date.parse(v);
+        return Number.isFinite(at) ? Math.max(0, at - Date.now()) : null;
+    }
+
+    function spicyCooldownMs() {
+        return Math.max(0, spicyCooldownUntil - Date.now());
+    }
+
     // `pass` is filled in for the caller: timedOut when a request hung,
     // noToken when Spicy could not even be asked. `signal` ends the fetch
     // when the track it is for is no longer playing.
     async function fetchSpicyLyrics(trackUri, quiet = false, pass = {}, signal = null) {
         if (signal?.aborted) return null;
+        const cooling = spicyCooldownMs();
+        if (cooling > 0) {
+            if (!quiet) lastSpicyError = `rate limited, ${Math.ceil(cooling / 1000)} s to go`;
+            return null;
+        }
         // quiet: a background prefetch — no log lines, and it must not
         // overwrite lastSpicyError, which belongs to the playing track.
         const note = (m) => { if (!quiet) lastSpicyError = m; };
@@ -449,6 +485,14 @@
                     client:  { version: SPICY_VERSION }
                 })
             });
+            if (resp.status === 429 || resp.status === 503) {
+                const wait = Math.min(SPICY_COOLDOWN_MAX_MS, retryAfterMs(resp) ?? SPICY_COOLDOWN_DEFAULT_MS);
+                spicyCooldownUntil = Date.now() + wait;
+                note(`HTTP ${resp.status}, rate limited for ${Math.ceil(wait / 1000)} s`);
+                console.warn("[LyricsBridge] Spicy API rate limited:", resp.status, "waiting", wait, "ms");
+                dbg(`Spicy API HTTP ${resp.status} — not asked again for ${Math.ceil(wait / 1000)} s`);
+                return null;
+            }
             if (resp.status !== 200) {
                 note(`HTTP ${resp.status}`);
                 // 400/403/426 here almost always means SPICY_VERSION is stale.
@@ -630,6 +674,20 @@
     const LYRIC_ATTEMPTS  = 2;
     const LYRIC_RETRY_MS  = 3000;
 
+    // Lyrics found this session, by track: a skip back, a repeat, or a track
+    // that was prefetched is answered from here without another request.
+    // Only found lyrics are kept (a miss may be an auth token that was not
+    // ready yet).
+    const LYRICS_MEMORY_MAX = 40;
+    const lyricsMemory = new Map();   // uri -> { lyrics, source }
+
+    function rememberLyrics(uri, found) {
+        if (!found) return;
+        lyricsMemory.delete(uri);
+        lyricsMemory.set(uri, found);
+        if (lyricsMemory.size > LYRICS_MEMORY_MAX) lyricsMemory.delete(lyricsMemory.keys().next().value);
+    }
+
     // One pass over both lyric sources. Returns { lyrics, source } or null.
     async function fetchLyricsOnce(trackUri, quiet = false, pass = {}, signal = null) {
         // Try Spicy first; fall back to Spotify's own color-lyrics API if Spicy
@@ -681,9 +739,9 @@
             sendQueue(true);
             sendPlayerState(false);   // liked differs per track
 
-            let found = null;
+            let found = lyricsMemory.get(trackUri) || null;
             let attempts = 0;
-            for (let attempt = 0; attempt < LYRIC_ATTEMPTS; attempt++) {
+            for (let attempt = 0; attempt < LYRIC_ATTEMPTS && !found; attempt++) {
                 if (attempt > 0) {
                     console.log(`[LyricsBridge] No lyrics yet, retrying in ${LYRIC_RETRY_MS}ms...`);
                     send({ type: "lyrics_debug",
@@ -699,7 +757,7 @@
                 attempts++;
                 found = await fetchLyricsOnce(trackUri, false, pass, ctl.signal);
                 if (abandoned()) return;   // the track moved on: its lyrics are nobody's business now
-                if (found) break;
+                if (found) { rememberLyrics(trackUri, found); break; }
                 // The retry is for an auth token that was not ready yet. A
                 // request that hung is not that, and would only hang again.
                 if (pass.timedOut && !pass.noToken) break;
@@ -740,8 +798,7 @@
         if (!item) return;
         const durMs = parseInt(item.metadata?.["duration"] || item.duration_ms || 0);
         const playing = Spicetify.Player.isPlaying();
-        send({ type: "position", position_ms: Spicetify.Player.getProgress(),
-               duration_ms: durMs, is_playing: playing });
+        sendPosition(Date.now(), item.uri || "", Spicetify.Player.getProgress(), durMs, playing);
         if (!playing) send({ type: "paused" });
         wasPlaying = playing;
     }
@@ -863,8 +920,9 @@
         if (!uri.startsWith("spotify:track:") || uri === cur || prefetchTried.has(uri)) return;
         prefetchTried.add(uri);
         if (prefetchTried.size > 200) prefetchTried.delete(prefetchTried.values().next().value);
-        const found = await fetchLyricsOnce(uri, true);
+        const found = lyricsMemory.get(uri) || await fetchLyricsOnce(uri, true);
         if (!found) return;
+        rememberLyrics(uri, found);
         send({ type: "lyrics_prefetch", track_uri: uri, source: found.source, ...found.lyrics });
     }
 
@@ -886,30 +944,83 @@
         } catch (e) { /* expected: the endpoint is deprecated */ }
     }
 
-    let tickCount = 0;
+    // ── Positions: events first, a heartbeat behind them ─────────
+    // Spotify's player (Platform.PlayerAPI, which Spicetify.Player.origin
+    // points at) announces every change of its state, a seek included, with
+    // an "update" event; Spicetify's own songchange/onplaypause are derived
+    // from it. The bridge listens to it too, so a seek is reported the
+    // moment it happens, and a position is sent only when something changed:
+    // the track, the play state, the duration, or a position off the clock
+    // by more than SEEK_EPS_MS (a seek, or a stall). The timer is then just
+    // a heartbeat that keeps Statusify's clock honest. Until the first
+    // update event has been seen the timer polls every POLL_MS, as bridge
+    // 2.2 did, so a Spotify without the event behaves exactly as before.
+    const POLL_MS             = 500;
+    const HEARTBEAT_MS        = 1000;
+    const HEARTBEAT_PAUSED_MS = 3000;
+    const EXTRAS_MS           = 2000;   // queue and player state: polled, they have no event
+    const SEEK_EPS_MS         = 300;
+    let updateEvents   = false;         // an "update" event has been seen
+    let lastSent       = null;          // the last position report: { uri, pos, at, dur, playing }
+    let lastExtrasAt   = 0;
+    let heartbeatTimer = null;
 
-    async function tick() {
+    function heartbeatMs(playing) {
+        if (!updateEvents) return POLL_MS;
+        return playing ? HEARTBEAT_MS : HEARTBEAT_PAUSED_MS;
+    }
+
+    function scheduleHeartbeat(playing) {
+        clearTimeout(heartbeatTimer);
+        heartbeatTimer = setTimeout(() => { tick("heartbeat").catch(() => {}); }, heartbeatMs(playing));
+    }
+
+    // Is a position report owed? On the heartbeat always; otherwise when the
+    // player is not where the last report said it would be by now.
+    function positionDue(now, uri, posMs, durMs, playing, heartbeat) {
+        const l = lastSent;
+        if (heartbeat || !l) return true;
+        if (l.uri !== uri || l.playing !== playing || l.dur !== durMs) return true;
+        const expected = l.pos + (l.playing ? now - l.at : 0);
+        return Math.abs(posMs - expected) > SEEK_EPS_MS;
+    }
+
+    function sendPosition(now, uri, posMs, durMs, playing) {
+        lastSent = { uri, pos: posMs, at: now, dur: durMs, playing };
+        send({ type: "position", position_ms: posMs, duration_ms: durMs, is_playing: playing });
+    }
+
+    async function tick(why = "heartbeat") {
+        const heartbeat = why === "heartbeat";
+        const now = Date.now();
         // Queue and player state change without events we can rely on;
         // polling them every ~2 s is a handful of sync getter calls.
-        if (++tickCount % 4 === 0) {
+        if (now - lastExtrasAt >= EXTRAS_MS) {
+            lastExtrasAt = now;
             try { sendQueue(false); sendPlayerState(false); } catch (e) {}
         }
         const data = Spicetify.Player.data;
-        if (!data?.item) return;
+        if (!data?.item) {
+            if (heartbeat) scheduleHeartbeat(false);
+            return;
+        }
 
         const item     = data.item;
         const trackUri = item.uri || "";
         const posMs    = Spicetify.Player.getProgress();
         const durMs    = parseInt(item.metadata?.["duration"] || item.duration_ms || 0);
         const playing  = Spicetify.Player.isPlaying();
+        // The heartbeat re-arms itself; an event re-arms it only when the
+        // play state flipped, so the paused cadence starts at once.
+        if (heartbeat || (lastSent && lastSent.playing !== playing)) scheduleHeartbeat(playing);
 
         if (!playing) {
             // "paused" once per pause, not every tick: each one made Statusify
             // close the play record and repaint. The position still goes out
-            // (as not playing), so a seek while paused shows up.
+            // (as not playing) when it moved, so a seek while paused shows up.
             if (wasPlaying) send({ type: "paused" });
             wasPlaying = false;
-            send({ type: "position", position_ms: posMs, duration_ms: durMs, is_playing: false });
+            if (positionDue(now, trackUri, posMs, durMs, false, heartbeat)) sendPosition(now, trackUri, posMs, durMs, false);
             return;
         }
         wasPlaying = true;
@@ -920,19 +1031,30 @@
             sendTrackAndLyrics(item);  // async, don't await so tick stays fast
         }
 
-        send({ type: "position", position_ms: posMs, duration_ms: durMs, is_playing: playing });
+        if (positionDue(now, trackUri, posMs, durMs, true, heartbeat)) sendPosition(now, trackUri, posMs, durMs, true);
     }
 
-    setInterval(tick, 500);
+    scheduleHeartbeat(true);
     Spicetify.Player.addEventListener("songchange", () => {
         lastTrackUri = ""; currentLyrics = null;
         abandonStaleFetches(Spicetify.Player.data?.item?.uri);
-        tick().catch(() => {});
+        tick("event").catch(() => {});
     });
     // Both events come straight from Spotify's own player update (not a
     // timer), so a track change, pause or resume is reported at once instead
-    // of on the next tick. The 500 ms interval stays as the heartbeat and
-    // notices seeks, which have no event.
-    Spicetify.Player.addEventListener("onplaypause", () => { tick().catch(() => {}); });
+    // of on the next tick.
+    Spicetify.Player.addEventListener("onplaypause", () => { tick("event").catch(() => {}); });
+    // And the player update itself, for everything else it carries: a seek
+    // above all. (Missing on an unknown Spotify build: the poll covers it.)
+    try {
+        const origin = Spicetify.Player.origin || Spicetify.Platform?.PlayerAPI;
+        const events = origin?._events;
+        if (typeof events?.addListener === "function") {
+            events.addListener("update", () => {
+                updateEvents = true;
+                tick("event").catch(() => {});
+            });
+        }
+    } catch (e) { console.warn("[LyricsBridge] player update events unavailable:", e?.message); }
     connect();
 })();
