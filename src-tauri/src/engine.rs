@@ -112,6 +112,8 @@ pub struct Engine {
     inner: Mutex<Inner>,
     pub store: Option<Store>,
     http: reqwest::Client,
+    /// LRCLIB's "not before" (a 429 or a Retry-After), shared by every lookup.
+    lrclib_limiter: crate::backoff::Limiter,
     pub lrclib_url: String,
     pub lrclib_enabled: AtomicBool,
     pub lrclib_early: Duration,
@@ -162,6 +164,7 @@ impl Engine {
             inner: Mutex::new(Inner::default()),
             store,
             http: lrclib::client(),
+            lrclib_limiter: crate::backoff::Limiter::default(),
             lrclib_url: lrclib::URL.into(),
             lrclib_enabled: AtomicBool::new(true),
             lrclib_early: LRCLIB_EARLY,
@@ -701,7 +704,7 @@ impl Engine {
         };
         let me = self.clone();
         tokio::spawn(async move {
-            match lrclib::fetch_with_backoff(&me.http, &me.lrclib_url, &artist, &title, dur, me.lrclib_backoff).await {
+            match lrclib::fetch_with_backoff(&me.http, &me.lrclib_limiter, &me.lrclib_url, &artist, &title, dur, me.lrclib_backoff).await {
                 Ok(l) => {
                     if me.still_waiting(&uri) {
                         let mut g = me.inner.lock().unwrap();

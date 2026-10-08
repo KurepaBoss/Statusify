@@ -1,4 +1,5 @@
 mod app_icon;
+mod backoff;
 mod bridge;
 #[cfg(test)]
 mod bench_bridge;

@@ -441,23 +441,35 @@ pub fn fetch(texts: &[String], tl: &str, post: Post) -> Result<BTreeMap<String, 
     Ok(out)
 }
 
+/// After a 429 or 503 nothing is asked of the service until its Retry-After
+/// has passed (this long when it names none, never longer than the cap); the
+/// fields left out are retried the next time the track plays.
+pub const RATE_LIMIT_DEFAULT_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
+pub const RATE_LIMIT_MAX_HOLD: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// The production `post`: one blocking HTTPS POST (call from spawn_blocking).
-pub fn http_post(client: &reqwest::Client, handle: &tokio::runtime::Handle, tl: &str, text: &str) -> Result<Value, String> {
+/// `lim` is the service's hold, shared by every call.
+pub fn http_post(client: &reqwest::Client, lim: &crate::backoff::Limiter, handle: &tokio::runtime::Handle, tl: &str, text: &str) -> Result<Value, String> {
+    if let Some(left) = lim.remaining() {
+        return Err(format!("translation service rate limited; {} s to go", left.as_secs() + 1));
+    }
     let url = format!("{URL}{}{URL_TAIL}", urlencode(tl));
     handle.block_on(async {
-        client
+        let r = client
             .post(url)
             .header("User-Agent", "Mozilla/5.0")
             .timeout(std::time::Duration::from_secs(TIMEOUT_S))
             .form(&[("q", text)])
             .send()
             .await
-            .map_err(|e| e.to_string())?
-            .error_for_status()
-            .map_err(|e| e.to_string())?
-            .json::<Value>()
-            .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        let code = r.status();
+        if code.as_u16() == 429 || code.as_u16() == 503 {
+            let hold = crate::backoff::retry_after(r.headers()).unwrap_or(RATE_LIMIT_DEFAULT_HOLD).min(RATE_LIMIT_MAX_HOLD);
+            lim.hold(hold);
+            return Err(format!("HTTP {code}; translation paused for {} s", hold.as_secs()));
+        }
+        r.error_for_status().map_err(|e| e.to_string())?.json::<Value>().await.map_err(|e| e.to_string())
     })
 }
 

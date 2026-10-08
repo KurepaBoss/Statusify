@@ -216,11 +216,11 @@ fn fetch_art(url: &str) -> Result<String, String> {
     }
     let url = url.to_string();
     tauri::async_runtime::block_on(async move {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .user_agent("Statusify")
-            .build()
-            .map_err(|e| e.to_string())?;
+        // One client (and its connection pool) for every cover, not one per call.
+        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        let client = CLIENT.get_or_init(|| {
+            reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).user_agent("Statusify").build().unwrap_or_else(|_| reqwest::Client::new())
+        });
         let r = client.get(&url).send().await.map_err(|e| e.to_string())?;
         if !r.status().is_success() {
             return Err(format!("HTTP {}", r.status()));

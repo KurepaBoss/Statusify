@@ -59,7 +59,8 @@ impl TState {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let handle = tauri::async_runtime::handle().inner().clone();
-        Self::new(cache, Arc::new(move |tl, text| t::http_post(&client, &handle, tl, text)))
+        let lim = crate::backoff::Limiter::default();
+        Self::new(cache, Arc::new(move |tl, text| t::http_post(&client, &lim, &handle, tl, text)))
     }
 
     fn settings(cfg: &crate::config::Config) -> (String, String) {
