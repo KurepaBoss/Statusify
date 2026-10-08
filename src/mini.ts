@@ -27,6 +27,7 @@ const lyricEl = $("lyric");
 const toggleBtn = $("toggle");
 
 let lyric: string | null = null; // text currently shown
+let lastColorKey = "";
 let art = "";
 let shown = { title: "\u0000", artist: "\u0000" };
 let awayTimer = 0;
@@ -155,19 +156,19 @@ function paint(s: Snapshot) {
   const accent = pickAccent(w.accent, pal, w.tint !== false, dark, s.track?.uri);
   const fg: [number, number, number] = dark ? [255, 255, 255] : [18, 20, 26];
   const acc = mix(accent, fg, 0.2);
-  pill.style.setProperty("--accent", rgb(acc));
-  pill.style.setProperty("--glyph", luma(acc) > 150 ? "rgb(18, 20, 26)" : "#fff");
   const base = parseColor(dark ? pal?.base : (pal?.light?.base ?? pal?.base));
   const cols = (pal?.colors ?? pal?.blobs) as unknown;
   const first = base ?? (Array.isArray(cols) ? parseColor(cols[1] ?? cols[0]) : null);
-  if (first && w.tint !== false && (!pal?.uri || pal.uri === s.track?.uri)) {
+  const tinted = !!first && w.tint !== false && (!pal?.uri || pal.uri === s.track?.uri);
+  // paint() runs every 120 ms for the lyric; the colours rarely change.
+  const colorKey = `${acc.join()}|${tinted ? rgb(base ? base : dark ? mix(first!, [0, 0, 0], 0.55) : mix(first!, [255, 255, 255], 0.75)) : ""}`;
+  if (colorKey !== lastColorKey) {
+    lastColorKey = colorKey;
+    pill.style.setProperty("--accent", rgb(acc));
+    pill.style.setProperty("--glyph", luma(acc) > 150 ? "rgb(18, 20, 26)" : "#fff");
     // The palette's own base is already normalised for the theme.
-    pill.style.setProperty(
-      "--base",
-      rgb(base ? base : dark ? mix(first, [0, 0, 0], 0.55) : mix(first, [255, 255, 255], 0.75)),
-    );
-  } else {
-    pill.style.removeProperty("--base");
+    if (tinted) pill.style.setProperty("--base", colorKey.split("|")[1]);
+    else pill.style.removeProperty("--base");
   }
 
   const t = s.track;

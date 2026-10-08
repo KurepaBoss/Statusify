@@ -82,6 +82,7 @@ let elTitle: HTMLElement, elArtist: HTMLElement, elInfo: HTMLElement, elLike: HT
 let elSeek: HTMLElement, elFill: HTMLElement, elKnob: HTMLElement, elTip: HTMLElement, elEl: HTMLElement, elTot: HTMLElement;
 let elPlay: HTMLElement, elVol: HTMLElement, elRing: SVGElement, elErr: HTMLElement, elSleep: HTMLElement, elWarn: HTMLElement;
 let elDelayLab: HTMLElement, elDelayVal: HTMLElement, elFoot: HTMLElement, elSheet: HTMLElement;
+let elRpcLabel: HTMLElement, elShuffle: HTMLElement, elRepeat: HTMLElement, elQueueBtn: HTMLElement, elVolGlyph: HTMLElement, elSp: HTMLElement, elDc: HTMLElement;
 const actBtns: Record<string, HTMLElement> = {};
 let covers: HTMLImageElement[] = [];
 let coverPh: HTMLElement;
@@ -113,6 +114,7 @@ let lastFill = "";
 let lastEl = "";
 let lastLiveTier = -1;
 let lastBeatKey = "";
+let lastRingDash = "";
 let seekRect: DOMRect | null = null;
 let seekW = 0;
 let overflow: string[] = [];
@@ -136,10 +138,19 @@ function tier(): number {
   return autoTier;
 }
 
+let themeKey = "";
+
 function applyTheme() {
   const p = prefs();
   const animations = p.animations !== false;
   const isDark = dark();
+  // Everything below is a pure function of these; a snapshot that moved only
+  // the clock (or an unrelated extra) must not restyle the page root, which
+  // would recalculate the style of every element under it.
+  const palRef = ex("palette");
+  const key = [animations, isDark, p.album_tint !== false, p.accent, p.render_quality, autoTier, snap?.track?.album_art ?? "", palRef?.uri ?? "", palRef?.accent ?? "", palRef?.base ?? ""].join("|");
+  if (key === themeKey) return;
+  themeKey = key;
   const html = document.documentElement;
   html.dataset.anim = animations ? "on" : "off";
   if (isDark) delete html.dataset.light; else html.dataset.light = "";
@@ -205,8 +216,14 @@ function layoutActions() {
   more.hidden = !r.overflow.length;
 }
 
+/** What geometry depends on besides the window's size (which the ResizeObservers watch). */
+let geoPrefs = "";
+
 function updateGeometry() {
   if (!np) return;
+  // Reading clientWidth/offsetHeight forces a layout if anything is dirty,
+  // so this runs only when something geometry depends on changed, never on
+  // every snapshot.
   const W = np.clientWidth, H = np.clientHeight;
   if (!W || !H) return;
   const boost = Number(prefs().lyric_font_boost ?? 0);
@@ -291,8 +308,8 @@ function renderHeader(s: Snapshot) {
   const pill = L.rpcPill(ex("core")?.rpc_enabled, s.discord_user, ex("shell")?.app_id_set, ex("core")?.discord_error);
   elRpc.classList.toggle("on", pill.state === "on");
   elRpc.classList.toggle("waiting", pill.state === "waiting");
-  elRpc.title = pill.title;
-  setText(elRpc.querySelector("span")!, pill.label);
+  if (elRpc.title !== pill.title) elRpc.title = pill.title;
+  setText(elRpcLabel, pill.label);
 }
 
 // ── Sheet model ─────────────────────────────────────────────
@@ -319,9 +336,19 @@ function buildSpecs(s: Snapshot, kind: Cur["kind"], timing: Any): { specs: RowSp
   return { specs: [{ kind: "static", k: -1, t0: 0, t1: null, text: "" }], plan: [] };
 }
 
+let subsFor: { tr: unknown; specs: unknown; out: { subs: (string | null)[] | null; sig: string } } | null = null;
+
 function computeSubs(s: Snapshot): { subs: (string | null)[] | null; sig: string } {
   const tr = ex("translation");
   if (!tr || !s.track || tr.uri !== s.track.uri || tr.mode === "off" || !tr.data) return { subs: null, sig: "off" };
+  // The same translation over the same rows gives the same sublines.
+  if (subsFor && subsFor.tr === tr && subsFor.specs === cur.specs) return subsFor.out;
+  const out = computeSubsNow(tr);
+  subsFor = { tr, specs: cur.specs, out };
+  return out;
+}
+
+function computeSubsNow(tr: Any): { subs: (string | null)[] | null; sig: string } {
   const subs = cur.specs.map((sp, i) => {
     if (cur.kind === "synced") return sp.kind === "line" ? L.subline(tr.mode, tr.data[String(sp.k)]) : null;
     if (cur.kind === "plain") return L.subline(tr.mode, tr.data[String(i)]);
@@ -385,16 +412,15 @@ function renderFooter(s: Snapshot) {
   const lv = live();
   const glyph = pl ? "pause" : "play";
   if (elPlay.dataset.g !== glyph) { elPlay.dataset.g = glyph; elPlay.innerHTML = icon(glyph); }
-  q(".sh").classList.toggle("on", !!p.shuffle);
-  const rp = q(".rp");
-  rp.classList.toggle("on", Number(p.repeat) > 0);
-  rp.classList.toggle("one", Number(p.repeat) === 2);
-  q(".q").classList.toggle("on", panels?.open === "queue");
+  elShuffle.classList.toggle("on", !!p.shuffle);
+  elRepeat.classList.toggle("on", Number(p.repeat) > 0);
+  elRepeat.classList.toggle("one", Number(p.repeat) === 2);
+  elQueueBtn.classList.toggle("on", panels?.open === "queue");
   const v = curVolume();
   const vg = v <= 0.001 ? "vol0" : v < 0.5 ? "vol1" : "vol2";
-  const vgEl = q(".vg");
-  if (vgEl.dataset.g !== vg) { vgEl.dataset.g = vg; vgEl.innerHTML = icon(vg); }
-  elRing.setAttribute("stroke-dasharray", `${(75.4 * L.clamp(v)).toFixed(1)} 200`);
+  if (elVolGlyph.dataset.g !== vg) { elVolGlyph.dataset.g = vg; elVolGlyph.innerHTML = icon(vg); }
+  const dash = `${(75.4 * L.clamp(v)).toFixed(1)} 200`;
+  if (lastRingDash !== dash) { lastRingDash = dash; elRing.setAttribute("stroke-dasharray", dash); }
   np.classList.toggle("dead", !lv);
 
   const off = offsetMs();
@@ -407,9 +433,10 @@ function renderFooter(s: Snapshot) {
   actBtns.top.classList.toggle("on", !!prefs().always_on_top);
   actBtns.overlay.classList.toggle("on", !!ex("windows")?.overlay);
 
-  q(".sp").classList.toggle("on", lv);
-  q(".dc").classList.toggle("on", !!s.discord_user);
-  q(".dc").title = s.discord_user ? `Connected as ${s.discord_user}` : "Not connected";
+  elSp.classList.toggle("on", lv);
+  elDc.classList.toggle("on", !!s.discord_user);
+  const dcTitle = s.discord_user ? `Connected as ${s.discord_user}` : "Not connected";
+  if (elDc.title !== dcTitle) elDc.title = dcTitle;
   const sleep: string = ex("core")?.sleep_label || "";
   if (elSleep.dataset.s !== sleep) {
     elSleep.dataset.s = sleep;
@@ -421,7 +448,8 @@ function renderFooter(s: Snapshot) {
   const { text: err, fix: fixable } = L.footerNotice(localErr, s.note || "", String(ex("core")?.bridge_warning || ""));
   setText(elErr, err);
   elErr.classList.toggle("click", fixable);
-  elErr.title = fixable ? "Click to repair the Spotify connection" : "";
+  const errTitle = fixable ? "Click to repair the Spotify connection" : "";
+  if (elErr.title !== errTitle) elErr.title = errTitle;
 }
 
 /** Right of the status row: dropped lines, and "Rate limited · Ns" counting down
@@ -696,8 +724,10 @@ function tick(ts: number) {
   const dur = s.duration_ms;
 
   // Seek bar and times: a transform and two strings, nothing that lays out.
+  // The fill is written when it has moved a quarter pixel (a 3-minute song
+  // moves it 2 px a second), not on every frame.
   const frac = drag ?? (dur > 0 ? L.clamp(pos / dur) : 0);
-  const key = frac.toFixed(4);
+  const key = (Math.round(frac * Math.max(1, seekW) * 4) / 4).toFixed(2);
   if (key !== lastFill) {
     lastFill = key;
     elFill.style.transform = `scaleX(${frac})`;
@@ -737,8 +767,11 @@ function tick(ts: number) {
 }
 
 // ── Snapshot ────────────────────────────────────────────────
-let lastQueueRef: unknown = null;
+let lastQueueSig = "";
 let infoTimer = 0;
+
+/** The queue as the panel shows it; a new snapshot object with the same queue is no change. */
+const queueSig = (q: QueueItem[] | undefined) => (q ?? []).map((t) => `${t.uri}|${t.uid}|${t.title}|${t.album_art}`).join("\n");
 
 function render(s: Snapshot) {
   snap = s;
@@ -751,15 +784,17 @@ function render(s: Snapshot) {
   renderHeader(s);
   syncSheet(s);
   renderFooter(s);
-  const queue = ex("queue");
-  if (queue !== lastQueueRef) { lastQueueRef = queue; panels.setQueue((queue ?? []) as QueueItem[]); }
+  const queue = ex("queue") as QueueItem[] | undefined;
+  const qs = queueSig(queue);
+  if (qs !== lastQueueSig) { lastQueueSig = qs; panels.setQueue(queue ?? []); }
   panels.setPinned(!!prefs().pinned);
   if (s.lyrics.mode === "none" && s.track) {
     // "Looking for lyrics…" turns into "No lyrics" after 8 s.
     window.clearTimeout(infoTimer);
     infoTimer = window.setTimeout(() => snap && setText(elInfo, infoText(snap)), Math.max(50, 8100 - (Date.now() - trackAt)));
   }
-  updateGeometry();
+  const gp = `${prefs().lyric_font_boost ?? 0}|${fs}`;
+  if (gp !== geoPrefs) { geoPrefs = gp; updateGeometry(); }
 }
 
 // ── Interaction ─────────────────────────────────────────────
@@ -913,6 +948,13 @@ export function mount(root: HTMLElement) {
   elWarn = q(".warn");
   elDelayLab = q(".np-delay .lab");
   elDelayVal = q(".np-chip .val");
+  elRpcLabel = elRpc.querySelector("span")!;
+  elShuffle = q(".sh");
+  elRepeat = q(".rp");
+  elQueueBtn = q(".q");
+  elVolGlyph = q(".vg");
+  elSp = q(".sp");
+  elDc = q(".dc");
   covers = [...np.querySelectorAll<HTMLImageElement>(".np-cover img")];
   coverPh = q(".np-cover .ph");
   for (const k of ["copy", "top", "overlay", "mini", "ov_more"]) actBtns[k] = q(`[data-k="${k}"]`);

@@ -188,9 +188,16 @@ function present(next: Scene, slide: boolean, up: boolean, lhPx: number) {
 
 const rgbHex = (c: [number, number, number]) => "#" + c.map((n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, "0")).join("");
 
+let layoutKey = "";
+
 function applyLayout(s: Snapshot) {
   const w = s.extras?.windows ?? {};
   const l = w.layout ?? {};
+  // Every step() comes here (up to every few ms during a line); the writes
+  // below are the same unless the layout, accent or palette changed.
+  const key = `${JSON.stringify(l)}|${w.accent}|${w.tint}|${w.dark}|${s.track?.uri}|${s.extras?.palette?.uri}|${s.extras?.palette?.accent}`;
+  if (key === layoutKey) return;
+  layoutKey = key;
   const set = (k: string, v: unknown) => {
     if (typeof v === "number") root.style.setProperty(k, `${v}px`);
   };

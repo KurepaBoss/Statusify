@@ -1036,7 +1036,10 @@ export function mount(root: HTMLElement) {
       autoShownTag = u.tag;
       updateDialog(u);
     }
-    syncAll();
+    // The controls are brought up to date on show(); off screen, every
+    // snapshot (twice a second while playing) would re-run every one of
+    // them for nothing.
+    if (visible) syncAll();
   });
   call<{ code: string; name: string }[]>("settings", "languages").then((l) => (languages = l)).finally(syncAll).catch(() => undefined);
   call<string[]>("settings", "fonts").then((f) => (fonts = f)).finally(syncAll).catch(() => undefined);
@@ -1049,6 +1052,7 @@ export function mount(root: HTMLElement) {
 
 export function show() {
   visible = true;
+  syncAll();
   void refreshPrefs();
   void refreshShell();
   void pollLog(true);

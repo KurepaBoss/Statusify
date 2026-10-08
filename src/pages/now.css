@@ -83,7 +83,9 @@
   transition: transform 0.72s var(--ease) var(--dl, 0ms), opacity 0.72s var(--ease) var(--dl, 0ms),
               filter 0.72s var(--ease) var(--dl, 0ms), background 0.15s;
   }
-.np .ln.off { visibility: hidden; }
+/* Off screen (beyond the band): not painted, and not animated either; a row
+   comes back already in place. */
+.np .ln.off { visibility: hidden; transition: none; }
 .np .rows.nt .ln,
 .np .sheet.noanim .ln { transition: none; }
 /* distance from the sung row: opacity and blur by bucket (the Python alpha table) */
