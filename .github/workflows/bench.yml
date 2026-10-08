@@ -5,8 +5,9 @@ name: Bench
 # numbers instead of a guess. Started by hand (Actions tab, Bench, Run
 # workflow), or by a push whose commit message contains "[bench]". The
 # results (one JSON line per benchmark) are left as the workflow artifact
-# `bench-results`; the runner is a shared 4-core VM, so read the CPU numbers
-# to within 10-15 % and trust the counts (frames, wake-ups, bytes) exactly.
+# `bench-results`, in the job summary, and as a comment on the commit; the
+# runner is a shared 4-core VM, so read the CPU numbers to within 10-15 %
+# and trust the counts (frames, wake-ups, bytes) exactly.
 on:
   workflow_dispatch:
     inputs:
@@ -18,7 +19,7 @@ on:
     branches: ['**']
 
 permissions:
-  contents: read
+  contents: write # the results go on the commit as a comment
 
 concurrency:
   group: bench-${{ github.ref }}
@@ -89,6 +90,25 @@ jobs:
           npx vite --port 1420 --strictPort > vite.log 2>&1 &
           for i in $(seq 1 60); do curl -sf http://localhost:1420/tests-ts/harness.html > /dev/null && break; sleep 1; done
           node tests/bench/ui_profile.mjs --runs 3 --seconds 20 --out bench-ui.json > /dev/null
+
+      - name: Leave the results on the commit
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Bench results for ${GITHUB_SHA::8} (run ${{ github.run_id }}, ${RUNNER_OS})"
+            echo
+            echo '```json'
+            cat bench-results.jsonl 2>/dev/null || true
+            for f in bench-traffic.json bench-traffic-noevents.json bench-ui.json; do
+              if [ -f "$f" ]; then node -e "const j=require('./$f'); console.log(JSON.stringify({file:'$f', ...(j.median ? {median:j.median} : j)}))"; fi
+            done
+            echo '```'
+          } > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" -F body=@comment.md > /dev/null || echo "could not comment on the commit"
 
       - uses: actions/upload-artifact@v4
         if: always()
