@@ -36,7 +36,6 @@ html, body { height: 100%; background: var(--bg); color: var(--text);
    The cover, enlarged and blurred, drifts under five blobs of its colours.
    Only transform and opacity ever animate, so it stays on the compositor. */
 @property --bd-base { syntax: "<color>"; inherits: true; initial-value: #121216; }
-@property --c { syntax: "<color>"; inherits: false; initial-value: #202028; }
 
 #backdrop { position: fixed; inset: 0; overflow: hidden; background: #000;
   --bd-base: #121216; transition: --bd-base 1.6s ease-in-out; contain: strict; }
@@ -53,8 +52,10 @@ html, body { height: 100%; background: var(--bg); color: var(--text);
 .bd-water { position: absolute; inset: 0; background: var(--bd-base); opacity: 1; transition: opacity 1.2s ease-in-out; }
 #backdrop.cover .bd-water { opacity: 0.3; }
 .bl { position: absolute; left: 50%; top: 50%; width: 0; height: 0; will-change: transform; }
-.bd-blob { position: absolute; border-radius: 50%; will-change: transform;
-  background: radial-gradient(closest-side, var(--c), transparent); transition: --c 1.6s ease-in-out; }
+/* The disc is a 128 px canvas (now_fx.ts paintDisc) the GPU scales up; its
+   colour fade is drawn there, not transitioned (see now_fx.ts). */
+.bd-blob { position: absolute; border-radius: 50%; will-change: transform; }
+.bd-disc { display: block; width: 100%; height: 100%; }
 @keyframes bd-x { from { transform: translate3d(calc(var(--amp) * -1), 0, 0); } to { transform: translate3d(var(--amp), 0, 0); } }
 @keyframes bd-y { from { transform: translate3d(0, calc(var(--amp) * -1), 0); } to { transform: translate3d(0, var(--amp), 0); } }
 @keyframes bd-s { from { transform: scale(0.82); } to { transform: scale(1.18); } }

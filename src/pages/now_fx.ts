@@ -12,8 +12,13 @@
 // Everything that moves is a CSS animation of transform on a composited
 // layer, and the cover is a 96 px canvas texture the GPU scales up, so a
 // frame costs the compositor nothing but the blend (the Python version
-// rebuilt a PIL image every frame). Brightness per page is one opacity on
-// #shade (index.html), set from body[data-page] in styles.css.
+// rebuilt a PIL image every frame). Each blob is a 128 px canvas texture too
+// (a radial gradient is linear in the radius, so the GPU's bilinear upscale
+// reproduces it; a CSS gradient the size of the screen was a 2000 px texture
+// per blob, rasterised again on every frame of its 1.6 s colour fade at a
+// track change). The fade is drawn here, with CSS's ease-in-out, into that
+// small texture. Brightness per page is one opacity on #shade (index.html),
+// set from body[data-page] in styles.css.
 
 export type BdColors = { base: string; blobs: string[] };
 
@@ -29,10 +34,66 @@ export function neutralColors(dark: boolean, accent?: string): BdColors {
   return { base: c.base, blobs };
 }
 
+type Rgb = [number, number, number];
+
+/** #rgb or #rrggbb to channels; anything else is black. */
+export function hexRgb(h: string): Rgb {
+  const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(h.trim());
+  if (!m) return [0, 0, 0];
+  const x = m[1].length === 3 ? m[1].split("").map((c) => c + c).join("") : m[1];
+  return [0, 2, 4].map((i) => parseInt(x.slice(i, i + 2), 16)) as Rgb;
+}
+
 function mixHex(a: string, b: string, t: number): string {
-  const p = (h: string) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
-  const [x, y] = [p(a), p(b)];
+  const [x, y] = [hexRgb(a), hexRgb(b)];
   return "#" + x.map((v, i) => Math.round(v + (y[i] - v) * t).toString(16).padStart(2, "0")).join("");
+}
+
+/** How long a blob takes to change colour, and its curve: CSS `1.6s ease-in-out`. */
+export const BLOB_FADE_MS = 1600;
+const EASE_IN_OUT = cubicBezier(0.42, 0, 0.58, 1);
+
+/** y(x) of a CSS cubic-bezier timing function. */
+export function cubicBezier(x1: number, y1: number, x2: number, y2: number): (x: number) => number {
+  const cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx;
+  const cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by;
+  const sx = (t: number) => ((ax * t + bx) * t + cx) * t;
+  const sy = (t: number) => ((ay * t + by) * t + cy) * t;
+  const dx = (t: number) => (3 * ax * t + 2 * bx) * t + cx;
+  return (x: number) => {
+    if (x <= 0) return 0;
+    if (x >= 1) return 1;
+    let t = x;
+    for (let i = 0; i < 8; i++) {
+      const d = dx(t);
+      if (Math.abs(d) < 1e-6) break;
+      const e = sx(t) - x;
+      if (Math.abs(e) < 1e-6) return sy(t);
+      t -= e / d;
+    }
+    let lo = 0, hi = 1;
+    t = x;
+    while (hi - lo > 1e-6) {
+      if (sx(t) < x) lo = t; else hi = t;
+      t = (lo + hi) / 2;
+    }
+    return sy(t);
+  };
+}
+
+/** The texture of one blob: a disc fading linearly from `rgb` at the centre
+ *  to nothing at the edge, as CSS `radial-gradient(closest-side, c, transparent)`
+ *  paints it (the alpha fades, the colour stays: premultiplied interpolation). */
+export const DISC_PX = 128;
+export function paintDisc(c: HTMLCanvasElement, rgb: Rgb) {
+  const ctx = c.getContext("2d")!;
+  const r = DISC_PX / 2;
+  const g = ctx.createRadialGradient(r, r, 0, r, r, r);
+  g.addColorStop(0, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},1)`);
+  g.addColorStop(1, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0)`);
+  ctx.clearRect(0, 0, DISC_PX, DISC_PX);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, DISC_PX, DISC_PX);
 }
 
 function rng(seed: number) {
@@ -54,6 +115,10 @@ export class Backdrop {
   private gen = 0;
   private water: HTMLElement;
   private blobs: HTMLElement[] = [];
+  private discs: HTMLCanvasElement[] = [];
+  /** Each blob's colour: what is shown now, and the fade it is in (from, to, started at). */
+  private tint: { now: Rgb; from: Rgb; to: Rgb; at: number }[] = [];
+  private fadeRaf = 0;
   private beat: HTMLElement;
   private lastBeat = 0;
 
@@ -115,9 +180,32 @@ export class Backdrop {
       const disc = wrap("bd-blob", "bd-s", fr, pr);
       disc.style.width = disc.style.height = sz;
       disc.style.margin = `calc(${sz} / -2) 0 0 calc(${sz} / -2)`;
+      const c = document.createElement("canvas");
+      c.width = c.height = DISC_PX;
+      c.className = "bd-disc";
+      disc.append(c);
+      const start = hexRgb(NEUTRAL_DARK.blobs[n]);
+      paintDisc(c, start);
       this.blobs.push(disc);
+      this.discs.push(c);
+      this.tint.push({ now: start, from: start, to: start, at: 0 });
     }
   }
+
+  /** One frame of the blobs' colour fades; stops itself when they are done. */
+  private fadeFrame = (ts: number) => {
+    this.fadeRaf = 0;
+    let busy = false;
+    this.tint.forEach((t, i) => {
+      if (t.now === t.to) return;
+      const k = EASE_IN_OUT(Math.min(1, (ts - t.at) / BLOB_FADE_MS));
+      const rgb = (k >= 1 ? t.to : t.from.map((v, j) => v + (t.to[j] - v) * k)) as Rgb;
+      t.now = k >= 1 ? t.to : rgb;
+      paintDisc(this.discs[i], rgb);
+      if (k < 1) busy = true;
+    });
+    if (busy) this.fadeRaf = requestAnimationFrame(this.fadeFrame);
+  };
 
   /** Crossfade to a new cover; null shows the water alone. */
   setCover(url: string | null) {
@@ -165,7 +253,18 @@ export class Backdrop {
 
   setColors(c: BdColors) {
     this.root.style.setProperty("--bd-base", c.base);
-    this.blobs.forEach((b, i) => b.style.setProperty("--c", c.blobs[i % c.blobs.length]));
+    const now = performance.now();
+    let changed = false;
+    this.tint.forEach((t, i) => {
+      const to = hexRgb(c.blobs[i % c.blobs.length]);
+      if (to.join() === t.to.join()) return;
+      // Like a CSS transition: from wherever the colour is now.
+      t.from = t.now;
+      t.to = to;
+      t.at = now;
+      changed = true;
+    });
+    if (changed && !this.fadeRaf) this.fadeRaf = requestAnimationFrame(this.fadeFrame);
   }
 
   /** Cover mode shows the water at 30 % over the cover; otherwise alone. */
