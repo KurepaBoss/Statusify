@@ -38,17 +38,40 @@ struct Sim {
     lines: Vec<String>,
     dropped: u32,
     rl: u32,
+    /// Ticks taken (wake-ups of the loop this stands in for).
+    wakes: u32,
 }
 
 impl Sim {
     fn new() -> Self {
         let t0 = Instant::now();
-        Sim { p: Presence::new(true, t0), t0, sends: vec![], lines: vec![], dropped: 0, rl: 0 }
+        Sim { p: Presence::new(true, t0), t0, sends: vec![], lines: vec![], dropped: 0, rl: 0, wakes: 0 }
+    }
+    /// `Presence::next_due` at elapsed `ms`, in whole ms (rounded up), for
+    /// the snapshot as the last tick saw it.
+    fn due(&self, ms: u64, s: &Snapshot, set: &Settings) -> Option<u64> {
+        self.p.next_due(s, self.t0 + Duration::from_millis(ms), BASE_MS + ms as i64, set).map(|d| (d.as_secs_f64() * 1000.0).ceil() as u64)
+    }
+    /// Play like `run_loop` does: wake when next_due says, or at the next
+    /// position report (the bridge sends one every 500 ms), never on a 50 ms
+    /// poll.
+    fn play_due(&mut self, start_ms: u64, s: &mut Snapshot, from: i64, dur: u64, set: &Settings) -> u64 {
+        let mut t = start_ms;
+        let mut spins = 0;
+        while t <= start_ms + dur {
+            self.at(t, s, from + (t - start_ms) as i64, set);
+            let due = self.due(t, s, set).unwrap_or(500).min(500);
+            spins = if due == 0 { spins + 1 } else { 0 };
+            assert!(spins < 4, "the loop would spin at {t} ms");
+            t += due;
+        }
+        t
     }
     fn at(&mut self, ms: u64, s: &mut Snapshot, pos: i64, set: &Settings) -> Vec<Effect> {
         let now_ms = BASE_MS + ms as i64;
         s.position_ms = pos;
         s.position_at_ms = now_ms;
+        self.wakes += 1;
         let eff = self.p.tick(s, self.t0 + Duration::from_millis(ms), now_ms, set);
         for e in &eff {
             match e {
@@ -92,6 +115,66 @@ impl Sim {
 /// The most of `times` (ms) inside any 20 s window.
 fn max_in_window(times: &[u64]) -> usize {
     (0..times.len()).map(|i| times[i..].iter().take_while(|x| **x < times[i] + 20_000).count()).max().unwrap_or(0)
+}
+
+#[test]
+fn next_due_is_the_settle_then_the_plan_then_the_next_line_not_a_poll() {
+    let mut sim = Sim::new();
+    let mut s = snap("spotify:track:a", sheet(&[(0, "first"), (6000, "second"), (12000, "third")]), 30000);
+    let set = Settings::default();
+    sim.at(0, &mut s, 0, &set);
+    assert!(sim.sends.is_empty());
+    // Known lyrics: the first frame waits KNOWN_SETTLE, and nothing is due before.
+    assert_eq!(sim.due(0, &s, &set), Some(400));
+    sim.at(400, &mut s, 400, &set);
+    assert_eq!(sim.sends.len(), 1, "sent the moment the settle ends");
+    // After a send the plan is remade at once ...
+    assert_eq!(sim.due(400, &s, &set), Some(0));
+    sim.at(400, &mut s, 400, &set);
+    assert_eq!(sim.sends.len(), 1);
+    // ... and the next wake is for the second line, seconds away.
+    let d = sim.due(400, &s, &set).unwrap();
+    assert!(d > 500 && d <= 5600, "next due in {d} ms");
+}
+
+#[test]
+fn nothing_is_due_while_paused_once_the_profile_is_down() {
+    let mut sim = Sim::new();
+    let mut s = snap("spotify:track:a", sheet(&[(0, "first")]), 30000);
+    let set = Settings::default();
+    let t = sim.play(0, &mut s, 0, 2000, &set);
+    assert_eq!(sim.sends.len(), 1);
+    s.is_playing = false;
+    sim.at(t, &mut s, 2000, &set);
+    assert_eq!(sim.due(t, &s, &set), Some(1500), "the pause hold");
+    let t = sim.idle(t, &mut s, 2000, 3000, &set);
+    assert_eq!(sim.sends.len(), 2, "cleared");
+    assert_eq!(sim.due(t, &s, &set), None, "paused and cleared: only a change can bring work");
+}
+
+#[test]
+fn waking_at_next_due_sends_the_same_frames_as_polling_and_no_later() {
+    let dense: Vec<String> = (0..40).map(|i| format!("line {i:02} {}", "la ".repeat(22))).collect();
+    let dense: Vec<(i64, &str)> = dense.iter().enumerate().map(|(i, w)| (i as i64 * 1200, w.as_str())).collect();
+    let mut hook: Vec<(i64, &str)> = (0..6).map(|i| (i * 3000, if i % 2 == 0 { "hook" } else { "verse" })).collect();
+    hook.push((40000, "hook"));
+    hook.push((43000, "end"));
+    let sparse = vec![(0, "first"), (6000, "second"), (12000, "third"), (30000, "fourth")];
+    for (name, lines, dur) in [("sparse", sparse, 40_000u64), ("hook+gap", hook, 50_000), ("dense", dense, 55_000)] {
+        let set = Settings { instrumental_text: "~ music ~".into(), ..Default::default() };
+        let mut poll = Sim::new();
+        let mut s1 = snap("spotify:track:x", sheet(&lines), dur as i64 + 5000);
+        poll.play(0, &mut s1, 0, dur, &set);
+        let mut ev = Sim::new();
+        let mut s2 = snap("spotify:track:x", sheet(&lines), dur as i64 + 5000);
+        ev.play_due(0, &mut s2, 0, dur, &set);
+        assert_eq!(ev.states(), poll.states(), "{name}: the same frames");
+        for ((te, _), (tp, _)) in ev.sends.iter().zip(&poll.sends) {
+            assert!(te <= tp, "{name}: a frame at {te} ms, the poll had it at {tp} ms");
+        }
+        assert!(ev.max_per_20s() <= 5, "{name}");
+        assert!(ev.wakes * 3 < poll.wakes, "{name}: {} wake-ups against {} polls", ev.wakes, poll.wakes);
+    }
 }
 
 #[test]

@@ -186,6 +186,7 @@ pub fn act(env: &Env, action: &str, args: &Value) -> Result<Value, String> {
                 args.get("enabled").and_then(|v| v.as_bool()).ok_or("enabled: true/false expected")?
             };
             e.core.set_rpc_enabled(on);
+            e.wake();
             crate::log(&format!("RPC {}", if on { "enabled" } else { "disabled" }));
         }
         "set_track_offset" => {
@@ -272,6 +273,7 @@ pub fn act(env: &Env, action: &str, args: &Value) -> Result<Value, String> {
                 return Err("Not connected to Discord — cannot send test".into());
             }
             e.core.with(|c| c.test_request = true);
+            e.wake();
         }
         "reconnect_rpc" => {
             if !e.core.with(|c| c.presence_running) {

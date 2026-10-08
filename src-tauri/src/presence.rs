@@ -491,6 +491,93 @@ impl Presence {
         self.cur_line.as_ref().is_some_and(|l| self.shown.contains(l))
     }
 
+    /// When the ledger will have more than `keep` free slots: now, or when
+    /// enough of the oldest frames in the window have aged out.
+    fn slot_after(&self, now: Instant, keep: usize) -> Option<Instant> {
+        let live: Vec<Instant> = self.rl.iter().copied().filter(|t| now.duration_since(*t) < RATE_WINDOW).collect();
+        let allowed = RATE_CALLS.checked_sub(keep + 1)?;
+        if live.len() <= allowed {
+            return Some(now);
+        }
+        live.get(live.len() - allowed - 1).map(|t| *t + RATE_WINDOW)
+    }
+
+    /// How long until `tick` could have something to do, from the state the
+    /// last tick left and the same inputs; None when nothing is timed and
+    /// only a change (a position report, a track, Discord, the switch) can
+    /// bring work. `run_loop` sleeps exactly this long instead of polling
+    /// every 50 ms: a planned line goes out at its time rather than up to a
+    /// poll late, and nothing wakes while paused or idle.
+    pub fn next_due(&self, snap: &Snapshot, now: Instant, now_ms: i64, s: &Settings) -> Option<Duration> {
+        if snap.discord_user.is_none() {
+            return None;
+        }
+        let mut due: Option<Instant> = None;
+        let mut note = |t: Instant| due = Some(due.map_or(t, |d| d.min(t)));
+        let owed_at = |keep: usize| self.slot_after(now, keep);
+        if !s.enabled {
+            if let Some(why) = self.owed {
+                if let Some(t) = owed_at(if why == Owed::Pause { self.pause_reserve } else { 0 }) {
+                    note(t);
+                }
+            }
+            return due.map(|t| t.saturating_duration_since(now));
+        }
+        if !snap.is_playing {
+            if let Some((t, _)) = self.pause_since {
+                note(t + PAUSE_HOLD);
+            }
+            if let Some(why) = self.owed {
+                if let Some(t) = owed_at(if why == Owed::Pause { self.pause_reserve } else { 0 }) {
+                    note(t);
+                }
+            }
+            return due.map(|t| t.saturating_duration_since(now));
+        }
+        let Some(track) = snap.track.as_ref().filter(|t| !t.title.is_empty()) else { return None };
+        if track.blacklisted {
+            if self.owed.is_some() {
+                if let Some(t) = owed_at(0) {
+                    note(t);
+                }
+            }
+            return due.map(|t| t.saturating_duration_since(now));
+        }
+        let known = !snap.lyrics.is_none();
+        if let Some(g) = self.gate_until(known).filter(|g| *g > now) {
+            note(g);
+        }
+        if let Some(b) = self.bar_fix_at.filter(|b| *b > now) {
+            note(b);
+        }
+        let pos = (snap.estimated_position(now_ms) + s.offset_ms) as f64;
+        // A song time as a wall time (never in the past).
+        let wall = |song_ms: f64| now + Duration::from_secs_f64(((song_ms - pos) / 1000.0).max(0.0));
+        match self.upcoming.as_ref() {
+            None => return Some(Duration::ZERO), // a plan is due (after a send, or overtaken)
+            Some(v) => {
+                if let Some(ev) = v.first() {
+                    if pos < ev.t {
+                        note(wall(ev.t));
+                    } else if let Some(t) = owed_at(0) {
+                        note(t); // the frame waits for a slot
+                    }
+                    note(wall(ev.end as f64));
+                }
+            }
+        }
+        note(wall(self.plan_anchor.0 + plan::PLAN_HORIZON_MS / 2.0));
+        // The next line boundary: a line the song moves past unseen is counted then.
+        let i = self.units.partition_point(|u| (u.start as f64) <= pos);
+        if let Some(u) = i.checked_sub(1).and_then(|k| self.units.get(k)).filter(|u| (u.end as f64) > pos) {
+            note(wall(u.end as f64));
+        }
+        if let Some(u) = self.units.get(i) {
+            note(wall(u.start as f64));
+        }
+        due.map(|t| t.saturating_duration_since(now))
+    }
+
     pub fn tick(&mut self, snap: &Snapshot, now: Instant, now_ms: i64, s: &Settings) -> Vec<Effect> {
         let mut out = Vec::new();
         if snap.discord_user.is_none() {
@@ -700,12 +787,30 @@ impl Presence {
 }
 
 /// Drive the presence against the engine forever, sending to Discord.
+/// The loop looks at the engine at least this often whatever happens: a
+/// backstop for anything that changes without an event.
+pub const MAX_SLEEP: Duration = Duration::from_secs(1);
+
+/// Drives `Presence::tick` against the engine. It wakes when the engine
+/// changes (a bridge message, lyrics, Discord, the RPC switch, settings) and
+/// at the next instant the presence has something timed to do
+/// (`Presence::next_due`), instead of every 50 ms: a planned line goes out
+/// at its time, and an idle or paused app leaves the CPU alone.
 pub async fn run_loop(engine: Arc<Engine>, tx: mpsc::UnboundedSender<crate::discord::Update>) {
     engine.core.with(|c| c.presence_running = true);
     let mut p = Presence::new(engine.core.rpc_enabled(), Instant::now());
     let mut test_waiting = false;
+    let mut events = engine.subscribe();
+    let mut due = Duration::ZERO;
     loop {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(due) => {}
+            ev = events.recv() => {
+                if matches!(ev, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                    tokio::time::sleep(MAX_SLEEP).await;
+                }
+            }
+        }
         WAKEUPS.fetch_add(1, Ordering::Relaxed);
         let snap = engine.snapshot();
         let now = Instant::now();
@@ -741,6 +846,7 @@ pub async fn run_loop(engine: Arc<Engine>, tx: mpsc::UnboundedSender<crate::disc
                 Effect::Log(m) => crate::log(&m),
             }
         }
+        due = p.next_due(&snap, now, now_ms, &s).unwrap_or(MAX_SLEEP).min(MAX_SLEEP);
     }
 }
 

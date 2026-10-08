@@ -58,6 +58,10 @@ pub enum Event {
     Resumed,
     /// statusify.cfg was changed (Engine::config_changed); re-read settings.
     ConfigChanged,
+    /// Something the presence loop should look at now that is not in the
+    /// events above: Discord connected or went away, the RPC switch, a test
+    /// presence request (Engine::wake).
+    Wake,
 }
 
 /// The play in progress. Listening time is wall-clock time while playing
@@ -201,6 +205,12 @@ impl Engine {
         self.config.get()
     }
 
+    /// Wake the presence loop (Event::Wake) for a change it cannot see in
+    /// the snapshot: the RPC switch, a test presence request.
+    pub fn wake(&self) {
+        self.emit(Event::Wake);
+    }
+
     /// Call after writing statusify.cfg so every feature re-reads it.
     pub fn config_changed(&self) {
         self.refresh_config();
@@ -339,10 +349,13 @@ impl Engine {
 
     pub fn update(&self, f: impl FnOnce(&mut Snapshot)) {
         let mut paused = false;
+        let discord;
         {
             let mut g = self.inner.lock().unwrap();
             let was = g.snap.bridge_connected;
+            let user = g.snap.discord_user.clone();
             f(&mut g.snap);
+            discord = user != g.snap.discord_user;
             // The bridge went away: Spotify is not playing for us any more.
             if was && !g.snap.bridge_connected && g.snap.is_playing {
                 g.snap.is_playing = false;
@@ -354,6 +367,9 @@ impl Engine {
         }
         if paused {
             self.emit(Event::Paused);
+        }
+        if discord {
+            self.emit(Event::Wake);
         }
         self.changed();
     }
