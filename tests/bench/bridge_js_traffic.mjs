@@ -85,6 +85,9 @@ function window_(from, to) {
 await wait(1300);
 await wait(1000);
 if (!sent.some((m) => m.type === "lyrics")) throw new Error("the bridge did not send lyrics; stub mismatch");
+// Spotify's player announces the state it loaded; a bridge that listens learns here that the event exists.
+fireUpdate();
+await wait(200);
 
 const half = (SECONDS * 1000) / 2;
 // Phase 1: playing, untouched.

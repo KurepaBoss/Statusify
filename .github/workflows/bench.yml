@@ -62,12 +62,33 @@ jobs:
           set -o pipefail
           benches="${{ github.event.inputs.benches }}"
           if [ -z "$benches" ]; then
-            benches="f_unit_costs f_idle_cpu k_presence_wakeups c_pause_resume_seek b_line_jitter_and_waste js_e2e l_bridge_js_traffic"
+            benches="f_unit_costs f_idle_cpu k_presence_wakeups c_pause_resume_seek b_line_jitter_and_waste js_e2e"
           fi
           # shellcheck disable=SC2086
           tests/bench/run.sh $benches
           echo "== results =="
           cat "$STATUSIFY_BENCH_OUT"
+
+      # The bridge's traffic and seek latency, in Node alone (no Rust).
+      - name: Bridge traffic
+        if: always()
+        shell: bash
+        run: |
+          node tests/bench/bridge_js_traffic.mjs --seconds 20 --seeks 12 --out bench-traffic.json
+          node tests/bench/bridge_js_traffic.mjs --seconds 20 --seeks 12 --no-update-events --out bench-traffic-noevents.json
+
+      # The Lyrics page in a headless Chromium (the harness under the dev
+      # server). Best effort: a missing browser must not fail the run.
+      - name: UI profile
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          npm i -g playwright@1.47.2
+          npx playwright@1.47.2 install chromium
+          npx vite --port 1420 --strictPort > vite.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://localhost:1420/tests-ts/harness.html > /dev/null && break; sleep 1; done
+          node tests/bench/ui_profile.mjs --runs 3 --seconds 20 --out bench-ui.json > /dev/null
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -76,4 +97,7 @@ jobs:
           path: |
             bench-results.jsonl
             bench-results.stderr.log
+            bench-traffic.json
+            bench-traffic-noevents.json
+            bench-ui.json
           if-no-files-found: warn
