@@ -27,9 +27,15 @@ use crate::lyrics::{instrumental_gaps, join_lines, Lyrics};
 use crate::state::Snapshot;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// How many times `run_loop` has woken up to look at the engine, in total.
+/// Read by the benchmarks (bench_k_presence_wakeups): the loop's cost is its
+/// wake-ups, each one a snapshot clone, a settings read and a tick.
+pub static WAKEUPS: AtomicU64 = AtomicU64::new(0);
 
 pub const RATE_CALLS: usize = 5;
 pub const RATE_WINDOW: Duration = Duration::from_secs(20);
@@ -700,6 +706,7 @@ pub async fn run_loop(engine: Arc<Engine>, tx: mpsc::UnboundedSender<crate::disc
     let mut test_waiting = false;
     loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
+        WAKEUPS.fetch_add(1, Ordering::Relaxed);
         let snap = engine.snapshot();
         let now = Instant::now();
         let now_ms = crate::state::now_ms();

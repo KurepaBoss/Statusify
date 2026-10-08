@@ -43,6 +43,7 @@ The benchmarks, by the letter used in the code:
 | `h_pause_flapping` | Pause and resume every 0.3 to 3 s for a minute, ending playing or paused: the most updates in any 20 s, and whether the status was ever blank while music played |
 | `i_discord_hangup` | Discord hangs up at various moments after connecting, for a minute |
 | `j_bridge_flap` | The bridge's socket drops every 0.3 to 6 s, for a minute |
+| `k_presence_wakeups` | How many times a second the presence loop wakes up to look at the engine, playing, paused and idle (an exact count), and the process CPU meanwhile |
 
 ## Running it
 
@@ -56,6 +57,31 @@ tests/bench/run.sh a_track_change     # one, by the name above
 BENCH_JS_TRIALS=24 tests/bench/run.sh js_e2e                  # more trials per kind (default 6)
 BENCH_BRIDGE_JS=/path/to/other.js tests/bench/run.sh js_e2e   # measure another bridge file
 ```
+
+Two more measurements run in Node alone and need no Rust build:
+
+```bash
+node tests/bench/bridge_js_traffic.mjs [--seconds 20] [--seeks 12] [--no-update-events]
+npx vite --port 1420 &   # serves tests-ts/harness.html
+node tests/bench/ui_profile.mjs [--runs 3] [--seconds 20] [--out file.json]
+```
+
+`bridge_js_traffic.mjs` runs the real `lyrics-bridge.js` against a stub
+Spicetify with real timers and reports what it puts on the socket: messages and
+bytes per minute by type, playing and paused, and how long a seek in Spotify
+takes to appear as a position message. `--no-update-events` models a Spotify
+whose player API never announces state changes, so only the bridge's own
+heartbeat can notice a seek. `ui_profile.mjs` drives the Lyrics page in a
+headless Chromium (Playwright) for a scripted window of playback with one track
+change, and reports the main-thread work from the DevTools trace (style
+recalculations, layouts, paints, raster tasks, and their time), the frame
+intervals, and what one snapshot publish costs the page. Its absolute frame
+times are those of a software renderer; compare runs, do not read them as a
+monitor's.
+
+On GitHub, the *Bench* workflow (`.github/workflows/bench.yml`) runs the quick
+set on a Windows runner when started by hand or when a commit message contains
+`[bench]`, and leaves `bench-results.jsonl` as its artifact.
 
 `run.sh` builds the test binary in its own target directory (`.bench-target`,
 ignored by git), so it does not disturb a build you already have. It keeps
@@ -77,7 +103,9 @@ Application ID is read, and nothing talks to Spotify or Spicetify.
 | `baseline-session.jsonl` | A second run of the same baseline, on the day the final numbers were taken, to check that `baseline.jsonl` still held on that PC |
 | `after.jsonl` | Version 3.0.0 with the final code. Its first entry (`_meta`) lists the notes and caveats for the run |
 | `js_e2e_24_trials.jsonl` | `js_e2e` with 24 trials per kind, before and after, for the seek rows |
-| `bridge_js_probe.mjs` | The stub Spicetify that runs the real `lyrics-bridge.js` outside Spotify |
+| `bridge_js_probe.mjs` | The stub Spicetify that runs the real `lyrics-bridge.js` outside Spotify, for the `js_*` benchmarks. It fires the player API's "update" event on every state change like Spotify does; `--no-update-events` leaves it out |
+| `bridge_js_traffic.mjs` | The bridge's traffic per minute and seek latency, in Node alone (see above) |
+| `ui_profile.mjs` | The Lyrics page under a headless Chromium: main-thread work and frame intervals (see above) |
 | `proposed-bridge-js.patch` | The prototype of the four bridge changes that were measured before being adopted. It is **superseded**: `lyrics-bridge.js` 2.2 contains them and more. Kept for the record |
 
 ## The numbers

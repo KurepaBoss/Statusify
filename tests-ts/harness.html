@@ -87,6 +87,14 @@
             if (action === "set_track_offset") { snap.extras.core.track_offset_ms = 0; snap.extras.np.song_offset = false; emit(); return true; }
           }
           if (feature === "windows" && action === "toggle_overlay") { snap.extras.windows.overlay = !snap.extras.windows.overlay; emit(); return true; }
+          if (feature === "settings") {
+            if (action === "languages") return [{ code: "en", name: "English" }, { code: "ko", name: "Korean" }, { code: "de", name: "German" }];
+            if (action === "read_log") return [];
+            if (action === "set") { snap.extras.np[args.key] = args.value; emit(); return args.value; }
+            return null;
+          }
+          if (feature === "history") return action === "session" ? { tracks: 0, minutes: 0, top: [] } : [];
+          if (feature === "shell") return { app_id_set: true, active_app_id: "0", profiles: [], autostart: false, legacy_startup: false, needs_restart: false, version: "harness", data_dir: "C:/mock", data_dir_label: "C:/mock", hotkeys: {}, hotkey_errors: {} };
           return null;
         };
         window.__TAURI_INTERNALS__ = {

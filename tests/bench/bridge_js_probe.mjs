@@ -11,8 +11,11 @@
 //
 // stdin commands (e2e): songchange <n> | pause | resume | seek <ms>
 // The stub changes its state first and then fires the same Spicetify events
-// the real spicetifyWrapper.js fires (songchange, onplaypause); there is no
-// seek event in the real API either.
+// the real spicetifyWrapper.js fires (songchange, onplaypause), and the
+// player "update" event Spotify's PlayerAPI fires on every state change (a
+// seek included) to listeners on Spicetify.Player.origin._events, which is
+// where a bridge can see a seek without polling. --no-update-events leaves
+// that out, for measuring a bridge against a Spotify that lacks it.
 import fs from "node:fs";
 import readline from "node:readline";
 import vm from "node:vm";
@@ -27,6 +30,7 @@ const bridgePath = opt("bridge");
 const scenario = opt("scenario", "e2e");
 const hangMs = Number(opt("hang-ms", "30000"));
 const verbose = argv.includes("--verbose");
+const updateEvents = !argv.includes("--no-update-events");
 if (!bridgePath) throw new Error("--bridge is required");
 if (port === 8765) throw new Error("refusing to talk to port 8765 (the live Statusify)");
 
@@ -55,6 +59,21 @@ const listeners = {};
 const fire = (type) => {
   for (const f of listeners[type] || []) f({ type, data: Player.data });
 };
+// PlayerAPI's "update": its listeners get { data: PlayerState }, after the
+// PlayerCore's own listener (registered first) has stored the new state, so
+// Player.getProgress()/isPlaying() already read the new one.
+const apiListeners = {};
+const PlayerAPI = {
+  _events: {
+    addListener(type, f) { (apiListeners[type] ||= []).push(f); },
+    removeListener(type, f) { apiListeners[type] = (apiListeners[type] || []).filter((g) => g !== f); },
+  },
+};
+const fireUpdate = () => {
+  if (!updateEvents) return;
+  const data = { item: Player.data.item, is_paused: !playing, position_as_of_timestamp: pos0, timestamp: Date.now() - (playing ? performance.now() - wall0 : 0), duration: DUR, playback_speed: playing ? 1 : 0 };
+  for (const f of apiListeners.update || []) f({ data });
+};
 const setPlaying = (v) => {
   pos0 = pos();
   wall0 = performance.now();
@@ -69,10 +88,11 @@ const Player = {
   getShuffle: () => false,
   getHeart: () => false,
   next() {}, back() {}, togglePlay() {},
-  pause() { setPlaying(false); fire("onplaypause"); },
-  play() { setPlaying(true); fire("onplaypause"); },
-  seek(ms) { pos0 = ms; wall0 = performance.now(); },
+  pause() { setPlaying(false); fireUpdate(); fire("onplaypause"); },
+  play() { setPlaying(true); fireUpdate(); fire("onplaypause"); },
+  seek(ms) { pos0 = ms; wall0 = performance.now(); fireUpdate(); },
   addEventListener(t, f) { (listeners[t] ||= []).push(f); },
+  origin: PlayerAPI,
 };
 
 // Spotify's color-lyrics answer: 12 LINE_SYNCED lines 30 s apart, "L000 ..." tokens.
@@ -86,7 +106,7 @@ const lyricsFor = () => ({
 globalThis.Spicetify = {
   Player,
   Queue: { nextTracks: [] },
-  Platform: { AuthorizationAPI: { _tokenProvider: { _token: { accessToken: "stub" } } }, PlayerAPI: {} },
+  Platform: { AuthorizationAPI: { _tokenProvider: { _token: { accessToken: "stub" } } }, PlayerAPI },
   CosmosAsync: {
     get: (url) =>
       scenario === "lyrics-hang"
@@ -109,6 +129,7 @@ if (scenario === "e2e") {
       pos0 = 0;
       wall0 = performance.now();
       playing = true;
+      fireUpdate();
       fire("songchange");
       if (wasPaused) fire("onplaypause");
     } else if (cmd === "pause") {

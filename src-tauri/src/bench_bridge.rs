@@ -1265,6 +1265,46 @@ fn bench_f_idle_cpu() {
     });
 }
 
+/// (k) how often the presence loop wakes up to look at the engine, and what
+/// that costs, playing, paused and idle. Wake-ups are counted exactly
+/// (presence::WAKEUPS); the loop's cost is the wake-ups times the unit cost
+/// in f_unit_costs. A fixed 50 ms sleep wakes 20 times a second whatever
+/// happens (Windows' timer makes it ~16); a loop that sleeps until the next
+/// deadline wakes a few times a second playing and not at all paused.
+#[test]
+#[ignore = "benchmark"]
+fn bench_k_presence_wakeups() {
+    mt().block_on(async {
+        let mut out = serde_json::Map::new();
+        let variants: [(&str, bool, bool); 3] = [("playing_2Hz_positions", true, true), ("paused_2Hz_positions", false, true), ("no_track_no_bridge_client", false, false)];
+        for (name, playing, client) in variants {
+            let mut o = Opts::default();
+            o.start_bridge_client = client;
+            let p = Pipeline::start(track_with(1, Some(Sheet::fixture("fast"))), LyricsPlan::After(100), o).await;
+            p.wait_connected().await;
+            sleep(if client { 4000 } else { 2000 }).await;
+            if client && !playing {
+                p.pause();
+                sleep(3000).await;
+            }
+            let (w0, cpu0, wall0, calls0) = (presence::WAKEUPS.load(Ordering::Relaxed), process_cpu_ms(), Instant::now(), p.emit_calls.load(Ordering::Relaxed));
+            sleep(20_000).await;
+            let wall = ms(wall0.elapsed());
+            let wake = presence::WAKEUPS.load(Ordering::Relaxed) - w0;
+            let calls = p.emit_calls.load(Ordering::Relaxed) - calls0;
+            let frames = frame_log(&p).iter().filter(|(t, _)| *t >= wall0).count();
+            out.insert(
+                name.into(),
+                json!({"window_s": r1(wall / 1000.0), "presence_wakeups_per_s": r1(wake as f64 / (wall / 1000.0)), "presence_wakeups": wake,
+                       "on_change_calls_per_s": r1(calls as f64 / (wall / 1000.0)), "discord_frames_in_window": frames,
+                       "process_cpu_ms_per_s": r1((process_cpu_ms() - cpu0) / wall * 1000.0)}),
+            );
+            p.stop().await;
+        }
+        report("k_presence_wakeups", Value::Object(out));
+    });
+}
+
 /// (f, unit costs) what one 50 ms presence wakeup and one position message cost.
 #[test]
 #[ignore = "benchmark"]

@@ -1,0 +1,79 @@
+name: Bench
+
+# The pipeline benchmarks (tests/bench/run.sh) on a Windows runner, so a
+# change to the bridge, the engine or the presence loop comes with measured
+# numbers instead of a guess. Started by hand (Actions tab, Bench, Run
+# workflow), or by a push whose commit message contains "[bench]". The
+# results (one JSON line per benchmark) are left as the workflow artifact
+# `bench-results`; the runner is a shared 4-core VM, so read the CPU numbers
+# to within 10-15 % and trust the counts (frames, wake-ups, bytes) exactly.
+on:
+  workflow_dispatch:
+    inputs:
+      benches:
+        description: 'Benchmarks to run, space separated (empty = the quick set)'
+        required: false
+        default: ''
+  push:
+    branches: ['**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[bench]')
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Its own cache: run.sh builds without LTO, into its own target dir.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          shared-key: statusify-windows-bench
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # The crate embeds dist\ at compile time.
+      - name: Build the frontend
+        run: npm run build
+
+      - name: Run the benchmarks
+        shell: bash
+        env:
+          BENCH_JS_TRIALS: 8
+          STATUSIFY_BENCH_OUT: ${{ github.workspace }}/bench-results.jsonl
+          CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target/bench
+        run: |
+          set -o pipefail
+          benches="${{ github.event.inputs.benches }}"
+          if [ -z "$benches" ]; then
+            benches="f_unit_costs f_idle_cpu k_presence_wakeups c_pause_resume_seek b_line_jitter_and_waste js_e2e l_bridge_js_traffic"
+          fi
+          # shellcheck disable=SC2086
+          tests/bench/run.sh $benches
+          echo "== results =="
+          cat "$STATUSIFY_BENCH_OUT"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: |
+            bench-results.jsonl
+            bench-results.stderr.log
+          if-no-files-found: warn
