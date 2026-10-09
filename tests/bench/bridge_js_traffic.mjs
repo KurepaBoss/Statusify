@@ -13,13 +13,14 @@
 // on its own heartbeat); the default models the real one, which does.
 import fs from "node:fs";
 import vm from "node:vm";
+import { fileURLToPath } from "node:url";
 
 const argv = process.argv.slice(2);
 const opt = (n, d) => { const i = argv.indexOf("--" + n); return i >= 0 ? argv[i + 1] : d; };
 const SECONDS = Number(opt("seconds", "20"));
 const SEEKS = Number(opt("seeks", "12"));
 const OUT = opt("out", "");
-const BRIDGE = opt("bridge", new URL("../../src-tauri/resources/lyrics-bridge.js", import.meta.url).pathname);
+const BRIDGE = opt("bridge", fileURLToPath(new URL("../../src-tauri/resources/lyrics-bridge.js", import.meta.url)));
 const updateEvents = !argv.includes("--no-update-events");
 
 const src = fs.readFileSync(BRIDGE, "utf8");

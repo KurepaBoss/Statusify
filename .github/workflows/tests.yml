@@ -57,4 +57,19 @@ jobs:
 
       - name: Backend tests
         working-directory: src-tauri
-        run: cargo test --release
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --release 2>&1 | tee ../cargo-test.log
+
+      # The run log is not always reachable from where a failure is looked at,
+      # so the failing tests are also left as annotations on the check.
+      - name: Name the failing tests
+        if: failure()
+        shell: bash
+        run: |
+          {
+            grep -E "^test .* FAILED$" cargo-test.log | head -5
+            grep -E "panicked at" cargo-test.log | head -4
+            grep -E "^error(\[E[0-9]+\])?:" cargo-test.log | head -1
+          } | while IFS= read -r line; do echo "::error title=Backend tests::${line}"; done
