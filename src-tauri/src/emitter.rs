@@ -80,9 +80,11 @@ mod tests {
     async fn a_burst_of_changes_is_one_emit_now_and_one_at_the_end_of_the_gap() {
         let (em, log) = start(Duration::from_millis(60));
         let t0 = Instant::now();
+        // Yield, not sleep, between the marks: a timer on Windows ticks every
+        // 15.6 ms, which would spread the burst over several gaps.
         for _ in 0..20 {
             em.mark(Change::Full);
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
         let got = log.lock().unwrap().clone();
