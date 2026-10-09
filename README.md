@@ -13,6 +13,7 @@
   <br><br>
   <a href="https://github.com/KurepaBoss/Statusify/releases/latest"><img src="docs/statusify-promo.gif" alt="A short demo: the lyric line on a Discord Listening to status changing in time with the song, then installing Statusify in three steps" width="760" /></a>
   <br><sub>Synced lyrics on your Discord status, and the install in three steps. All demo content is fictional.</sub>
+  <br><sub>Low frame rate? <a href="docs/statusify-promo.mp4">Watch the demo as a 30 fps video with sound</a>.</sub>
 </div>
 
 ---
